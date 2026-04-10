@@ -560,7 +560,8 @@ async def get_top_queries(
         "participants (display_name), channels (name), and transcripts (transcript_text). "
         "Returns matched rows grouped by table, ranked by trigram similarity. "
         "Use this when you need to find communications that mention specific terms, "
-        "people, or topics across the entire data store in one call."
+        "people, or topics across the entire data store in one call. "
+        "Keywords must be at least 3 characters each."
     ),
     annotations=ToolAnnotations(
         title="Universal Search",
