@@ -1,6 +1,7 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -9,6 +10,7 @@ from enum import Enum
 from typing import Any
 from typing import List
 from typing import Literal
+from typing import Optional
 from typing import Union
 
 import mcp.types as types
@@ -24,6 +26,7 @@ from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
+from .outbound_lock import run_outbound_lock
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
@@ -761,6 +764,74 @@ def _format_transcript_row(cells: dict) -> str:
         f"created_at={_fmt_dt(cells.get('created_at'))}\n"
         f"  transcript_text: {cells.get('transcript_text') or ''}"
     )
+
+
+@mcp.tool(
+    description=(
+        "Outbound intent lock — the single source of truth for 'did this customer-facing "
+        "send already happen?'. Use BEFORE any outbound send to avoid duplicates. Strict JSON "
+        "in/out; message IDs and proxy emails travel as args (never inline SQL). Ops:\n"
+        "- acquire {identity_key, intent_kind, holder, property_scope?}: take the lock. Returns "
+        "{acquired, lock_id, existing}. If acquired=false, `existing` carries the blocking lock "
+        "with is_duplicate_send_evidence — if that is true the send ALREADY happened, do NOT resend.\n"
+        "- complete {lock_id, holder, request_ref}: after a VERIFIED send; request_ref is the send "
+        "handle (email request id / SMTP Message-ID / SMS id).\n"
+        "- release {lock_id, holder}: abort without sending, freeing the scope.\n"
+        "- check {identity_key, property_scope?, intent_kind?, days?}: recent locks + evidence, for "
+        "dedup audits.\n"
+        "is_duplicate_send_evidence = (completed_at set AND request_ref set), independent of "
+        "released_at — a completed lock is evidence of a send; a plain release is not."
+    ),
+    annotations=ToolAnnotations(
+        title="Outbound Lock",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+    ),
+)
+@validate_call
+async def outbound_lock(
+    op: Literal["acquire", "complete", "release", "check"] = Field(
+        description="acquire | complete | release | check"
+    ),
+    identity_key: Optional[str] = Field(
+        default=None, description="Customer identity (phone digits / email / factbook:uuid). Required for acquire and check."
+    ),
+    property_scope: str = Field(
+        default="", description="Unit/property scope, e.g. '317 S Main St #3'. Optional; normalized server-side."
+    ),
+    intent_kind: Optional[str] = Field(
+        default=None, description="What is being sent, e.g. 'showing-confirmation', 'correction'. Required for acquire."
+    ),
+    holder: Optional[str] = Field(
+        default=None, description="This run's id (session/run id). Required for acquire/complete/release."
+    ),
+    lock_id: Optional[int] = Field(
+        default=None, description="Lock id from acquire. Required for complete/release."
+    ),
+    request_ref: Optional[str] = Field(
+        default=None, description="Verified send handle (email request id / Message-ID / SMS id). Required for complete."
+    ),
+    days: int = Field(default=7, description="check: look-back window in days."),
+) -> ResponseType:
+    """First-class outbound lock (wraps the migration-026 SQL functions)."""
+    try:
+        driver = await get_sql_driver()
+        result = await run_outbound_lock(
+            driver,
+            op=op,
+            identity_key=identity_key,
+            property_scope=property_scope,
+            intent_kind=intent_kind,
+            holder=holder,
+            lock_id=lock_id,
+            request_ref=request_ref,
+            days=days,
+        )
+        return format_text_response(json.dumps(result))
+    except Exception as e:
+        logger.error(f"Error in outbound_lock: {e}")
+        return format_text_response(json.dumps({"op": op, "error": str(e)}))
 
 
 async def main():
