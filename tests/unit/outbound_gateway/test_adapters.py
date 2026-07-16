@@ -127,13 +127,17 @@ def completed(tool, content):
 
 @pytest.mark.asyncio
 async def test_email_adapter_derives_recipient_and_returns_structured_receipt():
-    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        cc_by_source={"zillow": "management@pfg.io"},
+    )
     request = adapter.build_request(context(), ACTION_UID)
     assert request.server_name == "agent-email"
     assert request.tool == "email_send"
     assert request.arguments == {
         "account_id": "nigel-zoho",
         "to": [{"address": "lead@convo.zillow.com"}],
+        "cc": [{"address": "management@pfg.io"}],
         "subject": "Re: Zillow inquiry for 138 Bullman St #144-A",
         "text": "Friday at 10:30 works. — Nigel",
         "outbound_action_uid": str(ACTION_UID),
@@ -147,6 +151,20 @@ async def test_email_adapter_derives_recipient_and_returns_structured_receipt():
     assert receipt is not None
     assert receipt.provider_message_id == "<mail-1@example.com>"
     assert receipt.provider_request_ref == "req-1"
+
+
+def test_email_adapter_applies_management_copy_only_to_configured_sources():
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.io"},
+        cc_by_source={"zillow": "management@pfg.io", "hotpads": "management@pfg.io"},
+    )
+
+    tenantcloud_request = adapter.build_request(
+        context(source="tenantcloud"),
+        ACTION_UID,
+    )
+
+    assert "cc" not in tenantcloud_request.arguments
 
 
 @pytest.mark.asyncio

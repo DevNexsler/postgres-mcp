@@ -44,6 +44,12 @@ from .service import OutboundActionService
 from .store import PostgresActionStore
 from .worker import OutboundWorker
 
+DEFAULT_EMAIL_SENDER_DOMAINS = {"nigel-zoho": "pfg.io"}
+DEFAULT_EMAIL_CC_BY_SOURCE = {
+    "zillow": "management@pfg.io",
+    "hotpads": "management@pfg.io",
+}
+
 
 @dataclass(frozen=True)
 class FeaturePolicy:
@@ -243,11 +249,23 @@ async def build_runtime() -> GatewayRuntime:
     )
     email_domains = _json_mapping(
         "OUTBOUND_EMAIL_SENDER_DOMAINS_JSON",
-        {"nigel-zoho": os.environ.get("OUTBOUND_DEFAULT_EMAIL_DOMAIN", "parkfrontgroup.com")},
+        {
+            "nigel-zoho": os.environ.get(
+                "OUTBOUND_DEFAULT_EMAIL_DOMAIN",
+                DEFAULT_EMAIL_SENDER_DOMAINS["nigel-zoho"],
+            )
+        },
+    )
+    email_cc_by_source = _json_mapping(
+        "OUTBOUND_EMAIL_CC_BY_SOURCE_JSON",
+        DEFAULT_EMAIL_CC_BY_SOURCE,
     )
     calendar_accounts = {routing.calendar_by_profile["appointment-setter"]: routing.calendar_account_by_profile["appointment-setter"]}
     adapters = {
-        Operation.EMAIL_SEND: EmailAdapter(sender_domains=email_domains),
+        Operation.EMAIL_SEND: EmailAdapter(
+            sender_domains=email_domains,
+            cc_by_source=email_cc_by_source,
+        ),
         Operation.QUO_SMS_SEND: QuoSmsAdapter(user_id=os.environ.get("OUTBOUND_QUO_USER_ID", "gateway")),
         Operation.CLIQ_CHANNEL_POST: CliqAdapter(Operation.CLIQ_CHANNEL_POST),
         Operation.CLIQ_CHAT_POST: CliqAdapter(Operation.CLIQ_CHAT_POST),

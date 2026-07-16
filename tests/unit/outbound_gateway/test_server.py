@@ -9,11 +9,21 @@ from starlette.testclient import TestClient
 from postgres_mcp.outbound_gateway.metrics import MetricSample
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
+from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
+from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
+
+
+def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
+    assert DEFAULT_EMAIL_SENDER_DOMAINS == {"nigel-zoho": "pfg.io"}
+    assert DEFAULT_EMAIL_CC_BY_SOURCE == {
+        "zillow": "management@pfg.io",
+        "hotpads": "management@pfg.io",
+    }
 
 
 def public(status=PublicStatus.SENT, detail="provider_receipt_verified"):

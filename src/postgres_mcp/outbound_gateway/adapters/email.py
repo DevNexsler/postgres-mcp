@@ -21,8 +21,14 @@ from .base import terminal_content
 
 
 class EmailAdapter:
-    def __init__(self, *, sender_domains: Mapping[str, str]):
+    def __init__(
+        self,
+        *,
+        sender_domains: Mapping[str, str],
+        cc_by_source: Mapping[str, str] | None = None,
+    ):
         self._sender_domains = dict(sender_domains)
+        self._cc_by_source = dict(cc_by_source or {})
 
     def validate(self, context: ActionContext) -> None:
         if context.operation is not Operation.EMAIL_SEND:
@@ -37,16 +43,20 @@ class EmailAdapter:
         subject = context.source_subject or "Rental inquiry"
         if not subject.casefold().startswith("re:"):
             subject = f"Re: {subject}"
+        arguments = {
+            "account_id": context.provider_account,
+            "to": [{"address": context.target.target_id}],
+            "subject": subject,
+            "text": str(context.arguments["text"]),
+            "outbound_action_uid": str(action_uid),
+        }
+        copy_address = self._cc_by_source.get(context.source)
+        if copy_address:
+            arguments["cc"] = [{"address": copy_address}]
         return ProviderRequest(
             server_name="agent-email",
             tool="email_send",
-            arguments={
-                "account_id": context.provider_account,
-                "to": [{"address": context.target.target_id}],
-                "subject": subject,
-                "text": str(context.arguments["text"]),
-                "outbound_action_uid": str(action_uid),
-            },
+            arguments=arguments,
         )
 
     async def invoke(self, client: McpProviderClient, request: ProviderRequest) -> ProviderObservation:
