@@ -14,6 +14,9 @@ from uuid import uuid5
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.responses import PlainTextResponse
 
 from postgres_mcp.sql import DbConnPool
 from postgres_mcp.sql import SqlDriver
@@ -26,6 +29,8 @@ from .context import ACTION_NAMESPACE
 from .context import ActionContextLoader
 from .context import RoutingPolicy
 from .evidence import DatabasePreflightEvidenceLoader
+from .metrics import GatewayObservability
+from .metrics import render_prometheus
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
@@ -52,6 +57,7 @@ class GatewayRuntime:
     service: OutboundActionService
     store: PostgresActionStore
     policy: FeaturePolicy
+    observability: GatewayObservability
 
 
 async def handle_outbound_action(
@@ -86,7 +92,12 @@ async def handle_outbound_action(
     return result.model_dump(mode="json")
 
 
-def create_server(service: OutboundActionService, policy: FeaturePolicy) -> FastMCP:
+def create_server(
+    service: OutboundActionService,
+    policy: FeaturePolicy,
+    *,
+    observability: GatewayObservability | None = None,
+) -> FastMCP:
     mcp = FastMCP(
         "comm-outbound-gateway",
         instructions="One durable provider-neutral outbound action tool.",
@@ -117,6 +128,27 @@ def create_server(service: OutboundActionService, policy: FeaturePolicy) -> Fast
             },
             sort_keys=True,
         )
+
+    if observability is not None:
+
+        @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+        async def healthz(_request: Request):
+            healthy = await observability.database_healthy()
+            return JSONResponse(
+                {
+                    "status": "ok" if healthy else "unhealthy",
+                    "writes_enabled": policy.writes_enabled,
+                    "kill_switch": policy.kill_switch,
+                },
+                status_code=200 if healthy else 503,
+            )
+
+        @mcp.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+        async def metrics(_request: Request):
+            return PlainTextResponse(
+                render_prometheus(await observability.collect()),
+                media_type="text/plain; version=0.0.4",
+            )
 
     return mcp
 
@@ -171,6 +203,15 @@ async def build_runtime() -> GatewayRuntime:
     )
     context_repository = OutboundGatewayRepository(driver)
     store = PostgresActionStore(driver)
+    observability = GatewayObservability(
+        driver,
+        circuit_failure_threshold=int(os.environ.get("OUTBOUND_CIRCUIT_FAILURE_THRESHOLD", "5")),
+        circuit_window_seconds=int(os.environ.get("OUTBOUND_CIRCUIT_WINDOW_SECONDS", "300")),
+        circuit_open_seconds=int(os.environ.get("OUTBOUND_CIRCUIT_OPEN_SECONDS", "180")),
+        old_action_seconds=int(os.environ.get("OUTBOUND_ALERT_OLD_ACTION_SECONDS", "300")),
+        evidence_failure_threshold=int(os.environ.get("OUTBOUND_ALERT_EVIDENCE_FAILURE_THRESHOLD", "3")),
+        alert_window_seconds=int(os.environ.get("OUTBOUND_ALERT_WINDOW_SECONDS", "300")),
+    )
     provider_client = McpProviderClient(
         {
             "agent-email": McpServerConfig(
@@ -220,8 +261,17 @@ async def build_runtime() -> GatewayRuntime:
         provider_client=provider_client,
         clock=lambda: datetime.now(timezone.utc),
         lease_owner=os.environ.get("OUTBOUND_GATEWAY_LEASE_OWNER", "outbound-gateway"),
+        circuit_guard=observability,
+        retry_base_seconds=int(os.environ.get("OUTBOUND_RETRY_BASE_SECONDS", "5")),
+        retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
     )
-    return GatewayRuntime(pool=pool, service=service, store=store, policy=policy)
+    return GatewayRuntime(
+        pool=pool,
+        service=service,
+        store=store,
+        policy=policy,
+        observability=observability,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -234,7 +284,11 @@ def _parser() -> argparse.ArgumentParser:
 async def _serve() -> None:
     args = _parser().parse_args()
     runtime = await build_runtime()
-    mcp = create_server(runtime.service, runtime.policy)
+    mcp = create_server(
+        runtime.service,
+        runtime.policy,
+        observability=runtime.observability,
+    )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
     try:
@@ -249,7 +303,13 @@ def main() -> None:
 
 async def _work() -> None:
     runtime = await build_runtime()
-    worker = OutboundWorker(store=runtime.store, service=runtime.service)
+    worker = OutboundWorker(
+        store=runtime.store,
+        service=runtime.service,
+        batch_size=int(os.environ.get("OUTBOUND_WORKER_BATCH_SIZE", "20")),
+        max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
+        observability=runtime.observability,
+    )
     interval = max(1.0, float(os.environ.get("OUTBOUND_WORKER_INTERVAL_SECONDS", "5")))
     try:
         while True:

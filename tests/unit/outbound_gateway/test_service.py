@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from types import MappingProxyType
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.metrics import CircuitStatus
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import CompletionKind
@@ -118,6 +120,7 @@ def row(state=ActionState.RECEIVED, **overrides):
         completion_kind=None,
         detail_code=state.value,
         attempt_count=0,
+        next_attempt_at=NOW,
     )
     values.update(overrides)
     return OutboundActionRecord(**values)
@@ -149,7 +152,7 @@ class FakeStore:
         return self.current
 
     async def transition(self, action_id, expected_state, next_state, lease_owner, observation):
-        self.calls.append(("transition", expected_state, next_state, observation.detail_code))
+        self.calls.append(("transition", expected_state, next_state, observation.detail_code, lease_owner))
         self.current = replace(
             self.current,
             state=next_state,
@@ -174,6 +177,15 @@ class FakeStore:
     async def definitive_fail(self, action_id, expected_state, lease_owner, observation):
         self.calls.append(("definitive_fail", observation.detail_code))
         self.current = replace(self.current, state=ActionState.DEFINITIVE_FAILED, detail_code=observation.detail_code)
+        return self.current
+
+    async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code):
+        self.calls.append(("schedule", expected_state, delay_seconds, detail_code))
+        self.current = replace(
+            self.current,
+            detail_code=detail_code,
+            next_attempt_at=NOW + timedelta(seconds=delay_seconds),
+        )
         return self.current
 
     async def get(self, action_id):
@@ -212,7 +224,7 @@ class FakeAdapter:
         return self.observations.pop(0)
 
 
-def service(store, adapter, *, proof=None):
+def service(store, adapter, *, proof=None, circuit_guard=None):
     loader = AsyncMock()
     loader.load.return_value = context()
     preflight = AsyncMock()
@@ -227,6 +239,7 @@ def service(store, adapter, *, proof=None):
         lease_owner="gateway-test",
         response_budget_seconds=1,
         sleep=AsyncMock(),
+        circuit_guard=circuit_guard,
     )
 
 
@@ -314,6 +327,45 @@ async def test_ambiguous_timeout_retains_lock_and_never_retries_inline():
     assert adapter.calls.count(("invoke",)) == 1
     assert store.current.state is ActionState.UNKNOWN
     assert not any(call[0] == "definitive_fail" for call in store.calls)
+    assert any(call[0] == "schedule" and call[3] == "provider_timeout" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_open_provider_circuit_defers_without_provider_call():
+    circuit = AsyncMock()
+    circuit.circuit_status.return_value = CircuitStatus(
+        is_open=True,
+        retry_after_seconds=120,
+        failure_count=5,
+    )
+    store = FakeStore()
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter, circuit_guard=circuit).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code == "provider_circuit_open"
+    assert adapter.calls == []
+    assert ("schedule", ActionState.PREPARED, 120, "provider_circuit_open") in store.calls
+
+
+@pytest.mark.asyncio
+async def test_repeated_execute_cannot_bypass_scheduled_retry_due_time():
+    store = FakeStore(
+        row(
+            ActionState.RETRY_READY,
+            action_uid=ACTION_UID,
+            attempt_count=1,
+            next_attempt_at=NOW + timedelta(minutes=2),
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["create"]
 
 
 @pytest.mark.asyncio
@@ -387,6 +439,27 @@ async def test_explicit_non_acceptance_is_only_path_to_retry_ready():
 
     assert result.status is PublicStatus.PENDING
     assert store.current.state is ActionState.RETRY_READY
+    assert any(call[0] == "schedule" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch():
+    store = FakeStore(
+        row(
+            ActionState.UNKNOWN,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-1",
+            attempt_count=5,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert adapter.calls == []
+    assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+    assert [call for call in store.calls if call[0] == "claim"] == [("claim", ActionState.UNKNOWN, "gateway-test")]
 
 
 @pytest.mark.asyncio
@@ -427,3 +500,63 @@ async def test_zillow_refresh_dependency_returns_pending_not_staff_question():
     assert result.detail_code == "zillow_refresh_required"
     assert "staff" not in result.detail_code
     assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_due_dependency_retry_is_claimed_so_retry_budget_advances():
+    store = FakeStore(
+        row(
+            ActionState.DEPENDENCY_WAIT,
+            action_uid=ACTION_UID,
+            detail_code="zillow_refresh_required",
+            attempt_count=2,
+        )
+    )
+    adapter = FakeAdapter()
+    proof = evidence(refresh_required_through=NOW, refresh=None)
+    old_context = replace(context(), source_sent_at=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
+    loader = AsyncMock()
+    loader.load.return_value = old_context
+    proof_loader = AsyncMock()
+    proof_loader.load.return_value = proof
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    result = await gateway.resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.calls[0][:2] == ("claim", ActionState.DEPENDENCY_WAIT)
+    assert any(call[0] == "schedule" for call in store.calls)
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_due_dependency_terminal_preflight_uses_held_lease():
+    store = FakeStore(
+        row(
+            ActionState.DEPENDENCY_WAIT,
+            action_uid=ACTION_UID,
+            detail_code="zillow_refresh_required",
+            attempt_count=2,
+        )
+    )
+    adapter = FakeAdapter()
+    proof = evidence(later_inbound_message_id=701)
+
+    result = await service(store, adapter, proof=proof).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.STALE
+    assert store.calls[-1] == (
+        "transition",
+        ActionState.DEPENDENCY_WAIT,
+        ActionState.STALE,
+        "newer_inbound",
+        "gateway-test",
+    )

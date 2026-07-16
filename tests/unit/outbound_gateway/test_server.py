@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
+from starlette.testclient import TestClient
 
+from postgres_mcp.outbound_gateway.metrics import MetricSample
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
@@ -46,6 +48,32 @@ async def test_focused_server_exposes_only_outbound_action_and_health_resource()
     assert [tool.name for tool in tools] == ["outbound_action"]
     assert [str(resource.uri) for resource in resources] == ["health://outbound-gateway"]
     assert all(tool.name not in {"execute_sql", "outbound_lock"} for tool in tools)
+
+
+def test_loopback_http_health_and_metrics_routes_are_sanitized():
+    service = AsyncMock()
+    observability = AsyncMock()
+    observability.database_healthy.return_value = True
+    observability.collect.return_value = (MetricSample("outbound_gateway_actions_total", 3, {"outcome": "submitted"}),)
+    mcp = create_server(
+        service,
+        FeaturePolicy(writes_enabled=False, kill_switch=True),
+        observability=observability,
+    )
+
+    with TestClient(mcp.streamable_http_app()) as client:
+        health = client.get("/healthz")
+        metrics = client.get("/metrics")
+
+    assert health.status_code == 200
+    assert health.json() == {
+        "kill_switch": True,
+        "status": "ok",
+        "writes_enabled": False,
+    }
+    assert metrics.status_code == 200
+    assert 'outbound_gateway_actions_total{outcome="submitted"} 3' in metrics.text
+    assert "recipient" not in metrics.text
 
 
 @pytest.mark.asyncio

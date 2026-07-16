@@ -229,21 +229,54 @@ class PostgresActionStore:
         )
         return self._record(rows[0].cells) if rows else None
 
-    async def list_work(self, limit: int) -> list[tuple[UUID, ActionState]]:
+    async def schedule_next_attempt(
+        self,
+        action_id: UUID,
+        expected_state: ActionState,
+        delay_seconds: int,
+        detail_code: str,
+    ) -> OutboundActionRecord:
+        return await self._one(
+            "SELECT * FROM schedule_outbound_action_attempt({}, {}, {}, {})",
+            [action_id, expected_state.value, delay_seconds, detail_code],
+        )
+
+    async def list_work(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
             SELECT action_id, state
             FROM outbound_actions
             WHERE state IN (
-                'dependency_wait', 'prepared', 'dispatching', 'unknown',
-                'reconciling', 'retry_ready'
+                'dependency_wait', 'prepared', 'dispatching', 'provider_accepted',
+                'unknown', 'reconciling', 'retry_ready'
             )
               AND (lease_owner IS NULL OR lease_expires_at <= now())
+              AND next_attempt_at <= now()
+              AND attempt_count < {}
             ORDER BY updated_at, action_id
             LIMIT {}
             """,
-            [limit],
+            [max_attempts, limit],
+        )
+        return [(UUID(str(row.cells["action_id"])), ActionState(str(row.cells["state"]))) for row in rows or []]
+
+    async def list_exhausted(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]:
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT action_id, state
+            FROM outbound_actions
+            WHERE state IN (
+                'dependency_wait', 'prepared', 'dispatching', 'provider_accepted',
+                'unknown', 'reconciling', 'retry_ready'
+            )
+              AND (lease_owner IS NULL OR lease_expires_at <= now())
+              AND attempt_count >= {}
+            ORDER BY updated_at, action_id
+            LIMIT {}
+            """,
+            [max_attempts, limit],
         )
         return [(UUID(str(row.cells["action_id"])), ActionState(str(row.cells["state"]))) for row in rows or []]
 
@@ -266,4 +299,5 @@ class PostgresActionStore:
             completion_kind=CompletionKind(str(completion)) if completion else None,
             detail_code=str(cells["detail_code"]),
             attempt_count=int(cells.get("attempt_count") or 0),
+            next_attempt_at=cells["next_attempt_at"],
         )

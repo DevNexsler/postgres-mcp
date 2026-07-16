@@ -20,6 +20,8 @@ from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
+from .metrics import CircuitStatus
+from .metrics import bounded_backoff_seconds
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
@@ -50,6 +52,7 @@ class OutboundActionRecord:
     completion_kind: CompletionKind | None
     detail_code: str
     attempt_count: int
+    next_attempt_at: datetime
 
     def execute_request(self) -> ExecuteRequest:
         return ExecuteRequest.model_validate(
@@ -118,9 +121,27 @@ class ActionStore(Protocol):
 
     async def get(self, action_id: UUID) -> OutboundActionRecord | None: ...
 
+    async def schedule_next_attempt(
+        self,
+        action_id: UUID,
+        expected_state: ActionState,
+        delay_seconds: int,
+        detail_code: str,
+    ) -> OutboundActionRecord: ...
+
 
 class PreflightEvidenceLoader(Protocol):
     async def load(self, context: ActionContext) -> PreflightEvidence: ...
+
+
+class CircuitGuard(Protocol):
+    async def circuit_status(self, operation: Operation) -> CircuitStatus: ...
+
+
+class ClosedCircuitGuard:
+    async def circuit_status(self, operation: Operation) -> CircuitStatus:
+        del operation
+        return CircuitStatus(is_open=False, retry_after_seconds=0, failure_count=0)
 
 
 Clock = Callable[[], datetime]
@@ -143,6 +164,9 @@ class OutboundActionService:
         response_budget_seconds: float = 25,
         lease_seconds: int = 60,
         sleep: Sleeper = asyncio.sleep,
+        circuit_guard: CircuitGuard | None = None,
+        retry_base_seconds: int = 5,
+        retry_max_seconds: int = 900,
     ):
         self._store = store
         self._context_loader = context_loader
@@ -154,12 +178,17 @@ class OutboundActionService:
         self._response_budget_seconds = max(0, min(response_budget_seconds, 29))
         self._lease_seconds = lease_seconds
         self._sleep = sleep
+        self._circuit_guard = circuit_guard or ClosedCircuitGuard()
+        self._retry_base_seconds = max(1, retry_base_seconds)
+        self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         context = await self._context_loader.load(request)
         action = await self._store.create_or_load(context)
         if action.state is ActionState.COMPLETED:
             return self._result(action, repeated=True)
+        if not self._is_due(action):
+            return self._result(action)
         if action.state in {
             ActionState.STALE,
             ActionState.REJECTED,
@@ -183,6 +212,8 @@ class OutboundActionService:
 
     async def resume(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
+        if not self._is_due(action):
+            return self._result(action)
         context = await self._context_loader.load(action.execute_request())
         if action.state is ActionState.DEPENDENCY_WAIT:
             return await self._resume_dependency(action, context)
@@ -192,7 +223,13 @@ class OutboundActionService:
 
     async def reconcile(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
-        if action.state in {ActionState.DISPATCHING, ActionState.RECONCILING}:
+        if not self._is_due(action):
+            return self._result(action)
+        if action.state in {
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            ActionState.RECONCILING,
+        }:
             await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
             action = await self._store.transition(
                 action.action_id,
@@ -235,6 +272,89 @@ class OutboundActionService:
         )
         return await self._finish_observation(reconciling, context, adapter, observation)
 
+    async def exhaust(self, action_id: UUID) -> PublicResult:
+        """Close exhausted work without another provider invocation."""
+        action = await self._require_action(action_id)
+        lease_held = False
+        observation = ProviderObservation(
+            ProviderDisposition.AMBIGUOUS,
+            "retry_budget_exhausted",
+            provider_request_ref=action.provider_request_ref,
+        )
+        if action.state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
+            await self._store.claim(
+                action.action_id,
+                action.state,
+                self._lease_owner,
+                self._lease_seconds,
+            )
+            lease_held = True
+            action = await self._store.transition(
+                action.action_id,
+                action.state,
+                ActionState.UNKNOWN,
+                self._lease_owner,
+                observation,
+            )
+            lease_held = False
+        if action.state is ActionState.UNKNOWN:
+            await self._store.claim(
+                action.action_id,
+                action.state,
+                self._lease_owner,
+                self._lease_seconds,
+            )
+            lease_held = True
+            action = await self._store.transition(
+                action.action_id,
+                ActionState.UNKNOWN,
+                ActionState.RECONCILING,
+                self._lease_owner,
+                ProviderObservation(
+                    ProviderDisposition.AMBIGUOUS,
+                    "retry_budget_exhausted_reconciliation",
+                    provider_request_ref=action.provider_request_ref,
+                ),
+            )
+        if action.state in {ActionState.RECONCILING, ActionState.DEPENDENCY_WAIT}:
+            if not lease_held:
+                await self._store.claim(
+                    action.action_id,
+                    action.state,
+                    self._lease_owner,
+                    self._lease_seconds,
+                )
+            action = await self._store.transition(
+                action.action_id,
+                action.state,
+                ActionState.DEAD_LETTER,
+                self._lease_owner,
+                observation,
+            )
+            return self._result(action)
+        if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
+            await self._store.claim(
+                action.action_id,
+                action.state,
+                self._lease_owner,
+                self._lease_seconds,
+            )
+            failed = await self._store.definitive_fail(
+                action.action_id,
+                action.state,
+                self._lease_owner,
+                ProviderObservation(
+                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                    "retry_budget_exhausted",
+                    provider_request_ref=action.provider_request_ref,
+                    category="retry_budget_exhausted",
+                    retryable=False,
+                    evidence={"kind": "retry_budget"},
+                ),
+            )
+            return self._result(failed)
+        return self._result(action)
+
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         evidence = await self._evidence_loader.load(context)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
@@ -246,6 +366,12 @@ class OutboundActionService:
         return await self._apply_preflight_decision(action, evidence, decision)
 
     async def _resume_dependency(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
+        action = await self._store.claim(
+            action.action_id,
+            action.state,
+            self._lease_owner,
+            self._lease_seconds,
+        )
         evidence = await self._evidence_loader.load(context)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
@@ -254,20 +380,22 @@ class OutboundActionService:
                 return self._result(prepared, repeated=True)
             return await self._dispatch(prepared, context)
         if decision.outcome is PreflightOutcome.DEPENDENCY_WAIT:
-            return public_result(
-                state=action.state,
-                action_id=action.action_id,
-                action_uid=action.action_uid,
-                provider_request_ref=action.provider_request_ref,
-                detail_code=decision.detail_code,
-            )
-        return await self._apply_preflight_decision(action, evidence, decision)
+            scheduled = await self._schedule(action, decision.detail_code)
+            return self._result(scheduled)
+        return await self._apply_preflight_decision(
+            action,
+            evidence,
+            decision,
+            lease_owner=self._lease_owner,
+        )
 
     async def _apply_preflight_decision(
         self,
         action: OutboundActionRecord,
         evidence: PreflightEvidence,
         decision: PreflightDecision,
+        *,
+        lease_owner: str | None = None,
     ) -> PublicResult:
         if decision.outcome is PreflightOutcome.DUPLICATE:
             assert evidence.verified_outbound_request_ref is not None
@@ -281,7 +409,7 @@ class OutboundActionService:
             completed = await self._store.complete(
                 action.action_id,
                 action.state,
-                None,
+                lease_owner,
                 receipt,
                 CompletionKind.DUPLICATE,
                 decision.detail_code,
@@ -293,8 +421,20 @@ class OutboundActionService:
                 action.action_id,
                 action.state,
                 target,
-                None,
+                lease_owner,
                 ProviderObservation(ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE, decision.detail_code),
+            )
+            return self._result(transitioned)
+        if decision.outcome is PreflightOutcome.MANUAL_REVIEW and action.state is ActionState.DEPENDENCY_WAIT:
+            transitioned = await self._store.transition(
+                action.action_id,
+                action.state,
+                ActionState.DEAD_LETTER,
+                lease_owner,
+                ProviderObservation(
+                    ProviderDisposition.AMBIGUOUS,
+                    decision.detail_code,
+                ),
             )
             return self._result(transitioned)
         dependency_code = decision.detail_code
@@ -302,13 +442,22 @@ class OutboundActionService:
             action.action_id,
             action.state,
             ActionState.DEPENDENCY_WAIT,
-            None,
+            lease_owner,
             ProviderObservation(ProviderDisposition.PENDING, dependency_code),
         )
-        return self._result(transitioned)
+        return self._result(await self._schedule(transitioned, dependency_code))
 
     async def _dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         adapter = self._adapter(context.operation)
+        circuit = await self._circuit_guard.circuit_status(context.operation)
+        if circuit.is_open:
+            scheduled = await self._store.schedule_next_attempt(
+                action.action_id,
+                action.state,
+                max(1, circuit.retry_after_seconds),
+                "provider_circuit_open",
+            )
+            return self._result(scheduled)
         claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         dispatching = await self._store.transition(
             claimed.action_id,
@@ -389,7 +538,7 @@ class OutboundActionService:
                     self._lease_owner,
                     observation,
                 )
-                return self._result(retry)
+                return self._result(await self._schedule(retry, observation.detail_code))
             failed = await self._store.definitive_fail(
                 action.action_id,
                 expected_state,
@@ -404,7 +553,23 @@ class OutboundActionService:
             self._lease_owner,
             observation,
         )
-        return self._result(unknown)
+        return self._result(await self._schedule(unknown, observation.detail_code))
+
+    async def _schedule(
+        self,
+        action: OutboundActionRecord,
+        detail_code: str,
+    ) -> OutboundActionRecord:
+        return await self._store.schedule_next_attempt(
+            action.action_id,
+            action.state,
+            bounded_backoff_seconds(
+                action.attempt_count,
+                base_seconds=self._retry_base_seconds,
+                max_seconds=self._retry_max_seconds,
+            ),
+            detail_code,
+        )
 
     def _adapter(self, operation: Operation) -> ProviderAdapter:
         adapter = self._adapters.get(operation)
@@ -417,6 +582,9 @@ class OutboundActionService:
         if action is None:
             raise LookupError("outbound action does not exist")
         return action
+
+    def _is_due(self, action: OutboundActionRecord) -> bool:
+        return action.next_attempt_at <= self._clock()
 
     @staticmethod
     def evidence_hash(evidence: Mapping[str, Any] | None) -> str:

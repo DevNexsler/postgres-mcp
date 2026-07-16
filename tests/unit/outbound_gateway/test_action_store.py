@@ -40,6 +40,7 @@ def action_row(state="received"):
         "completion_kind": None,
         "detail_code": state,
         "attempt_count": 0,
+        "next_attempt_at": NOW,
     }
 
 
@@ -128,9 +129,36 @@ async def test_store_work_query_includes_expired_dispatch_without_unlocking_it()
         "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
         AsyncMock(side_effect=execute),
     ):
-        work = await store.list_work(20)
+        work = await store.list_work(20, 5)
 
     assert work == [(ACTION_ID, ActionState.DISPATCHING)]
     assert "lease_expires_at <= now()" in calls[0][0]
+    assert "next_attempt_at <= now()" in calls[0][0]
+    assert "attempt_count <" in calls[0][0]
     assert "FOR UPDATE SKIP LOCKED" not in calls[0][0]
-    assert calls[0][1] == [20]
+    assert calls[0][1] == [5, 20]
+
+
+@pytest.mark.asyncio
+async def test_store_schedules_bounded_next_attempt_through_database_function():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("unknown"))]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        scheduled = await store.schedule_next_attempt(
+            ACTION_ID,
+            ActionState.UNKNOWN,
+            120,
+            "provider_timeout",
+        )
+
+    assert scheduled.state is ActionState.UNKNOWN
+    assert "schedule_outbound_action_attempt" in calls[0][0]
+    assert calls[0][1] == [ACTION_ID, "unknown", 120, "provider_timeout"]
