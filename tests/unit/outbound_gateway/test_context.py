@@ -570,3 +570,19 @@ async def test_repository_uses_parameterized_queries_for_event_and_alias_reads()
     assert calls[0][1] == [12345]
     assert "12345" not in calls[0][0]
     assert calls[1][1] == [["email:a@example.com"], "144 bullman street"]
+
+
+@pytest.mark.asyncio
+async def test_repository_event_query_survives_literal_empty_json_object():
+    class Row:
+        def __init__(self, cells):
+            self.cells = cells
+
+    class Driver:
+        async def execute_query(self, query, *args, **kwargs):
+            assert "'{}'::jsonb" in query
+            return [Row(record().__dict__)]
+
+    loaded = await OutboundGatewayRepository(Driver()).load_wake_event(12345)
+
+    assert loaded.wakeup_event_id == 12345

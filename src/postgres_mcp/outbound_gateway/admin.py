@@ -45,7 +45,7 @@ async def _run(args: argparse.Namespace, driver: Any) -> UUID:
             driver,
             """
             SELECT action_id FROM resolve_outbound_action_from_evidence(
-                {}, {}, {}, {}, {}, {}, {}, {}, '{}'::jsonb
+                {}, {}, {}, {}, {}, {}, {}, {}, '{{}}'::jsonb
             )
             """,
             [

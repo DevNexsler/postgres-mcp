@@ -95,7 +95,7 @@ class OutboundGatewayRepository:
                 participant_row.participant_key,
                 participant_row.display_name,
                 event_row.envelope,
-                coalesce(raw_row.payload, '{}'::jsonb) AS raw_payload
+                coalesce(raw_row.payload, '{{}}'::jsonb) AS raw_payload
             FROM hermes_wakeup_events AS event_row
             JOIN messages AS message_row ON message_row.id = event_row.message_id
             JOIN channels AS channel_row ON channel_row.id = message_row.channel_id
