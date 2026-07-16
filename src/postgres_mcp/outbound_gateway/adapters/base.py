@@ -144,20 +144,19 @@ def initial_observation(result: McpCallResult) -> ProviderObservation | None:
     if status in {"failed", "lost"}:
         category = payload.get("category") if payload else None
         category = category if isinstance(category, str) else "request_lost" if status == "lost" else "provider_failure"
-        if status == "lost":
-            return ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "provider_request_lost",
-                provider_request_ref=ref,
-                category=category,
-            )
+        # Queue failure proves only that the provider call did not produce a
+        # usable receipt. It does not prove non-acceptance: SMTP, calendar, or
+        # messaging providers can accept an effect before the queue reports a
+        # terminal error. Keep the lock and reconcile. Individual adapters may
+        # emit DEFINITIVE_NON_ACCEPTANCE only when their provider contract
+        # supplies authoritative evidence that no effect occurred.
         return ProviderObservation(
-            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-            f"provider_{category}",
+            ProviderDisposition.AMBIGUOUS,
+            "provider_request_lost" if status == "lost" else f"provider_{category}",
             provider_request_ref=ref,
             category=category,
             retryable=bool(payload.get("retryable")) if payload else False,
-            evidence={"status": "failed", "category": category},
+            evidence={"status": status, "category": category},
         )
     if result.is_error:
         return ProviderObservation(

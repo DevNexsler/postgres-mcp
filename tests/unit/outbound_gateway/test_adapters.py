@@ -310,12 +310,12 @@ async def test_calendar_adapter_parses_agent_email_request_status_result(
         (McpCallResult(error_kind=TransportErrorKind.CONNECTION_LOST, is_error=True), ProviderDisposition.AMBIGUOUS, "provider_connection_lost"),
         (
             McpCallResult(structured_content={"status": "failed", "category": "auth_error", "retryable": False}),
-            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            ProviderDisposition.AMBIGUOUS,
             "provider_auth_error",
         ),
         (
             McpCallResult(structured_content={"status": "failed", "category": "transient_upstream_error", "retryable": True}),
-            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            ProviderDisposition.AMBIGUOUS,
             "provider_transient_upstream_error",
         ),
         (
@@ -330,7 +330,7 @@ async def test_calendar_adapter_parses_agent_email_request_status_result(
         ),
     ],
 )
-async def test_failures_distinguish_definite_non_acceptance_from_ambiguity(result, expected, detail):
+async def test_provider_failures_without_acceptance_proof_remain_ambiguous(result, expected, detail):
     adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
     client = FakeClient(result)
     observation = await adapter.invoke(client, adapter.build_request(context(), ACTION_UID))
