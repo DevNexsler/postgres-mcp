@@ -476,6 +476,74 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
 
 
 @pytest.mark.asyncio
+async def test_near_simultaneous_cross_channel_duplicate_is_canonicalized():
+    event = record(
+        message_source="zillow_rm_web_extract",
+        message_sent_at=datetime(2026, 7, 15, 22, 26, tzinfo=timezone.utc),
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "Kailani Deleon",
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "kailani.abc@convo.zillow.com",
+            },
+            "routing_hints": {
+                "potential_cross_channel_duplicate": {
+                    "duplicate_of_message_id": 196337,
+                    "duplicate_of_source": "zoho_mail",
+                    "duplicate_of_sent_at": "2026-07-15 22:26:10+00:00",
+                }
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.cross_channel_duplicate_message_ids == (196337,)
+    assert context.canonical_context["cross_channel_duplicate_message_ids"] == [196337]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("duplicate_source", "duplicate_sent_at", "duplicate_message_id"),
+    [
+        ("zillow_rm_web_extract", "2026-07-15T22:26:10Z", 196337),
+        ("zoho_mail", "2026-07-15T22:29:01Z", 196337),
+        ("zoho_mail", "not-a-time", 196337),
+        ("zoho_mail", "2026-07-15T22:26:10Z", True),
+    ],
+)
+async def test_unverified_cross_channel_duplicate_hint_is_ignored(
+    duplicate_source,
+    duplicate_sent_at,
+    duplicate_message_id,
+):
+    event = record(
+        message_source="zillow_rm_web_extract",
+        message_sent_at=datetime(2026, 7, 15, 22, 26, tzinfo=timezone.utc),
+        envelope={
+            "identity": {},
+            "message": {
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "kailani.abc@convo.zillow.com",
+            },
+            "routing_hints": {
+                "potential_cross_channel_duplicate": {
+                    "duplicate_of_message_id": duplicate_message_id,
+                    "duplicate_of_source": duplicate_source,
+                    "duplicate_of_sent_at": duplicate_sent_at,
+                }
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.cross_channel_duplicate_message_ids == ()
+    assert context.canonical_context["cross_channel_duplicate_message_ids"] == []
+
+
+@pytest.mark.asyncio
 async def test_duplicate_provider_and_property_aliases_converge():
     first_repo = FakeRepository(record(), canonical_subject="prospect:amanda")
     second_repo = FakeRepository(

@@ -117,6 +117,7 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     assert "related.source_message_id" in query
     assert "recipient.value->>'address'" in query
     assert query.count("(related.sent_at, related.id) > (") == 2
+    assert "related.id = any({}::bigint[])" in query
     assert calls[0][1] == [
         "zillow",
         "lead@convo.zillow.com",
@@ -131,6 +132,7 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
         44,
         NOW,
         700,
+        [700],
         NOW,
         700,
         "zillow",
@@ -141,6 +143,37 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
         7,
         NOW,
     ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_excludes_only_canonical_cross_channel_duplicate_from_newer_inbound():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": None,
+                    "verified_outbound_request_ref": None,
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    duplicate_context = context(cross_channel_duplicate_message_ids=(196337,))
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await DatabasePreflightEvidenceLoader(object()).load(duplicate_context)
+
+    query, params = calls[0]
+    assert "NOT (related.id = ANY({}::bigint[]))" in query
+    assert params[13] == [700, 196337]
 
 
 @pytest.mark.asyncio

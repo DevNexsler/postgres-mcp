@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
+from datetime import timezone
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
@@ -29,6 +30,7 @@ _SYSTEM_EMAIL_LOCAL_PARTS = frozenset({"mailer-daemon", "no-reply", "noreply", "
 _ZILLOW_PROVIDER_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
 _EMAIL_PARTICIPANT_TYPES = frozenset({"email", "email_address"})
 _PHONE_PARTICIPANT_TYPES = frozenset({"phone", "phone_number", "sms", "tel"})
+_CROSS_CHANNEL_DUPLICATE_MAX_SECONDS = 120
 _ADDRESS_WORDS = {
     "n": "north",
     "s": "south",
@@ -106,6 +108,7 @@ class ActionContext:
     calendar_event_etag: str | None = None
     channel_id: int = 0
     refresh_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    cross_channel_duplicate_message_ids: tuple[int, ...] = ()
 
 
 def normalize_string(value: str) -> str:
@@ -274,6 +277,10 @@ class ActionContextLoader:
             _nonblank(message.get("phone")) or (record.participant_key if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
         )
         refresh_evidence = _mapping(raw.get("zillow_refresh") or envelope.get("zillow_refresh"))
+        cross_channel_duplicate_message_ids = self._cross_channel_duplicate_message_ids(
+            record,
+            envelope,
+        )
 
         canonical_scope = self._scope(
             request,
@@ -309,6 +316,7 @@ class ActionContextLoader:
             "recipient_phone": recipient_phone,
             "channel_id": record.channel_id,
             "refresh_evidence": refresh_evidence,
+            "cross_channel_duplicate_message_ids": list(cross_channel_duplicate_message_ids),
         }
         canonical_context = MappingProxyType(canonical_context_data)
         payload_hash = canonical_payload_hash(
@@ -356,7 +364,44 @@ class ActionContextLoader:
             calendar_event_etag=calendar_event_etag,
             channel_id=record.channel_id,
             refresh_evidence=MappingProxyType(dict(refresh_evidence)),
+            cross_channel_duplicate_message_ids=cross_channel_duplicate_message_ids,
         )
+
+    @staticmethod
+    def _cross_channel_duplicate_message_ids(
+        record: WakeEventRecord,
+        envelope: Mapping[str, Any],
+    ) -> tuple[int, ...]:
+        routing_hints = _mapping(envelope.get("routing_hints"))
+        hint = _mapping(routing_hints.get("potential_cross_channel_duplicate"))
+        duplicate_id = hint.get("duplicate_of_message_id")
+        duplicate_source = _nonblank(hint.get("duplicate_of_source"))
+        duplicate_sent_at = _nonblank(hint.get("duplicate_of_sent_at"))
+        if (
+            isinstance(duplicate_id, bool)
+            or not isinstance(duplicate_id, int)
+            or duplicate_id <= 0
+            or not duplicate_source
+            or duplicate_source.casefold() == record.message_source.casefold()
+            or not duplicate_sent_at
+            or record.message_sent_at.tzinfo is None
+        ):
+            return ()
+        try:
+            parsed_sent_at = datetime.fromisoformat(duplicate_sent_at.replace("Z", "+00:00"))
+        except ValueError:
+            return ()
+        if parsed_sent_at.tzinfo is None:
+            return ()
+        delta_seconds = abs(
+            (
+                parsed_sent_at.astimezone(timezone.utc)
+                - record.message_sent_at.astimezone(timezone.utc)
+            ).total_seconds()
+        )
+        if delta_seconds > _CROSS_CHANNEL_DUPLICATE_MAX_SECONDS:
+            return ()
+        return (duplicate_id,)
 
     @staticmethod
     def _provider(
