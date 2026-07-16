@@ -78,6 +78,12 @@ class PostgresActionStore:
 
     async def prepare(self, context: ActionContext, expected_state: ActionState) -> OutboundActionRecord:
         slot = context.appointment_slot.isoformat() if context.appointment_slot else ""
+        if context.action_role is ActionRole.PROSPECT_REPLY:
+            lock_intent = f"{context.intent_kind.value}:turn:{context.source_message_id}"
+        elif context.action_role is ActionRole.CALENDAR_MUTATION:
+            lock_intent = f"{context.intent_kind.value}:lifecycle:{context.showing_lifecycle_id}"
+        else:
+            lock_intent = f"{context.intent_kind.value}:event:{context.wakeup_event_id}"
         return await self._one(
             """
             SELECT * FROM prepare_outbound_action_and_acquire_lock(
@@ -89,7 +95,7 @@ class PostgresActionStore:
                 expected_state.value,
                 context.prospect_id,
                 context.property_id or context.property_label or "",
-                context.intent_kind.value,
+                lock_intent,
                 slot,
                 list(context.aliases),
                 bool(slot and context.property_id),
@@ -300,4 +306,10 @@ class PostgresActionStore:
             detail_code=str(cells["detail_code"]),
             attempt_count=int(cells.get("attempt_count") or 0),
             next_attempt_at=cells["next_attempt_at"],
+            payload_hash=str(cells.get("payload_hash") or ""),
+            canonical_context=dict(cells.get("canonical_context") or {}),
+            canonical_scope=dict(cells.get("canonical_scope") or {}),
+            recipient_scope=dict(cells.get("recipient_scope") or {}),
+            provider_account=str(cells.get("provider_account") or ""),
+            routing_policy_version=str(cells.get("routing_policy_version") or ""),
         )

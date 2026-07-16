@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from unittest.mock import AsyncMock
@@ -91,7 +92,11 @@ def policy():
             "hotpads": "nigel-zoho",
             "tenantcloud": "nigel-zoho",
         },
-        quo_line_by_provider={"quo": "leasing-main"},
+        quo_line_by_provider={
+            "quo": "leasing-main",
+            "tenantcloud": "leasing-main",
+            "zillow": "leasing-main",
+        },
         calendar_by_profile={"appointment-setter": "nigel"},
         cliq_target_by_intent={"lead_alert": "tenant-leads"},
         property_aliases={
@@ -190,6 +195,25 @@ def request(**overrides) -> ExecuteRequest:
         ),
         (
             record(
+                raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
+                source_channel_id="tenantcloud-lead-1",
+                participant_key="tenant@example.com",
+                envelope={
+                    "identity": {},
+                    "message": {
+                        "property": "16 N Main St #16",
+                        "direct_email": "tenant@example.com",
+                        "phone": "+1 908 555 0199",
+                    },
+                },
+            ),
+            request(operation="quo.sms.send"),
+            "quo_conversation",
+            "+19085550199",
+            "leasing-main",
+        ),
+        (
+            record(
                 event_source="zoho_cliq",
                 message_source="zoho_cliq",
                 source_channel_id="tenant-leads",
@@ -235,6 +259,51 @@ async def test_context_derives_provider_targets_server_side(event, action, targe
     assert context.source_message_id == event.message_id
     assert context.conversation_watermark == 700
     assert len(context.payload_hash) == 64
+
+
+@pytest.mark.asyncio
+async def test_rollout_policy_rejects_cross_channel_provider_route():
+    restricted = replace(
+        policy(),
+        enabled_operations_by_provider={
+            "zillow": frozenset({"email.send"}),
+            "hotpads": frozenset({"email.send"}),
+            "quo": frozenset({"quo.sms.send"}),
+        },
+        enabled_intents=frozenset({"inquiry_reply", "showing_offer"}),
+    )
+    tenantcloud = record(
+        raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
+        participant_key="+19085550199",
+        participant_type="phone",
+        channel_type="sms",
+        envelope={
+            "identity": {},
+            "message": {
+                "property": "16 N Main St #16",
+                "phone": "+1 908 555 0199",
+            },
+        },
+    )
+
+    with pytest.raises(ContextDerivationError, match="provider operation is disabled"):
+        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(
+            request(operation="quo.sms.send")
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollout_policy_rejects_unapproved_intent():
+    restricted = replace(
+        policy(),
+        enabled_operations_by_provider={"zillow": frozenset({"email.send"})},
+        enabled_intents=frozenset({"inquiry_reply", "showing_offer"}),
+    )
+
+    with pytest.raises(ContextDerivationError, match="intent is disabled"):
+        await ActionContextLoader(FakeRepository(record()), restricted).load(
+            request(intent_kind="showing_confirmation")
+        )
 
 
 @pytest.mark.asyncio
@@ -286,6 +355,31 @@ async def test_ambiguous_aliases_and_unverified_targets_fail_closed():
             "message": {"property": "144 Bullman Street"},
         },
     )
+    with pytest.raises(ContextDerivationError, match="verified target"):
+        await ActionContextLoader(FakeRepository(unsafe), policy()).load(request())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_address",
+    (
+        "no-reply@comet.zillow.com",
+        "noreply@tenantcloud.com",
+        "postmaster@example.com",
+    ),
+)
+async def test_system_sender_cannot_become_customer_email_target(unsafe_address):
+    unsafe = record(
+        participant_key=unsafe_address,
+        envelope={
+            "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
+            "message": {
+                "property": "138 Bullman St #144-A",
+                "direct_email": unsafe_address,
+            },
+        },
+    )
+
     with pytest.raises(ContextDerivationError, match="verified target"):
         await ActionContextLoader(FakeRepository(unsafe), policy()).load(request())
 

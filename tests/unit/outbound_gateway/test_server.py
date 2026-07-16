@@ -7,10 +7,14 @@ import pytest
 from starlette.testclient import TestClient
 
 from postgres_mcp.outbound_gateway.metrics import MetricSample
+from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
+from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_INTENTS
+from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER
+from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
 from postgres_mcp.outbound_gateway.server import create_server
@@ -25,6 +29,14 @@ def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
         "zillow": "management@pfg.io",
         "hotpads": "management@pfg.io",
     }
+    assert DEFAULT_PROPERTY_ALIASES["138 bullman street 144 a"] == "building:bullman-st"
+    assert DEFAULT_PROPERTY_ALIASES["144 bullman street"] == "building:bullman-st"
+    assert DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER == {
+        "hotpads": frozenset({"email.send"}),
+        "quo": frozenset({"quo.sms.send"}),
+        "zillow": frozenset({"email.send"}),
+    }
+    assert DEFAULT_ENABLED_INTENTS == frozenset({"inquiry_reply", "showing_offer"})
 
 
 def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
@@ -133,4 +145,20 @@ async def test_write_policy_rejects_before_database_or_provider_call(policy, det
 
     assert result["status"] == "rejected"
     assert result["detail_code"] == detail
+    service.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disabled_operation_rejects_before_database_or_provider_call():
+    service = AsyncMock()
+    policy = FeaturePolicy(
+        writes_enabled=True,
+        kill_switch=False,
+        enabled_operations=frozenset({Operation.QUO_SMS_SEND}),
+    )
+
+    result = await handle_outbound_action(service, policy, execute_payload())
+
+    assert result["status"] == "rejected"
+    assert result["detail_code"] == "operation_disabled"
     service.execute.assert_not_called()

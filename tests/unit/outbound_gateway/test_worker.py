@@ -58,3 +58,30 @@ async def test_worker_exhausts_retry_budget_before_listing_due_work():
     service.exhaust.assert_awaited_once_with(exhausted_id)
     service.reconcile.assert_not_called()
     service.resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_isolates_poison_action_and_continues_batch():
+    poison = UUID(int=21)
+    healthy = UUID(int=22)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [
+        (poison, ActionState.UNKNOWN),
+        (healthy, ActionState.UNKNOWN),
+    ]
+    service = AsyncMock()
+    service.reconcile.side_effect = [RuntimeError("poison"), None]
+    failures = []
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        batch_size=20,
+        on_error=lambda action_id, operation, error: failures.append(
+            (action_id, operation, type(error).__name__)
+        ),
+    )
+
+    assert await worker.run_once() == 2
+    assert service.reconcile.await_args_list[1].args == (healthy,)
+    assert failures == [(poison, "reconcile", "RuntimeError")]

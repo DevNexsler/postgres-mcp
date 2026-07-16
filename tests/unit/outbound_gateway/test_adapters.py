@@ -153,6 +153,49 @@ async def test_email_adapter_derives_recipient_and_returns_structured_receipt():
     assert receipt.provider_request_ref == "req-1"
 
 
+@pytest.mark.asyncio
+async def test_email_reconciliation_reads_queued_thread_result_text():
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    unknown = await adapter.invoke(
+        FakeClient(
+            McpCallResult(
+                error_kind=TransportErrorKind.TIMEOUT,
+                is_error=True,
+            )
+        ),
+        adapter.build_request(context(), ACTION_UID),
+    )
+    client = FakeClient(
+        pending("thread-lookup-1"),
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "request_id": "thread-lookup-1",
+                "result": {
+                    "tool_name": "email_get_thread",
+                    "structured_content": {
+                        "status": "success",
+                        "data": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "**Thread:** exact deterministic message",
+                                }
+                            ]
+                        },
+                    },
+                },
+            }
+        ),
+    )
+
+    reconciled = await adapter.reconcile(client, context(), ACTION_UID, unknown)
+
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert reconciled.detail_code == "email_reconciled_by_message_id"
+    assert reconciled.message_id == f"<outbound-action-{ACTION_UID}@pfg.example>"
+
+
 def test_email_adapter_applies_management_copy_only_to_configured_sources():
     adapter = EmailAdapter(
         sender_domains={"nigel-zoho": "pfg.io"},

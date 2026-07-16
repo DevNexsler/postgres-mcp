@@ -25,6 +25,10 @@ from .repository import WakeEventRecord
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_SYSTEM_EMAIL_LOCAL_PARTS = frozenset(
+    {"mailer-daemon", "no-reply", "noreply", "do-not-reply", "donotreply", "postmaster"}
+)
+_ZILLOW_PROVIDER_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
 _ADDRESS_WORDS = {
     "n": "north",
     "s": "south",
@@ -61,6 +65,10 @@ class RoutingPolicy:
     property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
     calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
+    enabled_operations_by_provider: Mapping[str, frozenset[str]] = dataclass_field(
+        default_factory=dict
+    )
+    enabled_intents: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,25 @@ def normalize_phone(value: str | None) -> str | None:
     return f"+{digits}" if 10 < len(digits) <= 15 else None
 
 
+def replyable_email(value: str | None, *, require_zillow_proxy: bool = False) -> str | None:
+    address = _nonblank(value)
+    if not address:
+        return None
+    address = address.casefold()
+    if not _EMAIL.fullmatch(address):
+        return None
+    local_part, domain = address.rsplit("@", 1)
+    normalized_local = local_part.replace("_", "-").replace(".", "-")
+    if normalized_local in _SYSTEM_EMAIL_LOCAL_PARTS or any(
+        token in normalized_local
+        for token in ("do-not-reply", "donotreply", "no-reply", "noreply")
+    ):
+        return None
+    if require_zillow_proxy and domain != "convo.zillow.com":
+        return None
+    return address
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -167,6 +194,18 @@ class ActionContextLoader:
         message = _mapping(envelope.get("message"))
         raw = _mapping(record.raw_payload)
         provider = self._provider(record, raw, message)
+        if self._policy.enabled_operations_by_provider:
+            allowed_operations = self._policy.enabled_operations_by_provider.get(
+                provider,
+                frozenset(),
+            )
+            if request.operation.value not in allowed_operations:
+                raise ContextDerivationError("provider operation is disabled")
+        if (
+            self._policy.enabled_intents
+            and request.intent_kind.value not in self._policy.enabled_intents
+        ):
+            raise ContextDerivationError("intent is disabled")
         property_label = self._property_label(record, raw, message)
         property_scope = normalize_property_key(property_label)
         property_id = self._policy.property_aliases.get(property_scope)
@@ -409,17 +448,29 @@ class ActionContextLoader:
         message: Mapping[str, Any],
     ) -> tuple[DerivedTarget, str]:
         if request.operation is Operation.EMAIL_SEND:
-            raw_target = _nonblank(message.get("proxy_email")) or _nonblank(message.get("direct_email")) or _nonblank(record.participant_key)
-            target = raw_target.casefold() if raw_target else ""
+            proxy = replyable_email(
+                _nonblank(message.get("proxy_email")),
+                require_zillow_proxy=provider in _ZILLOW_PROVIDER_FAMILY,
+            )
+            direct = replyable_email(_nonblank(message.get("direct_email")))
+            participant = replyable_email(
+                record.participant_key
+                if record.participant_type in {"email", "email_address"}
+                and record.channel_type in {"email", "email_thread"}
+                else None
+            )
+            target = proxy if provider in _ZILLOW_PROVIDER_FAMILY else proxy or direct or participant
+            target = target or ""
             account = self._policy.email_account_by_provider.get(provider, "")
             return DerivedTarget("email_thread", target, bool(account and _EMAIL.fullmatch(target))), account
         if request.operation is Operation.QUO_SMS_SEND:
             phone = normalize_phone(_nonblank(message.get("phone")) or _nonblank(record.participant_key))
             account = self._policy.quo_line_by_provider.get(provider, "")
+            target_id = thread_identity if provider == "quo" else phone or ""
             return DerivedTarget(
                 "quo_conversation",
-                thread_identity,
-                bool(account and thread_identity and phone),
+                target_id,
+                bool(account and target_id and phone),
             ), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             target_id = self._policy.cliq_target_by_intent.get(request.intent_kind.value, "")

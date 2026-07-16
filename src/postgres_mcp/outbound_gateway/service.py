@@ -53,6 +53,12 @@ class OutboundActionRecord:
     detail_code: str
     attempt_count: int
     next_attempt_at: datetime
+    payload_hash: str
+    canonical_context: Mapping[str, Any]
+    canonical_scope: Mapping[str, Any]
+    recipient_scope: Mapping[str, Any]
+    provider_account: str
+    routing_policy_version: str
 
     def execute_request(self) -> ExecuteRequest:
         return ExecuteRequest.model_validate(
@@ -214,7 +220,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return self._result(action)
-        context = await self._context_loader.load(action.execute_request())
+        context = await self._verified_context(action)
+        if context is None:
+            return await self._manual_review(action, "persisted_context_mismatch")
         if action.state is ActionState.DEPENDENCY_WAIT:
             return await self._resume_dependency(action, context)
         if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
@@ -244,7 +252,9 @@ class OutboundActionService:
             )
         if action.state is not ActionState.UNKNOWN:
             return self._result(action)
-        context = await self._context_loader.load(action.execute_request())
+        context = await self._verified_context(action)
+        if context is None:
+            return await self._manual_review(action, "persisted_context_mismatch")
         adapter = self._adapter(context.operation)
         await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         reconciling = await self._store.transition(
@@ -331,6 +341,17 @@ class OutboundActionService:
                 self._lease_owner,
                 observation,
             )
+            action = await self._store.transition(
+                action.action_id,
+                ActionState.DEAD_LETTER,
+                ActionState.MANUAL_REVIEW,
+                None,
+                ProviderObservation(
+                    ProviderDisposition.AMBIGUOUS,
+                    "retry_budget_exhausted_manual_review",
+                    provider_request_ref=action.provider_request_ref,
+                ),
+            )
             return self._result(action)
         if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
             await self._store.claim(
@@ -362,6 +383,8 @@ class OutboundActionService:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
                 return self._result(prepared, repeated=True)
+            if prepared.state is ActionState.DEPENDENCY_WAIT:
+                return self._result(prepared)
             return await self._dispatch(prepared, context)
         return await self._apply_preflight_decision(action, evidence, decision)
 
@@ -378,6 +401,8 @@ class OutboundActionService:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
                 return self._result(prepared, repeated=True)
+            if prepared.state is ActionState.DEPENDENCY_WAIT:
+                return self._result(prepared)
             return await self._dispatch(prepared, context)
         if decision.outcome is PreflightOutcome.DEPENDENCY_WAIT:
             scheduled = await self._schedule(action, decision.detail_code)
@@ -582,6 +607,62 @@ class OutboundActionService:
         if action is None:
             raise LookupError("outbound action does not exist")
         return action
+
+    async def _verified_context(self, action: OutboundActionRecord) -> ActionContext | None:
+        context = await self._context_loader.load(action.execute_request())
+        if not action.payload_hash:
+            return context
+        expected_recipient = {
+            "kind": context.target.kind,
+            "target_id": context.target.target_id,
+            "verified": context.target.verified,
+        }
+        if (
+            context.action_id != action.action_id
+            or context.payload_hash != action.payload_hash
+            or context.provider_account != action.provider_account
+            or context.routing_policy_version != action.routing_policy_version
+            or dict(context.canonical_context) != dict(action.canonical_context)
+            or dict(context.canonical_scope) != dict(action.canonical_scope)
+            or expected_recipient != dict(action.recipient_scope)
+        ):
+            return None
+        return context
+
+    async def _manual_review(
+        self,
+        action: OutboundActionRecord,
+        detail_code: str,
+    ) -> PublicResult:
+        claimed = await self._store.claim(
+            action.action_id,
+            action.state,
+            self._lease_owner,
+            self._lease_seconds,
+        )
+        dead_letter = await self._store.transition(
+            claimed.action_id,
+            claimed.state,
+            ActionState.DEAD_LETTER,
+            self._lease_owner,
+            ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                detail_code,
+                provider_request_ref=claimed.provider_request_ref,
+            ),
+        )
+        manual = await self._store.transition(
+            dead_letter.action_id,
+            ActionState.DEAD_LETTER,
+            ActionState.MANUAL_REVIEW,
+            None,
+            ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                detail_code,
+                provider_request_ref=dead_letter.provider_request_ref,
+            ),
+        )
+        return self._result(manual)
 
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return action.next_attempt_at <= self._clock()

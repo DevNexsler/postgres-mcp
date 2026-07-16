@@ -45,6 +45,7 @@ ALLOWED_TRANSITIONS: dict[ActionState, set[ActionState]] = {
         ActionState.STALE,
         ActionState.DISPATCHING,
         ActionState.DEFINITIVE_FAILED,
+        ActionState.DEAD_LETTER,
     },
     ActionState.DISPATCHING: {
         ActionState.PROVIDER_ACCEPTED,
@@ -53,14 +54,18 @@ ALLOWED_TRANSITIONS: dict[ActionState, set[ActionState]] = {
         ActionState.DEFINITIVE_FAILED,
     },
     ActionState.PROVIDER_ACCEPTED: {ActionState.COMPLETED, ActionState.UNKNOWN},
-    ActionState.UNKNOWN: {ActionState.RECONCILING},
+    ActionState.UNKNOWN: {ActionState.RECONCILING, ActionState.DEAD_LETTER},
     ActionState.RECONCILING: {
         ActionState.COMPLETED,
         ActionState.UNKNOWN,
         ActionState.RETRY_READY,
         ActionState.DEAD_LETTER,
     },
-    ActionState.RETRY_READY: {ActionState.DISPATCHING, ActionState.DEFINITIVE_FAILED},
+    ActionState.RETRY_READY: {
+        ActionState.DISPATCHING,
+        ActionState.DEFINITIVE_FAILED,
+        ActionState.DEAD_LETTER,
+    },
     ActionState.DEAD_LETTER: {ActionState.MANUAL_REVIEW},
     ActionState.MANUAL_REVIEW: {ActionState.COMPLETED, ActionState.DEFINITIVE_FAILED},
     ActionState.COMPLETED: set(),

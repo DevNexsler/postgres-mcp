@@ -41,6 +41,16 @@ def action_row(state="received"):
         "detail_code": state,
         "attempt_count": 0,
         "next_attempt_at": NOW,
+        "payload_hash": "a" * 64,
+        "canonical_context": {"identity_version": "v1"},
+        "canonical_scope": {"version": "v1"},
+        "recipient_scope": {
+            "kind": "email_thread",
+            "target_id": "lead@convo.zillow.com",
+            "verified": True,
+        },
+        "provider_account": "nigel-zoho",
+        "routing_policy_version": "v1",
     }
 
 
@@ -162,3 +172,22 @@ async def test_store_schedules_bounded_next_attempt_through_database_function():
     assert scheduled.state is ActionState.UNKNOWN
     assert "schedule_outbound_action_attempt" in calls[0][0]
     assert calls[0][1] == [ACTION_ID, "unknown", 120, "provider_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_prospect_lock_scope_includes_canonical_source_turn():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("prepared"))]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.prepare(context(), ActionState.RECEIVED)
+
+    assert "prepare_outbound_action_and_acquire_lock" in calls[0][0]
+    assert calls[0][1][4] == "showing_offer:turn:700"

@@ -121,6 +121,12 @@ def row(state=ActionState.RECEIVED, **overrides):
         detail_code=state.value,
         attempt_count=0,
         next_attempt_at=NOW,
+        payload_hash="",
+        canonical_context={},
+        canonical_scope={},
+        recipient_scope={},
+        provider_account="",
+        routing_policy_version="",
     )
     values.update(overrides)
     return OutboundActionRecord(**values)
@@ -278,6 +284,39 @@ async def test_execute_persists_dispatch_before_io_and_completes_receipt_atomica
     assert store.calls[3][1:3] == (ActionState.PREPARED, ActionState.DISPATCHING)
     assert adapter.calls[:2] == [("build", "lead@convo.zillow.com", ACTION_UID), ("invoke",)]
     assert result.provider_request_ref == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_lock_contention_waits_without_dispatching_provider():
+    store = FakeStore(row())
+
+    async def contended_prepare(ctx, expected_state):
+        store.calls.append(("prepare", expected_state))
+        store.current = replace(
+            store.current,
+            state=ActionState.DEPENDENCY_WAIT,
+            detail_code="intent_lock_contended",
+            next_attempt_at=NOW + timedelta(seconds=5),
+        )
+        return store.current
+
+    store.prepare = contended_prepare
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "accepted",
+            provider_request_ref="must-not-send",
+            message_id="must-not-send",
+            accepted_at=NOW,
+        )
+    )
+
+    result = await service(store, adapter).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code == "intent_lock_contended"
+    assert not adapter.calls
+    assert not any(call[0] == "claim" for call in store.calls)
 
 
 @pytest.mark.asyncio
@@ -457,9 +496,15 @@ async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch()
     result = await service(store, adapter).exhaust(ACTION_ID)
 
     assert result.status is PublicStatus.MANUAL_REVIEW
+    assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
-    assert [call for call in store.calls if call[0] == "claim"] == [("claim", ActionState.UNKNOWN, "gateway-test")]
+    assert any(
+        call[0] == "transition"
+        and call[1] is ActionState.DEAD_LETTER
+        and call[2] is ActionState.MANUAL_REVIEW
+        for call in store.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -575,3 +620,23 @@ async def test_due_dependency_terminal_preflight_uses_held_lease():
         "newer_inbound",
         "gateway-test",
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_resume_rejects_mutated_persisted_context_before_provider_io():
+    store = FakeStore(
+        row(
+            ActionState.PREPARED,
+            action_uid=ACTION_UID,
+            payload_hash="f" * 64,
+            provider_account="nigel-zoho",
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert store.current.state is ActionState.MANUAL_REVIEW
+    assert adapter.calls == []
+    assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)

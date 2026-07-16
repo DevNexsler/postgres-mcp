@@ -117,6 +117,25 @@ def json_objects(value: Any):
         yield from json_objects(decoded)
 
 
+def mcp_text(result: McpCallResult) -> str:
+    """Extract text from direct or queued MCP tool-result envelopes."""
+
+    parts = [result.text] if result.text else []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if value.get("type") == "text" and isinstance(value.get("text"), str):
+                parts.append(value["text"])
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(terminal_content(result.structured_content))
+    return "\n".join(dict.fromkeys(part for part in parts if part))
+
+
 def transport_observation(result: McpCallResult) -> ProviderObservation | None:
     if result.error_kind is TransportErrorKind.TIMEOUT:
         return ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_timeout")
