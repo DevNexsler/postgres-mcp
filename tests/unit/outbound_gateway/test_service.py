@@ -18,6 +18,7 @@ from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.context import canonical_payload_hash
 from postgres_mcp.outbound_gateway.metrics import CircuitStatus
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
@@ -707,6 +708,79 @@ async def test_worker_resume_rejects_mutated_persisted_context_before_provider_i
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_worker_accepts_one_way_durable_subject_alias_promotion():
+    stored_prospect = "prospect:factbook:stable-id"
+    current_prospect = "subject:durable-alias-id"
+    stored_context = {"identity_version": "v1", "prospect_id": stored_prospect}
+    stored_scope = {"version": "v1", "prospect_id": stored_prospect}
+    current_context = replace(
+        context(),
+        prospect_id=current_prospect,
+        canonical_context=MappingProxyType(
+            {"identity_version": "v1", "prospect_id": current_prospect}
+        ),
+        canonical_scope=MappingProxyType(
+            {"version": "v1", "prospect_id": current_prospect}
+        ),
+    )
+    payload_hash = canonical_payload_hash(
+        {
+            "action_role": current_context.action_role.value,
+            "operation": current_context.operation.value,
+            "intent_kind": current_context.intent_kind.value,
+            "appointment_slot": current_context.appointment_slot,
+            "arguments": current_context.arguments,
+            "canonical_context": stored_context,
+        }
+    )
+    store = FakeStore(
+        row(
+            ActionState.UNKNOWN,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-1",
+            payload_hash=payload_hash,
+            canonical_context=stored_context,
+            canonical_scope=stored_scope,
+            recipient_scope={
+                "kind": "email_thread",
+                "target_id": "lead@convo.zillow.com",
+                "verified": True,
+            },
+            provider_account="nigel-zoho",
+            routing_policy_version="v1",
+        )
+    )
+    loader = AsyncMock()
+    loader.load.return_value = current_context
+    proof_loader = AsyncMock()
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "provider_accepted",
+            provider_request_ref="req-1",
+            message_id="mail-1",
+            accepted_at=NOW,
+            evidence={"kind": "provider_message_id"},
+        )
+    )
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    result = await gateway.reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert store.current.state is ActionState.COMPLETED
+    assert ("reconcile",) in adapter.calls
 
 
 @pytest.mark.asyncio

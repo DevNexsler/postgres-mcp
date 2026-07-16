@@ -534,6 +534,21 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
 
 
 @pytest.mark.asyncio
+async def test_payload_hash_canonicalizes_equivalent_slot_offsets():
+    loader = ActionContextLoader(FakeRepository(record()), policy())
+
+    eastern = await loader.load(
+        request(appointment_slot="2026-07-17T10:30:00-04:00")
+    )
+    utc = await loader.load(
+        request(appointment_slot="2026-07-17T14:30:00Z")
+    )
+
+    assert eastern.appointment_slot == utc.appointment_slot
+    assert eastern.payload_hash == utc.payload_hash
+
+
+@pytest.mark.asyncio
 async def test_near_simultaneous_cross_channel_duplicate_is_canonicalized():
     event = record(
         message_source="zillow_rm_web_extract",

@@ -21,6 +21,7 @@ from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
 from .context import ContextDerivationError
+from .context import canonical_payload_hash
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .models import ActionRole
@@ -672,15 +673,57 @@ class OutboundActionService:
         }
         if (
             context.action_id != action.action_id
-            or context.payload_hash != action.payload_hash
             or context.provider_account != action.provider_account
             or context.routing_policy_version != action.routing_policy_version
-            or dict(context.canonical_context) != dict(action.canonical_context)
-            or dict(context.canonical_scope) != dict(action.canonical_scope)
             or expected_recipient != dict(action.recipient_scope)
         ):
             return None, "persisted_context_mismatch"
-        return context, "context_verified"
+        if (
+            context.payload_hash == action.payload_hash
+            and dict(context.canonical_context) == dict(action.canonical_context)
+            and dict(context.canonical_scope) == dict(action.canonical_scope)
+        ):
+            return context, "context_verified"
+        if self._matches_durable_subject_alias_promotion(action, context):
+            return context, "context_verified_alias_promotion"
+        return None, "persisted_context_mismatch"
+
+    @staticmethod
+    def _matches_durable_subject_alias_promotion(
+        action: OutboundActionRecord,
+        context: ActionContext,
+    ) -> bool:
+        stored_context = dict(action.canonical_context)
+        current_context = dict(context.canonical_context)
+        stored_prospect = stored_context.get("prospect_id")
+        current_prospect = current_context.get("prospect_id")
+        if not (
+            isinstance(stored_prospect, str)
+            and stored_prospect.startswith("prospect:")
+            and isinstance(current_prospect, str)
+            and current_prospect.startswith("subject:")
+        ):
+            return False
+        normalized_context = {**current_context, "prospect_id": stored_prospect}
+        if normalized_context != stored_context:
+            return False
+        stored_scope = dict(action.canonical_scope)
+        current_scope = dict(context.canonical_scope)
+        if "prospect_id" in current_scope:
+            current_scope["prospect_id"] = stored_prospect
+        if current_scope != stored_scope:
+            return False
+        normalized_hash = canonical_payload_hash(
+            {
+                "action_role": context.action_role.value,
+                "operation": context.operation.value,
+                "intent_kind": context.intent_kind.value,
+                "appointment_slot": context.appointment_slot,
+                "arguments": context.arguments,
+                "canonical_context": normalized_context,
+            }
+        )
+        return normalized_hash == action.payload_hash
 
     async def _manual_review(
         self,
