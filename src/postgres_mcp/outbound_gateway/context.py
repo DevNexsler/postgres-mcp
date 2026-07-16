@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from hashlib import sha256
 from types import MappingProxyType
@@ -59,6 +60,7 @@ class RoutingPolicy:
     cliq_target_by_intent: Mapping[str, str]
     property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
+    calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,11 @@ class ActionContext:
     thread_identity: str
     showing_lifecycle_id: str
     calendar_event_uid: str | None
+    source_subject: str | None = None
+    prospect_name: str | None = None
+    recipient_phone: str | None = None
+    calendar_event_url: str | None = None
+    calendar_event_etag: str | None = None
 
 
 def normalize_string(value: str) -> str:
@@ -204,16 +211,21 @@ class ActionContextLoader:
             f"v1:wakeup:{request.wakeup_event_id}:role:{request.action_role}:ordinal:0",
         )
         showing_lifecycle_id = (
-            _nonblank(raw.get("showing_lifecycle_id"))
-            or _nonblank(raw.get("booking_id"))
-            or f"showing:wake:{request.wakeup_event_id}"
+            _nonblank(raw.get("showing_lifecycle_id")) or _nonblank(raw.get("booking_id")) or f"showing:wake:{request.wakeup_event_id}"
         )
-        calendar_event_uid = (
-            _nonblank(raw.get("calendar_event_uid"))
-            or _nonblank(_mapping(raw.get("booking")).get("calendar_event_uid"))
-        )
-        if request.operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE} and not calendar_event_uid:
-            raise ContextDerivationError("canonical calendar event UID is required")
+        calendar_event_uid = _nonblank(raw.get("calendar_event_uid")) or _nonblank(_mapping(raw.get("booking")).get("calendar_event_uid"))
+        booking = _mapping(raw.get("booking"))
+        calendar_event_url = _nonblank(raw.get("calendar_event_url")) or _nonblank(booking.get("calendar_event_url"))
+        calendar_event_etag = _nonblank(raw.get("calendar_event_etag")) or _nonblank(booking.get("calendar_event_etag"))
+        if request.operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE}:
+            if not calendar_event_uid:
+                raise ContextDerivationError("canonical calendar event UID is required")
+            if not calendar_event_url or not calendar_event_etag:
+                raise ContextDerivationError("canonical calendar event revision is required")
+
+        source_subject = _nonblank(record.subject)
+        prospect_name = _nonblank(message.get("prospect_name")) or _nonblank(record.display_name)
+        recipient_phone = normalize_phone(_nonblank(message.get("phone")) or (record.participant_key if record.participant_type == "phone" else None))
 
         canonical_scope = self._scope(
             request,
@@ -242,6 +254,11 @@ class ActionContextLoader:
             "routing_policy_version": self._policy.version,
             "showing_lifecycle_id": showing_lifecycle_id,
             "calendar_event_uid": calendar_event_uid,
+            "calendar_event_url": calendar_event_url,
+            "calendar_event_etag": calendar_event_etag,
+            "source_subject": source_subject,
+            "prospect_name": prospect_name,
+            "recipient_phone": recipient_phone,
         }
         canonical_context = MappingProxyType(canonical_context_data)
         payload_hash = canonical_payload_hash(
@@ -282,6 +299,11 @@ class ActionContextLoader:
             thread_identity=thread_identity,
             showing_lifecycle_id=showing_lifecycle_id,
             calendar_event_uid=calendar_event_uid,
+            source_subject=source_subject,
+            prospect_name=prospect_name,
+            recipient_phone=recipient_phone,
+            calendar_event_url=calendar_event_url,
+            calendar_event_etag=calendar_event_etag,
         )
 
     @staticmethod
@@ -334,10 +356,7 @@ class ActionContextLoader:
             email = _nonblank(candidate)
             if email and _EMAIL.fullmatch(email):
                 values.add(f"email:{email.casefold()}")
-        phone = normalize_phone(
-            _nonblank(message.get("phone"))
-            or (record.participant_key if record.participant_type == "phone" else None)
-        )
+        phone = normalize_phone(_nonblank(message.get("phone")) or (record.participant_key if record.participant_type == "phone" else None))
         if phone:
             values.add(f"phone:{phone}")
         for field in ("prospect_id", "contact_id", "zillow_contact_id"):
@@ -371,12 +390,7 @@ class ActionContextLoader:
         nearby = conversation.get("nearby_messages")
         message_ids = [record.message_id]
         if isinstance(nearby, list):
-            message_ids.extend(
-                value
-                for item in nearby
-                if isinstance(item, Mapping)
-                and isinstance((value := item.get("id")), int)
-            )
+            message_ids.extend(value for item in nearby if isinstance(item, Mapping) and isinstance((value := item.get("id")), int))
         return max(message_ids)
 
     def _target(
@@ -388,18 +402,12 @@ class ActionContextLoader:
         message: Mapping[str, Any],
     ) -> tuple[DerivedTarget, str]:
         if request.operation is Operation.EMAIL_SEND:
-            raw_target = (
-                _nonblank(message.get("proxy_email"))
-                or _nonblank(message.get("direct_email"))
-                or _nonblank(record.participant_key)
-            )
+            raw_target = _nonblank(message.get("proxy_email")) or _nonblank(message.get("direct_email")) or _nonblank(record.participant_key)
             target = raw_target.casefold() if raw_target else ""
             account = self._policy.email_account_by_provider.get(provider, "")
             return DerivedTarget("email_thread", target, bool(account and _EMAIL.fullmatch(target))), account
         if request.operation is Operation.QUO_SMS_SEND:
-            phone = normalize_phone(
-                _nonblank(message.get("phone")) or _nonblank(record.participant_key)
-            )
+            phone = normalize_phone(_nonblank(message.get("phone")) or _nonblank(record.participant_key))
             account = self._policy.quo_line_by_provider.get(provider, "")
             return DerivedTarget(
                 "quo_conversation",
@@ -410,8 +418,10 @@ class ActionContextLoader:
             target_id = self._policy.cliq_target_by_intent.get(request.intent_kind.value, "")
             kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
             return DerivedTarget(kind, target_id, bool(target_id)), target_id
-        calendar = self._policy.calendar_by_profile.get("appointment-setter", "")
-        return DerivedTarget("calendar", calendar, bool(calendar)), calendar
+        profile = "appointment-setter"
+        calendar = self._policy.calendar_by_profile.get(profile, "")
+        account = self._policy.calendar_account_by_profile.get(profile, calendar)
+        return DerivedTarget("calendar", calendar, bool(calendar and account)), account
 
     @staticmethod
     def _scope(
