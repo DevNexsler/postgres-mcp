@@ -178,6 +178,9 @@ class OutboundActionService:
             return await self._dispatch(action, context)
         return await self._preflight(action, context)
 
+    async def status(self, action_id: UUID) -> PublicResult:
+        return self._result(await self._require_action(action_id))
+
     async def resume(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
         context = await self._context_loader.load(action.execute_request())
