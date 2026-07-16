@@ -180,6 +180,11 @@ def _json_mapping(name: str, default: dict[str, str]) -> dict[str, str]:
     return value
 
 
+def _bearer_headers(name: str) -> dict[str, str]:
+    token = os.environ.get(name, "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 async def build_runtime() -> GatewayRuntime:
     database_uri = os.environ.get("DATABASE_URI")
     if not database_uri:
@@ -218,14 +223,13 @@ async def build_runtime() -> GatewayRuntime:
         evidence_failure_threshold=int(os.environ.get("OUTBOUND_ALERT_EVIDENCE_FAILURE_THRESHOLD", "3")),
         alert_window_seconds=int(os.environ.get("OUTBOUND_ALERT_WINDOW_SECONDS", "300")),
     )
-    agent_email_token = os.environ.get("EMAIL_MCP_TOKEN", "").strip()
     provider_client = McpProviderClient(
         {
             "agent-email": McpServerConfig(
                 name="agent-email",
                 url=os.environ.get("AGENT_EMAIL_MCP_URL", "http://127.0.0.1:9090/mcp"),
                 transport="streamable_http",
-                headers={"Authorization": f"Bearer {agent_email_token}"} if agent_email_token else {},
+                headers=_bearer_headers("EMAIL_MCP_TOKEN"),
                 allowed_tools=frozenset(
                     {
                         "email_send",
@@ -243,6 +247,7 @@ async def build_runtime() -> GatewayRuntime:
                 name="quo",
                 url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
                 transport="sse",
+                headers=_bearer_headers("QUO_MCP_TOKEN"),
                 allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
             ),
         }
