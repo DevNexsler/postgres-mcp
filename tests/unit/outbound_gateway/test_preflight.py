@@ -1,4 +1,3 @@
-from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -15,8 +14,6 @@ from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.preflight import PreflightOutcome
-from postgres_mcp.outbound_gateway.preflight import RefreshEvidence
-from postgres_mcp.outbound_gateway.preflight import RefreshStatus
 from postgres_mcp.outbound_gateway.preflight import SafetyPreflight
 
 NOW = datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc)
@@ -208,75 +205,12 @@ def test_calendar_duplicate_and_changed_revision_are_role_specific():
     assert stale.detail_code == "calendar_context_changed"
 
 
-def test_fresh_zillow_under_30_minutes_skips_refresh():
-    ctx = context(source_sent_at=NOW - timedelta(minutes=29, seconds=59))
-    decision = SafetyPreflight.evaluate(ctx, evidence(ctx), now=NOW)
+@pytest.mark.parametrize("age", [timedelta(minutes=29), timedelta(minutes=30), timedelta(hours=3)])
+def test_zillow_refresh_policy_is_skill_owned_not_duplicated_in_gateway(age):
+    ctx = context(source_sent_at=NOW - age)
+
+    decision = SafetyPreflight.evaluate(ctx, evidence(ctx, refresh=None), now=NOW)
+
     assert decision.outcome == PreflightOutcome.READY
     assert decision.detail_code == "ready"
-
-
-def test_zillow_at_30_minutes_requires_targeted_refresh_and_timeout_retries_technically():
-    ctx = context(source_sent_at=NOW - timedelta(minutes=30))
-    missing = SafetyPreflight.evaluate(ctx, evidence(ctx), now=NOW)
-    assert missing.outcome == PreflightOutcome.DEPENDENCY_WAIT
-    assert missing.detail_code == "zillow_refresh_required"
-    timeout = SafetyPreflight.evaluate(
-        ctx,
-        evidence(
-            ctx,
-            refresh=RefreshEvidence(
-                status=RefreshStatus.TIMEOUT,
-                covered_through=None,
-                covered_thread_identity=ctx.thread_identity,
-                attempt_count=1,
-            ),
-        ),
-        now=NOW,
-    )
-    assert timeout.outcome == PreflightOutcome.DEPENDENCY_WAIT
-    assert timeout.detail_code == "zillow_refresh_retry"
-    assert "schedule" not in timeout.detail_code
-
-
-def test_two_hour_zillow_tier_requires_browser_after_two_script_failures():
-    ctx = context(source_sent_at=NOW - timedelta(hours=2))
-    failed = RefreshEvidence(
-        status=RefreshStatus.FAILED,
-        covered_through=None,
-        covered_thread_identity=ctx.thread_identity,
-        attempt_count=2,
-    )
-    browser_needed = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, refresh=failed),
-        now=NOW,
-    )
-    assert browser_needed.outcome == PreflightOutcome.DEPENDENCY_WAIT
-    assert browser_needed.detail_code == "zillow_browser_verification_required"
-    covered = replace(
-        failed,
-        status=RefreshStatus.BROWSER_COVERED,
-        covered_through=NOW,
-    )
-    assert SafetyPreflight.evaluate(ctx, evidence(ctx, refresh=covered), now=NOW).outcome == PreflightOutcome.READY
-
-
-def test_manual_review_only_after_repeated_refresh_failure_with_unresolved_safety_identity():
-    ctx = context(source_sent_at=NOW - timedelta(hours=3))
-    unresolved = RefreshEvidence(
-        status=RefreshStatus.FAILED,
-        covered_through=None,
-        covered_thread_identity=ctx.thread_identity,
-        attempt_count=2,
-        identity_resolved=False,
-        thread_resolved=True,
-        property_resolved=True,
-    )
-    decision = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, refresh=unresolved),
-        now=NOW,
-    )
-    assert decision.outcome == PreflightOutcome.MANUAL_REVIEW
-    assert decision.detail_code == "zillow_refresh_identity_unresolved"
     assert "staff" not in decision.detail_code

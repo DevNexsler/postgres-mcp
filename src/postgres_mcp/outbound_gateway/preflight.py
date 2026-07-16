@@ -85,6 +85,11 @@ class SafetyPreflight:
         *,
         now: datetime,
     ) -> PreflightDecision:
+        # Source freshness remains skill-owned in phase one. Duplicating that
+        # policy here stranded valid sends when helper evidence was not part of
+        # the narrow action request. Gateway owns recipient/context/duplicate,
+        # calendar-dependency, and provider-delivery safety only.
+        del now
         if not context.target.verified or evidence.current_recipient_id != context.target.target_id:
             return PreflightDecision(PreflightOutcome.REJECTED, "recipient_mismatch")
         if evidence.current_property_id != context.property_id:
@@ -124,64 +129,4 @@ class SafetyPreflight:
                     "calendar_already_applied",
                 )
 
-        refresh_decision = SafetyPreflight._zillow_refresh(
-            context,
-            evidence.refresh,
-            evidence.refresh_required_through,
-            now,
-        )
-        if refresh_decision is not None:
-            return refresh_decision
         return PreflightDecision(PreflightOutcome.READY, "ready")
-
-    @staticmethod
-    def _zillow_refresh(
-        context: ActionContext,
-        refresh: RefreshEvidence | None,
-        required_through: datetime,
-        now: datetime,
-    ) -> PreflightDecision | None:
-        if context.source not in {"zillow", "hotpads"}:
-            return None
-        age_seconds = max(0.0, (now - context.source_sent_at).total_seconds())
-        if age_seconds < 30 * 60:
-            return None
-        if refresh is None:
-            return PreflightDecision(
-                PreflightOutcome.DEPENDENCY_WAIT,
-                "zillow_refresh_required",
-            )
-        unresolved = []
-        if not refresh.identity_resolved:
-            unresolved.append("identity")
-        if not refresh.thread_resolved:
-            unresolved.append("thread")
-        if not refresh.property_resolved:
-            unresolved.append("property")
-        if refresh.attempt_count >= 2 and unresolved:
-            return PreflightDecision(
-                PreflightOutcome.MANUAL_REVIEW,
-                f"zillow_refresh_{unresolved[0]}_unresolved",
-            )
-        covered = (
-            refresh.status in {RefreshStatus.COVERED, RefreshStatus.BROWSER_COVERED}
-            and refresh.covered_thread_identity == context.thread_identity
-            and refresh.covered_through is not None
-            and refresh.covered_through >= required_through
-        )
-        if covered:
-            return None
-        if refresh.attempt_count < 2:
-            return PreflightDecision(
-                PreflightOutcome.DEPENDENCY_WAIT,
-                "zillow_refresh_retry",
-            )
-        if age_seconds >= 2 * 60 * 60 and refresh.status is not RefreshStatus.BROWSER_COVERED:
-            return PreflightDecision(
-                PreflightOutcome.DEPENDENCY_WAIT,
-                "zillow_browser_verification_required",
-            )
-        return PreflightDecision(
-            PreflightOutcome.DEPENDENCY_WAIT,
-            "zillow_refresh_backoff",
-        )

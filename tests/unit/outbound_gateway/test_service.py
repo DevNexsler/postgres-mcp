@@ -476,14 +476,23 @@ async def test_newer_inbound_marks_action_stale_before_lock_or_provider_io():
 
 
 @pytest.mark.asyncio
-async def test_zillow_refresh_dependency_returns_pending_not_staff_question():
+async def test_gateway_does_not_duplicate_skill_owned_zillow_refresh_policy():
     old_context = replace(context(), source_sent_at=datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc))
     loader = AsyncMock()
     loader.load.return_value = old_context
     proof_loader = AsyncMock()
     proof_loader.load.return_value = evidence(refresh_required_through=NOW, refresh=None)
     store = FakeStore()
-    adapter = FakeAdapter()
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "provider_accepted",
+            provider_request_ref="req-1",
+            message_id="mail-1",
+            accepted_at=NOW,
+            evidence={"kind": "provider_message_id"},
+        )
+    )
     gateway = OutboundActionService(
         store=store,
         context_loader=loader,
@@ -496,10 +505,9 @@ async def test_zillow_refresh_dependency_returns_pending_not_staff_question():
 
     result = await gateway.execute(request())
 
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "zillow_refresh_required"
+    assert result.status is PublicStatus.SENT
     assert "staff" not in result.detail_code
-    assert adapter.calls == []
+    assert ("invoke",) in adapter.calls
 
 
 @pytest.mark.asyncio
@@ -514,11 +522,18 @@ async def test_due_dependency_retry_is_claimed_so_retry_budget_advances():
     )
     adapter = FakeAdapter()
     proof = evidence(refresh_required_through=NOW, refresh=None)
-    old_context = replace(context(), source_sent_at=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc))
+    old_context = replace(
+        context(),
+        source_sent_at=datetime(2026, 7, 15, 0, 0, tzinfo=timezone.utc),
+        intent_kind=IntentKind.SHOWING_CONFIRMATION,
+    )
     loader = AsyncMock()
     loader.load.return_value = old_context
     proof_loader = AsyncMock()
-    proof_loader.load.return_value = proof
+    proof_loader.load.return_value = replace(
+        proof,
+        calendar_dependency=CalendarDependencyState.PENDING,
+    )
     gateway = OutboundActionService(
         store=store,
         context_loader=loader,
