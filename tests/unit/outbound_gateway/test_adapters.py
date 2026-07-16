@@ -120,7 +120,7 @@ def completed(tool, content):
         structured_content={
             "status": "completed",
             "request_id": "req-1",
-            "completed_result": {"tool_name": tool, "structured_content": content},
+            "result": {"tool_name": tool, "structured_content": content},
         }
     )
 
@@ -248,6 +248,58 @@ async def test_calendar_adapter_uses_deterministic_uid_and_exact_revision(operat
     else:
         assert request.arguments["event_url"].endswith("existing-event.ics")
         assert request.arguments["etag"] == '"etag-1"'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "tool", "provider_text", "provider_id"),
+    [
+        (
+            Operation.CALENDAR_CREATE,
+            "calendar_create_event",
+            "**Event Created**\nUID: created-event\nURL: https://calendar.local/events/created-event.ics",
+            "created-event",
+        ),
+        (
+            Operation.CALENDAR_UPDATE,
+            "calendar_update_event",
+            "**Event Updated**\nUID: existing-event",
+            "existing-event",
+        ),
+        (
+            Operation.CALENDAR_DELETE,
+            "calendar_delete_event",
+            "**Event Deleted**\nURL: https://calendar.local/events/existing-event.ics",
+            "https://calendar.local/events/existing-event.ics",
+        ),
+    ],
+)
+async def test_calendar_adapter_parses_agent_email_request_status_result(
+    operation,
+    tool,
+    provider_text,
+    provider_id,
+):
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(operation)
+    client = FakeClient(
+        pending(),
+        completed(
+            tool,
+            {
+                "status": "success",
+                "data": {"content": [{"type": "text", "text": provider_text}]},
+            },
+        ),
+    )
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    assert observation.disposition is ProviderDisposition.PENDING
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == provider_id
+    assert observation.provider_request_ref == "req-1"
 
 
 @pytest.mark.asyncio

@@ -86,9 +86,15 @@ def request_ref(payload: Mapping[str, Any] | None) -> str | None:
 def terminal_content(payload: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
     if not payload:
         return None
-    completed = payload.get("completed_result")
-    if isinstance(completed, Mapping):
-        structured = completed.get("structured_content")
+    # Agent Email exposes queued terminal data as `result`; older releases and
+    # recorded evidence used `completed_result`. Accept both envelopes so the
+    # gateway follows the provider contract without coupling every adapter to a
+    # queue-server version.
+    for envelope_key in ("result", "completed_result"):
+        envelope = payload.get(envelope_key)
+        if not isinstance(envelope, Mapping):
+            continue
+        structured = envelope.get("structured_content")
         if isinstance(structured, Mapping):
             return structured
     return payload
