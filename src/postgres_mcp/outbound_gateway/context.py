@@ -211,7 +211,7 @@ class ActionContextLoader:
             )
             if request.intent_kind.value not in provider_intents:
                 raise ContextDerivationError("provider intent is disabled")
-        property_label = self._property_label(record, raw, message)
+        property_label = self._property_label(record, envelope, raw, message)
         property_scope = normalize_property_key(property_label)
         property_id = self._policy.property_aliases.get(property_scope)
         if property_scope and property_id is None:
@@ -434,15 +434,51 @@ class ActionContextLoader:
     @staticmethod
     def _property_label(
         record: WakeEventRecord,
+        envelope: Mapping[str, Any],
         raw: Mapping[str, Any],
         message: Mapping[str, Any],
     ) -> str | None:
         direct = _nonblank(message.get("property")) or _nonblank(raw.get("property"))
         if direct:
             return direct
+        proxy_email = replyable_email(
+            _nonblank(message.get("proxy_email"))
+            or _nonblank(message.get("zillow_proxy_email"))
+            or _nonblank(raw.get("proxy_email"))
+            or _nonblank(raw.get("zillow_proxy_email"))
+            or (
+                record.participant_key
+                if record.participant_type in _EMAIL_PARTICIPANT_TYPES
+                else None
+            ),
+            require_zillow_proxy=True,
+        )
+        nearby_messages = _mapping(envelope.get("conversation_context")).get(
+            "nearby_messages",
+            (),
+        )
+        if proxy_email and isinstance(nearby_messages, (list, tuple)):
+            for nearby_value in nearby_messages:
+                nearby = _mapping(nearby_value)
+                nearby_proxy = replyable_email(
+                    _nonblank(nearby.get("proxy_email"))
+                    or _nonblank(nearby.get("zillow_proxy_email")),
+                    require_zillow_proxy=True,
+                )
+                nearby_property = _nonblank(nearby.get("property"))
+                if nearby_proxy == proxy_email and nearby_property:
+                    return nearby_property
         subject = record.subject or ""
-        match = re.search(r"\bfor\s+(.+)$", subject, re.IGNORECASE)
-        return _nonblank(match.group(1)) if match else None
+        match = re.search(r"\b(?:for|about)\s+(.+)$", subject, re.IGNORECASE)
+        if not match:
+            return None
+        subject_property = re.sub(
+            r",\s*[^,]+,\s*[A-Z]{2},\s*\d{5}(?:-\d{4})?\s*$",
+            "",
+            match.group(1),
+            flags=re.IGNORECASE,
+        )
+        return _nonblank(subject_property)
 
     @staticmethod
     def _aliases(

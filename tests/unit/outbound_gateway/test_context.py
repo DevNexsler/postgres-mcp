@@ -333,6 +333,64 @@ async def test_participant_only_zillow_proxy_drives_provider_target_and_thread()
 
 
 @pytest.mark.asyncio
+async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
+    event = record(
+        subject=(
+            "Kailani is requesting information about 138 Bullman St #144-A, "
+            "Phillipsburg, NJ, 08865"
+        ),
+        participant_key="kailani.abc@convo.zillow.com",
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "Kailani Deleon",
+                "proxy_email": "kailani.abc@convo.zillow.com",
+            },
+            "conversation_context": {
+                "nearby_messages": [
+                    {
+                        "property": "16 N Main St #16",
+                        "proxy_email": "different.abc@convo.zillow.com",
+                    },
+                    {
+                        "property": "138 Bullman St #144-A",
+                        "proxy_email": "kailani.abc@convo.zillow.com",
+                    },
+                ]
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.property_label == "138 Bullman St #144-A"
+    assert context.property_id == "building:bullman-st"
+
+
+@pytest.mark.asyncio
+async def test_zillow_information_about_subject_derives_listing_address():
+    event = record(
+        subject=(
+            "Kailani is requesting information about 138 Bullman St #144-A, "
+            "Phillipsburg, NJ, 08865"
+        ),
+        participant_key="kailani.abc@convo.zillow.com",
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "Kailani Deleon",
+                "proxy_email": "kailani.abc@convo.zillow.com",
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.property_label == "138 Bullman St #144-A"
+    assert context.property_id == "building:bullman-st"
+
+
+@pytest.mark.asyncio
 async def test_explicit_zillow_provider_rejects_generic_participant_email():
     event = record(
         participant_type="email_address",
