@@ -117,9 +117,8 @@ def json_objects(value: Any):
         yield from json_objects(decoded)
 
 
-def mcp_text(result: McpCallResult) -> str:
-    """Extract text from direct or queued MCP tool-result envelopes."""
-
+def mcp_text_parts(result: McpCallResult) -> tuple[str, ...]:
+    """Extract distinct text blocks from direct or queued MCP envelopes."""
     parts = [result.text] if result.text else []
 
     def visit(value: Any) -> None:
@@ -133,7 +132,13 @@ def mcp_text(result: McpCallResult) -> str:
                 visit(nested)
 
     visit(terminal_content(result.structured_content))
-    return "\n".join(dict.fromkeys(part for part in parts if part))
+    return tuple(dict.fromkeys(part for part in parts if part))
+
+
+def mcp_text(result: McpCallResult) -> str:
+    """Join direct and queued MCP text blocks for diagnostics."""
+
+    return "\n".join(mcp_text_parts(result))
 
 
 def transport_observation(result: McpCallResult) -> ProviderObservation | None:

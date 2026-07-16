@@ -168,6 +168,7 @@ async def test_email_reconciliation_reads_queued_thread_result_text():
     client = FakeClient(
         pending("thread-lookup-1"),
         McpCallResult(
+            text=("**Request ID:** thread-lookup-1\n**Status:** completed\n**Result:** queued provider result follows"),
             structured_content={
                 "status": "completed",
                 "request_id": "thread-lookup-1",
@@ -185,7 +186,7 @@ async def test_email_reconciliation_reads_queued_thread_result_text():
                         },
                     },
                 },
-            }
+            },
         ),
     )
 

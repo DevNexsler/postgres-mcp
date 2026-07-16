@@ -15,7 +15,7 @@ from .base import ProviderReceipt
 from .base import ProviderRequest
 from .base import accepted_observation
 from .base import initial_observation
-from .base import mcp_text
+from .base import mcp_text_parts
 from .base import receipt_from_observation
 from .base import request_ref
 from .base import terminal_content
@@ -102,7 +102,7 @@ class EmailAdapter:
                 "request_status",
                 {"request_id": first.provider_request_ref},
             )
-        if mcp_text(lookup).lstrip().startswith("**Thread:**"):
+        if any(part.lstrip().startswith("**Thread:**") for part in mcp_text_parts(lookup)):
             return accepted_observation(
                 request_ref_value=observation.provider_request_ref,
                 message_id=message_id,

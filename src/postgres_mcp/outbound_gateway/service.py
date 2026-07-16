@@ -20,6 +20,7 @@ from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
+from .context import ContextDerivationError
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .models import ActionRole
@@ -220,9 +221,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return self._result(action)
-        context = await self._verified_context(action)
+        context, context_detail = await self._verified_context(action)
         if context is None:
-            return await self._manual_review(action, "persisted_context_mismatch")
+            return await self._manual_review(action, context_detail)
         if action.state is ActionState.DEPENDENCY_WAIT:
             return await self._resume_dependency(action, context)
         if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
@@ -252,9 +253,9 @@ class OutboundActionService:
             )
         if action.state is not ActionState.UNKNOWN:
             return self._result(action)
-        context = await self._verified_context(action)
+        context, context_detail = await self._verified_context(action)
         if context is None:
-            return await self._manual_review(action, "persisted_context_mismatch")
+            return await self._manual_review(action, context_detail)
         adapter = self._adapter(context.operation)
         await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         reconciling = await self._store.transition(
@@ -608,10 +609,16 @@ class OutboundActionService:
             raise LookupError("outbound action does not exist")
         return action
 
-    async def _verified_context(self, action: OutboundActionRecord) -> ActionContext | None:
-        context = await self._context_loader.load(action.execute_request())
+    async def _verified_context(
+        self,
+        action: OutboundActionRecord,
+    ) -> tuple[ActionContext | None, str]:
+        try:
+            context = await self._context_loader.load(action.execute_request())
+        except ContextDerivationError:
+            return None, "persisted_context_unavailable"
         if not action.payload_hash:
-            return context
+            return context, "context_verified"
         expected_recipient = {
             "kind": context.target.kind,
             "target_id": context.target.target_id,
@@ -626,8 +633,8 @@ class OutboundActionService:
             or dict(context.canonical_scope) != dict(action.canonical_scope)
             or expected_recipient != dict(action.recipient_scope)
         ):
-            return None
-        return context
+            return None, "persisted_context_mismatch"
+        return context, "context_verified"
 
     async def _manual_review(
         self,

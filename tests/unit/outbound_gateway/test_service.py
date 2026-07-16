@@ -14,6 +14,7 @@ from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
 from postgres_mcp.outbound_gateway.context import ActionContext
+from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.metrics import CircuitStatus
 from postgres_mcp.outbound_gateway.models import ActionRole
@@ -499,12 +500,7 @@ async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch()
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
-    assert any(
-        call[0] == "transition"
-        and call[1] is ActionState.DEAD_LETTER
-        and call[2] is ActionState.MANUAL_REVIEW
-        for call in store.calls
-    )
+    assert any(call[0] == "transition" and call[1] is ActionState.DEAD_LETTER and call[2] is ActionState.MANUAL_REVIEW for call in store.calls)
 
 
 @pytest.mark.asyncio
@@ -635,6 +631,35 @@ async def test_worker_resume_rejects_mutated_persisted_context_before_provider_i
     adapter = FakeAdapter()
 
     result = await service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert store.current.state is ActionState.MANUAL_REVIEW
+    assert adapter.calls == []
+    assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "initial_state"),
+    [("resume", ActionState.PREPARED), ("reconcile", ActionState.UNKNOWN)],
+)
+async def test_worker_terminalizes_context_that_can_no_longer_be_derived(method, initial_state):
+    store = FakeStore(row(initial_state, action_uid=ACTION_UID, payload_hash="a" * 64))
+    adapter = FakeAdapter()
+    loader = AsyncMock()
+    loader.load.side_effect = ContextDerivationError("wakeup event does not exist")
+    proof_loader = AsyncMock()
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    result = await getattr(gateway, method)(ACTION_ID)
 
     assert result.status is PublicStatus.MANUAL_REVIEW
     assert store.current.state is ActionState.MANUAL_REVIEW
