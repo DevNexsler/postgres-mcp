@@ -1,3 +1,5 @@
+# pyright: reportArgumentType=false, reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -118,6 +120,7 @@ def row(state=ActionState.RECEIVED, **overrides):
         action_uid=ACTION_UID if state is not ActionState.RECEIVED else None,
         provider_request_ref=None,
         provider_message_id=None,
+        provider_accepted_at=None,
         completion_kind=None,
         detail_code=state.value,
         attempt_count=0,
@@ -137,6 +140,7 @@ class FakeStore:
     def __init__(self, initial=None):
         self.current = initial
         self.calls = []
+        self.last_receipt = None
 
     async def create_or_load(self, ctx):
         self.calls.append(("create", ctx.action_id))
@@ -171,6 +175,7 @@ class FakeStore:
 
     async def complete(self, action_id, expected_state, lease_owner, receipt, completion_kind, detail_code):
         self.calls.append(("complete", expected_state, receipt.provider_request_ref))
+        self.last_receipt = receipt
         self.current = replace(
             self.current,
             state=ActionState.COMPLETED,
@@ -338,6 +343,72 @@ async def test_repeated_completed_execute_is_duplicate_without_provider_call():
     assert result.status is PublicStatus.DUPLICATE
     assert adapter.calls == []
     assert [call[0] for call in store.calls] == ["create"]
+
+
+@pytest.mark.asyncio
+async def test_verified_existing_outbound_keeps_provider_id_as_receipt_identity():
+    store = FakeStore()
+    adapter = FakeAdapter()
+    provider_message_id = "<existing-message@pfg.io>"
+    proof = evidence(
+        verified_outbound_message_id=702,
+        verified_outbound_request_ref=provider_message_id,
+        verified_outbound_covers_source=True,
+    )
+
+    result = await service(store, adapter, proof=proof).execute(request())
+
+    assert result.status is PublicStatus.DUPLICATE
+    assert store.current.provider_request_ref == provider_message_id
+    assert store.current.provider_message_id == provider_message_id
+    assert store.last_receipt.evidence == {
+        "kind": "verified_existing_outbound",
+        "cds_message_id": 702,
+    }
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_accepted_crash_recovery_completes_from_persisted_receipt():
+    store = FakeStore(
+        row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-accepted",
+            provider_message_id="mail-accepted",
+            provider_accepted_at=NOW,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["claim", "complete"]
+    assert store.current.provider_message_id == "mail-accepted"
+
+
+@pytest.mark.asyncio
+async def test_provider_accepted_exhaustion_recovers_persisted_receipt():
+    store = FakeStore(
+        row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-accepted",
+            provider_message_id="mail-accepted",
+            provider_accepted_at=NOW,
+            attempt_count=5,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["claim", "complete"]
+    assert store.current.provider_message_id == "mail-accepted"
 
 
 @pytest.mark.asyncio

@@ -27,9 +27,14 @@ class EmailAdapter:
         *,
         sender_domains: Mapping[str, str],
         cc_by_source: Mapping[str, str] | None = None,
+        reconciliation_poll_attempts: int = 3,
     ):
         self._sender_domains = dict(sender_domains)
         self._cc_by_source = dict(cc_by_source or {})
+        self._reconciliation_poll_attempts = max(
+            1,
+            min(reconciliation_poll_attempts, 5),
+        )
 
     def validate(self, context: ActionContext) -> None:
         if context.operation is not Operation.EMAIL_SEND:
@@ -96,12 +101,17 @@ class EmailAdapter:
             {"account_id": context.provider_account, "messageId": message_id, "folder": "Sent"},
         )
         first = initial_observation(lookup)
-        if first and first.disposition is ProviderDisposition.PENDING:
+        for _ in range(self._reconciliation_poll_attempts):
+            if not first or first.disposition is not ProviderDisposition.PENDING:
+                break
+            if not first.provider_request_ref:
+                break
             lookup = await client.call(
                 "agent-email",
                 "request_status",
                 {"request_id": first.provider_request_ref},
             )
+            first = initial_observation(lookup)
         if any(part.lstrip().startswith("**Thread:**") for part in mcp_text_parts(lookup)):
             return accepted_observation(
                 request_ref_value=observation.provider_request_ref,

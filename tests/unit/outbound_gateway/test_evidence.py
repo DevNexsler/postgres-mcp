@@ -1,3 +1,5 @@
+# pyright: reportArgumentType=false, reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,6 +10,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from pglast import parse_sql
 
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
@@ -102,10 +105,89 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     assert proof.refresh.status is RefreshStatus.COVERED
     assert proof.refresh.covered_thread_identity == "zrm-thread-1"
     query = calls[0][0].casefold()
+    parse_sql(calls[0][0].replace("{}", "NULL"))
     assert "verified_staff" not in query
     assert "showing_slot_validation" not in query
     assert "calendar_events" not in query
-    assert calls[0][1] == [700, 44, 44, 700, "showing_offer", 7, 7, NOW]
+    assert "related_messages" in query
+    assert "'{data,object,conversationid}'" in query
+    assert "'{data,object,phonenumberid}'" in query
+    assert "'{data,object,direction}'" in query
+    assert "related.payload->'provider_ids'->>'message'" in query
+    assert "related.source_message_id" in query
+    assert "recipient.value->>'address'" in query
+    assert query.count("(related.sent_at, related.id) > (") == 2
+    assert calls[0][1] == [
+        "zillow",
+        "lead@convo.zillow.com",
+        "lead@convo.zillow.com",
+        "zillow",
+        "nigel-zoho",
+        "zrm-thread-1",
+        "zrm-thread-1",
+        "",
+        "",
+        "zillow",
+        44,
+        NOW,
+        700,
+        NOW,
+        700,
+        "zillow",
+        "zillow",
+        "zillow",
+        "showing_offer",
+        7,
+        7,
+        NOW,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_quo_evidence_query_binds_conversation_line_target_and_nested_receipt():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": 702,
+                    "verified_outbound_request_ref": "quo-provider-702",
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    quo_context = context(
+        operation=Operation.QUO_SMS_SEND,
+        source="quo",
+        target=DerivedTarget("quo_conversation", "conversation-live", True),
+        provider_account="PN-line-live",
+        thread_identity="conversation-live",
+        recipient_phone="+19085550199",
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        proof = await DatabasePreflightEvidenceLoader(object()).load(quo_context)
+
+    assert proof.verified_outbound_request_ref == "quo-provider-702"
+    query = calls[0][0].casefold()
+    assert "regexp_replace" in query
+    assert "related.payload#>>'{data,object,id}'" in query
+    assert "lower(message_row.source) in ('quo', 'openphone')" in query
+    assert calls[0][1][4:9] == [
+        "PN-line-live",
+        "conversation-live",
+        "conversation-live",
+        "19085550199",
+        "19085550199",
+    ]
 
 
 @pytest.mark.asyncio

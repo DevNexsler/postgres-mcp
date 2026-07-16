@@ -574,9 +574,7 @@ async def get_top_queries(
     ),
 )
 async def universal_search(
-    keywords: List[str] = Field(
-        description="Search terms to fuzzy match, minimum 3 characters each (e.g. ['invoice', 'Dan'])"
-    ),
+    keywords: List[str] = Field(description="Search terms to fuzzy match, minimum 3 characters each (e.g. ['invoice', 'Dan'])"),
     mode: Literal["OR", "AND"] = Field(
         description="Search mode: 'OR' matches any keyword, 'AND' requires all keywords",
         default="OR",
@@ -592,9 +590,7 @@ async def universal_search(
         return format_error_response("At least one keyword is required")
     for kw in keywords:
         if len(kw) < 3:
-            return format_error_response(
-                f"Keyword '{kw}' is too short. Keywords must be at least 3 characters for effective fuzzy matching."
-            )
+            return format_error_response(f"Keyword '{kw}' is too short. Keywords must be at least 3 characters for effective fuzzy matching.")
     if limit < 1 or limit > 200:
         return format_error_response("limit must be between 1 and 200")
 
@@ -608,8 +604,8 @@ async def universal_search(
                 "table": "messages",
                 "search_cols": ["body", "subject"],
                 "select": "id, source, channel_id, sender_participant_id, sent_at, "
-                          "left(coalesce(subject, ''), 100) AS subject, "
-                          "left(coalesce(body, ''), 200) AS body",
+                "left(coalesce(subject, ''), 100) AS subject, "
+                "left(coalesce(body, ''), 200) AS body",
                 "formatter": _format_message_row,
             },
             {
@@ -630,8 +626,7 @@ async def universal_search(
                 "name": "Transcripts",
                 "table": "transcripts",
                 "search_cols": ["transcript_text"],
-                "select": "id, call_id, message_id, "
-                          "left(transcript_text, 200) AS transcript_text, created_at",
+                "select": "id, call_id, message_id, left(transcript_text, 200) AS transcript_text, created_at",
                 "formatter": _format_transcript_row,
             },
         ]
@@ -700,13 +695,7 @@ async def _search_table(
     # Append limit as parameter
     params.append(limit)
 
-    query = (
-        f"SELECT {select} "
-        f"FROM {table} "
-        f"WHERE {where_clause} "
-        f"ORDER BY {order_by} DESC "
-        f"LIMIT {{}}"
-    )
+    query = f"SELECT {select} FROM {table} WHERE {where_clause} ORDER BY {order_by} DESC LIMIT {{}}"
 
     rows = await SafeSqlDriver.execute_param_query(
         sql_driver,
@@ -797,24 +786,16 @@ def _format_transcript_row(cells: dict[str, Any]) -> str:
 )
 @validate_call
 async def outbound_lock(
-    op: Literal["acquire", "complete", "release", "check"] = Field(
-        description="acquire | complete | release | check"
-    ),
+    op: Literal["acquire", "complete", "release", "check"] = Field(description="acquire | complete | release | check"),
     identity_key: Optional[str] = Field(
         default=None, description="Customer identity (phone digits / email / factbook:uuid). Required for acquire and check."
     ),
-    property_scope: str = Field(
-        default="", description="Unit/property scope, e.g. '317 S Main St #3'. Optional; normalized server-side."
-    ),
+    property_scope: str = Field(default="", description="Unit/property scope, e.g. '317 S Main St #3'. Optional; normalized server-side."),
     intent_kind: Optional[str] = Field(
         default=None, description="What is being sent, e.g. 'showing-confirmation', 'correction'. Required for acquire."
     ),
-    holder: Optional[str] = Field(
-        default=None, description="This run's id (session/run id). Required for acquire/complete/release."
-    ),
-    lock_id: Optional[int] = Field(
-        default=None, description="Lock id from acquire. Required for complete/release."
-    ),
+    holder: Optional[str] = Field(default=None, description="This run's id (session/run id). Required for acquire/complete/release."),
+    lock_id: Optional[int] = Field(default=None, description="Lock id from acquire. Required for complete/release."),
     request_ref: Optional[str] = Field(
         default=None, description="Verified send handle (email request id / Message-ID / SMS id). Required for complete."
     ),

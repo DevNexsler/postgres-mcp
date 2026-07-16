@@ -55,17 +55,16 @@ DEFAULT_PROPERTY_ALIASES = {
     "144 bullman street": "building:bullman-st",
     "16 north main street 16": "building:16-n-main",
 }
-DEFAULT_ENABLED_OPERATIONS = frozenset(
-    {Operation.EMAIL_SEND, Operation.QUO_SMS_SEND}
-)
+DEFAULT_ENABLED_OPERATIONS = frozenset({Operation.EMAIL_SEND})
 DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER = {
     "hotpads": frozenset({Operation.EMAIL_SEND.value}),
-    "quo": frozenset({Operation.QUO_SMS_SEND.value}),
     "zillow": frozenset({Operation.EMAIL_SEND.value}),
 }
-DEFAULT_ENABLED_INTENTS = frozenset(
-    {IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}
-)
+DEFAULT_ENABLED_INTENTS = frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value})
+DEFAULT_ENABLED_INTENTS_BY_PROVIDER = {
+    "hotpads": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
+    "zillow": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
+}
 
 
 @dataclass(frozen=True)
@@ -229,8 +228,8 @@ def _enabled_operations_by_provider() -> dict[str, frozenset[str]]:
     if raw is None:
         return DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER
     value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON must be a JSON object")
+    if not isinstance(value, dict) or not value:
+        raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON must be a non-empty JSON object")
     parsed: dict[str, frozenset[str]] = {}
     for provider, operations in value.items():
         if (
@@ -240,17 +239,11 @@ def _enabled_operations_by_provider() -> dict[str, frozenset[str]]:
             or not operations
             or not all(isinstance(item, str) for item in operations)
         ):
-            raise ValueError(
-                "OUTBOUND_PROVIDER_OPERATIONS_JSON values must be non-empty string arrays"
-            )
+            raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON values must be non-empty string arrays")
         try:
-            parsed[provider.casefold()] = frozenset(
-                Operation(item).value for item in operations
-            )
+            parsed[provider.casefold()] = frozenset(Operation(item).value for item in operations)
         except ValueError as exc:
-            raise ValueError(
-                "OUTBOUND_PROVIDER_OPERATIONS_JSON contains an unsupported operation"
-            ) from exc
+            raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON contains an unsupported operation") from exc
     return parsed
 
 
@@ -259,16 +252,36 @@ def _enabled_intents() -> frozenset[str]:
     if raw is None:
         return DEFAULT_ENABLED_INTENTS
     value = json.loads(raw)
-    if not isinstance(value, list) or not value or not all(
-        isinstance(item, str) for item in value
-    ):
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
         raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON must be a non-empty string array")
     try:
         return frozenset(IntentKind(item).value for item in value)
     except ValueError as exc:
-        raise ValueError(
-            "OUTBOUND_ENABLED_INTENTS_JSON contains an unsupported intent"
-        ) from exc
+        raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON contains an unsupported intent") from exc
+
+
+def _enabled_intents_by_provider() -> dict[str, frozenset[str]]:
+    raw = os.environ.get("OUTBOUND_PROVIDER_INTENTS_JSON")
+    if raw is None:
+        return DEFAULT_ENABLED_INTENTS_BY_PROVIDER
+    value = json.loads(raw)
+    if not isinstance(value, dict) or not value:
+        raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON must be a non-empty JSON object")
+    parsed: dict[str, frozenset[str]] = {}
+    for provider, intents in value.items():
+        if (
+            not isinstance(provider, str)
+            or not provider.strip()
+            or not isinstance(intents, list)
+            or not intents
+            or not all(isinstance(item, str) for item in intents)
+        ):
+            raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON values must be non-empty string arrays")
+        try:
+            parsed[provider.casefold()] = frozenset(IntentKind(item).value for item in intents)
+        except ValueError as exc:
+            raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON contains an unsupported intent") from exc
+    return parsed
 
 
 def _bearer_headers(name: str) -> dict[str, str]:
@@ -296,10 +309,7 @@ async def build_runtime() -> GatewayRuntime:
         ),
         quo_line_by_provider=_json_mapping(
             "OUTBOUND_QUO_LINES_JSON",
-            {
-                provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "")
-                for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")
-            },
+            {provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "") for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")},
         ),
         calendar_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_NAME", "nigel")},
         calendar_account_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_ACCOUNT", "nigel-zoho")},
@@ -314,6 +324,7 @@ async def build_runtime() -> GatewayRuntime:
         conversation_aliases=_json_mapping("OUTBOUND_CONVERSATION_ALIASES_JSON", {}),
         enabled_operations_by_provider=_enabled_operations_by_provider(),
         enabled_intents=_enabled_intents(),
+        enabled_intents_by_provider=_enabled_intents_by_provider(),
     )
     context_repository = OutboundGatewayRepository(driver)
     store = PostgresActionStore(driver)

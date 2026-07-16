@@ -302,6 +302,7 @@ class PostgresActionStore:
             action_uid=UUID(str(action_uid)) if action_uid else None,
             provider_request_ref=cells.get("provider_request_ref"),
             provider_message_id=cells.get("provider_message_id"),
+            provider_accepted_at=cells.get("provider_accepted_at"),
             completion_kind=CompletionKind(str(completion)) if completion else None,
             detail_code=str(cells["detail_code"]),
             attempt_count=int(cells.get("attempt_count") or 0),

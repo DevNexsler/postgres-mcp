@@ -1,3 +1,5 @@
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
+
 from datetime import timezone
 from uuid import UUID
 

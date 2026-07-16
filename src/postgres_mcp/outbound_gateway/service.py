@@ -50,6 +50,7 @@ class OutboundActionRecord:
     action_uid: UUID | None
     provider_request_ref: str | None
     provider_message_id: str | None
+    provider_accepted_at: datetime | None
     completion_kind: CompletionKind | None
     detail_code: str
     attempt_count: int
@@ -234,6 +235,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return self._result(action)
+        recovered = await self._recover_persisted_acceptance(action)
+        if recovered is not None:
+            return recovered
         if action.state in {
             ActionState.DISPATCHING,
             ActionState.PROVIDER_ACCEPTED,
@@ -286,6 +290,9 @@ class OutboundActionService:
     async def exhaust(self, action_id: UUID) -> PublicResult:
         """Close exhausted work without another provider invocation."""
         action = await self._require_action(action_id)
+        recovered = await self._recover_persisted_acceptance(action)
+        if recovered is not None:
+            return recovered
         lease_held = False
         observation = ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
@@ -377,6 +384,42 @@ class OutboundActionService:
             return self._result(failed)
         return self._result(action)
 
+    async def _recover_persisted_acceptance(
+        self,
+        action: OutboundActionRecord,
+    ) -> PublicResult | None:
+        """Complete a durable provider acceptance without provider I/O."""
+        if not (
+            action.state is ActionState.PROVIDER_ACCEPTED
+            and action.provider_request_ref
+            and action.provider_message_id
+            and action.provider_accepted_at
+        ):
+            return None
+        provider_request_ref = action.provider_request_ref
+        provider_message_id = action.provider_message_id
+        provider_accepted_at = action.provider_accepted_at
+        action = await self._store.claim(
+            action.action_id,
+            action.state,
+            self._lease_owner,
+            self._lease_seconds,
+        )
+        completed = await self._store.complete(
+            action.action_id,
+            ActionState.PROVIDER_ACCEPTED,
+            self._lease_owner,
+            ProviderReceipt(
+                provider_request_ref=provider_request_ref,
+                provider_message_id=provider_message_id,
+                accepted_at=provider_accepted_at,
+                evidence={"kind": "persisted_provider_acceptance"},
+            ),
+            CompletionKind.SENT,
+            "persisted_provider_acceptance_recovered",
+        )
+        return self._result(completed)
+
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         evidence = await self._evidence_loader.load(context)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
@@ -428,9 +471,12 @@ class OutboundActionService:
             assert evidence.verified_outbound_message_id is not None
             receipt = ProviderReceipt(
                 provider_request_ref=evidence.verified_outbound_request_ref,
-                provider_message_id=str(evidence.verified_outbound_message_id),
+                provider_message_id=evidence.verified_outbound_request_ref,
                 accepted_at=self._clock(),
-                evidence={"kind": "verified_existing_outbound"},
+                evidence={
+                    "kind": "verified_existing_outbound",
+                    "cds_message_id": evidence.verified_outbound_message_id,
+                },
             )
             completed = await self._store.complete(
                 action.action_id,

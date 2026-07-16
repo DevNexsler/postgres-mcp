@@ -188,7 +188,11 @@ def request(**overrides) -> ExecuteRequest:
                     "message": {"property": "16 N Main St #16", "phone": "+1 908 555 0199"},
                 },
             ),
-            request(operation="quo.sms.send"),
+            request(
+                operation="quo.sms.send",
+                intent_kind="inquiry_reply",
+                appointment_slot=None,
+            ),
             "quo_conversation",
             "quo-conversation-9",
             "leasing-main",
@@ -287,9 +291,7 @@ async def test_rollout_policy_rejects_cross_channel_provider_route():
     )
 
     with pytest.raises(ContextDerivationError, match="provider operation is disabled"):
-        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(
-            request(operation="quo.sms.send")
-        )
+        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(request(operation="quo.sms.send"))
 
 
 @pytest.mark.asyncio
@@ -301,9 +303,162 @@ async def test_rollout_policy_rejects_unapproved_intent():
     )
 
     with pytest.raises(ContextDerivationError, match="intent is disabled"):
-        await ActionContextLoader(FakeRepository(record()), restricted).load(
-            request(intent_kind="showing_confirmation")
+        await ActionContextLoader(FakeRepository(record()), restricted).load(request(intent_kind="showing_confirmation"))
+
+
+@pytest.mark.asyncio
+async def test_participant_only_zillow_proxy_drives_provider_target_and_thread():
+    event = record(
+        message_source="zoho_mail",
+        source_channel_id="INBOX",
+        channel_type="email_thread",
+        participant_type="email_address",
+        participant_key="relay-only@convo.zillow.com",
+        raw_payload={},
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "Amanda Snyder",
+                "property": "138 Bullman St #144-A",
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.source == "zillow"
+    assert context.target.target_id == "relay-only@convo.zillow.com"
+    assert context.thread_identity == "relay-only@convo.zillow.com"
+    assert context.conversation_id == "conversation:zillow:relay-only@convo.zillow.com"
+
+
+@pytest.mark.asyncio
+async def test_explicit_zillow_provider_rejects_generic_participant_email():
+    event = record(
+        participant_type="email_address",
+        participant_key="prospect@gmail.com",
+        raw_payload={"provider": "zillow"},
+        envelope={
+            "identity": {},
+            "message": {"property": "138 Bullman St #144-A"},
+        },
+    )
+
+    with pytest.raises(ContextDerivationError, match="verified target"):
+        await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+
+@pytest.mark.asyncio
+async def test_live_shape_quo_phone_number_and_nested_conversation_are_canonical():
+    event = record(
+        event_source="quo",
+        message_source="quo",
+        source_channel_id="leasing-line-channel",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550199",
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "quo-conversation-live",
+                    "phoneNumberId": "leasing-main",
+                    "direction": "incoming",
+                    "from": "+19085550199",
+                    "to": "+19085550000",
+                }
+            }
+        },
+        envelope={
+            "identity": {},
+            "message": {"property": "16 N Main St #16"},
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
         )
+    )
+
+    assert context.thread_identity == "quo-conversation-live"
+    assert context.conversation_id == "conversation:quo:quo-conversation-live"
+    assert context.recipient_phone == "+19085550199"
+    assert "phone:+19085550199" in context.aliases
+    assert context.target.verified is True
+
+
+@pytest.mark.asyncio
+async def test_quo_line_id_must_match_server_owned_route():
+    event = record(
+        event_source="quo",
+        message_source="quo",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550199",
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "quo-conversation-live",
+                    "phoneNumberId": "different-line",
+                    "direction": "incoming",
+                    "from": "+19085550199",
+                }
+            }
+        },
+        envelope={"identity": {}, "message": {"property": "16 N Main St #16"}},
+    )
+
+    with pytest.raises(ContextDerivationError, match="verified target"):
+        await ActionContextLoader(FakeRepository(event), policy()).load(
+            request(
+                operation="quo.sms.send",
+                intent_kind="inquiry_reply",
+                appointment_slot=None,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing_offer():
+    restricted = replace(
+        policy(),
+        enabled_intents_by_provider={
+            "zillow": frozenset({"inquiry_reply", "showing_offer"}),
+            "quo": frozenset({"inquiry_reply"}),
+        },
+    )
+    event = record(
+        event_source="quo",
+        message_source="quo",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550199",
+        subject=None,
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "quo-conversation-live",
+                    "phoneNumberId": "leasing-main",
+                    "direction": "incoming",
+                    "from": "+19085550199",
+                }
+            }
+        },
+        envelope={"identity": {}, "message": {}},
+    )
+
+    inquiry = await ActionContextLoader(FakeRepository(event), restricted).load(
+        request(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+        )
+    )
+    assert inquiry.intent_kind.value == "inquiry_reply"
+    with pytest.raises(ContextDerivationError, match="provider intent is disabled"):
+        await ActionContextLoader(FakeRepository(event), restricted).load(request(operation="quo.sms.send"))
 
 
 @pytest.mark.asyncio
@@ -330,7 +485,7 @@ async def test_duplicate_provider_and_property_aliases_converge():
                 "identity": {},
                 "message": {
                     "property": "144 Bullman Street",
-                    "proxy_email": "other-proxy@convo.zillow.com",
+                    "proxy_email": "amanda.abc@convo.zillow.com",
                     "direct_email": "AmandaSnyder@live.com",
                 },
             },

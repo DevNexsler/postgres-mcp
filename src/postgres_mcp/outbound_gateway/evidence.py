@@ -23,39 +23,177 @@ class DatabasePreflightEvidenceLoader:
         self._driver = driver
 
     async def load(self, context: ActionContext) -> PreflightEvidence:
+        provider_family = "zillow" if context.source in {"hotpads", "zillow", "zumper"} else context.source
+        recipient_phone = "".join(character for character in str(context.recipient_phone or "") if character.isdigit())
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
-            WITH conversation AS (
+            WITH related_messages AS (
                 SELECT
-                    max(message_row.id) FILTER (
-                        WHERE message_row.id > {}
-                          AND message_row.direction IS DISTINCT FROM 'outbound'
-                    ) AS later_inbound_message_id,
-                    max(message_row.sent_at) AS latest_sent_at
-                FROM messages AS message_row
-                WHERE message_row.channel_id = {}
-            ), verified_outbound AS (
-                SELECT
-                    message_row.id AS verified_outbound_message_id,
-                    coalesce(
-                        raw_row.payload->>'provider_request_ref',
-                        raw_row.payload->>'request_ref',
-                        raw_row.payload->>'provider_message_id',
-                        raw_row.payload->>'message_id'
-                    ) AS verified_outbound_request_ref
+                    message_row.id,
+                    message_row.source_message_id,
+                    message_row.sent_at,
+                    message_row.direction,
+                    message_row.source,
+                    raw_row.payload,
+                    participant_row.participant_type,
+                    participant_row.participant_key
                 FROM messages AS message_row
                 LEFT JOIN raw_events AS raw_row ON raw_row.id = message_row.raw_event_id
-                WHERE message_row.channel_id = {}
-                  AND message_row.direction = 'outbound'
-                  AND message_row.id > {}
+                LEFT JOIN participants AS participant_row
+                  ON participant_row.id = message_row.sender_participant_id
+                WHERE (
+                    {} = 'zillow'
+                    AND (
+                        lower(coalesce(
+                            raw_row.payload->>'proxy_email',
+                            raw_row.payload->>'zillow_proxy_email',
+                            raw_row.payload->>'relay_email',
+                            CASE
+                                WHEN lower(coalesce(participant_row.participant_type, ''))
+                                         IN ('email', 'email_address')
+                                  AND split_part(
+                                        lower(coalesce(participant_row.participant_key, '')),
+                                        '@', 2
+                                      ) = 'convo.zillow.com'
+                                THEN participant_row.participant_key
+                            END,
+                            ''
+                        )) = lower({})
+                        OR EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(
+                                CASE
+                                    WHEN jsonb_typeof(raw_row.payload->'participants') = 'array'
+                                    THEN raw_row.payload->'participants'
+                                    ELSE '[]'::jsonb
+                                END
+                            ) AS recipient(value)
+                            WHERE lower(coalesce(recipient.value->>'kind', '')) = 'to'
+                              AND lower(coalesce(recipient.value->>'address', '')) = lower({})
+                        )
+                    )
+                ) OR (
+                    {} = 'quo'
+                    AND lower(message_row.source) IN ('quo', 'openphone')
+                    AND lower(coalesce(
+                        raw_row.payload#>>'{data,object,phoneNumberId}',
+                        raw_row.payload#>>'{data,object,phone_number_id}',
+                        ''
+                    )) = lower({})
+                    AND (
+                        lower(coalesce(
+                            raw_row.payload#>>'{data,object,conversationId}',
+                            raw_row.payload#>>'{data,object,conversation_id}',
+                            ''
+                        )) = lower({})
+                        OR (
+                            nullif(coalesce(
+                                raw_row.payload#>>'{data,object,conversationId}',
+                                raw_row.payload#>>'{data,object,conversation_id}',
+                                ''
+                            ), '') IS NULL
+                            AND {} LIKE 'line:%'
+                        )
+                    )
+                    AND (
+                        (
+                            lower(coalesce(
+                                message_row.direction,
+                                raw_row.payload->>'direction',
+                                raw_row.payload#>>'{data,object,direction}',
+                                ''
+                            )) IN ('inbound', 'incoming', 'received')
+                            AND regexp_replace(
+                                coalesce(raw_row.payload#>>'{data,object,from}', ''),
+                                '[^0-9]', '', 'g'
+                            ) = {}
+                        ) OR (
+                            lower(coalesce(
+                                message_row.direction,
+                                raw_row.payload->>'direction',
+                                raw_row.payload#>>'{data,object,direction}',
+                                ''
+                            )) IN ('outbound', 'outgoing', 'sent')
+                            AND regexp_replace(
+                                coalesce(raw_row.payload#>>'{data,object,to}', ''),
+                                '[^0-9]', '', 'g'
+                            ) = {}
+                        )
+                    )
+                ) OR (
+                    {} NOT IN ('zillow', 'quo')
+                    AND message_row.channel_id = {}
+                )
+            ), conversation AS (
+                SELECT
+                    max(related.id) FILTER (
+                        WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
+                          AND lower(coalesce(
+                              related.direction,
+                              related.payload->>'direction',
+                              related.payload#>>'{data,object,direction}',
+                              ''
+                          )) IN ('inbound', 'incoming', 'received', 'prospect')
+                    ) AS later_inbound_message_id,
+                    max(related.sent_at) AS latest_sent_at
+                FROM related_messages AS related
+            ), verified_outbound AS (
+                SELECT
+                    related.id AS verified_outbound_message_id,
+                    coalesce(
+                        related.payload->'provider_ids'->>'message',
+                        related.payload#>>'{data,object,id}',
+                        related.payload->>'provider_request_ref',
+                        related.payload->>'request_ref',
+                        related.payload->>'provider_message_id',
+                        related.payload->>'message_id',
+                        related.source_message_id
+                    ) AS verified_outbound_request_ref
+                FROM related_messages AS related
+                WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
+                  AND (
+                    (
+                        {} = 'zillow'
+                        AND lower(related.source) IN ('zoho_mail', 'nigel_mail')
+                        AND lower(coalesce(related.direction, '')) = 'outbound'
+                        AND replace(lower(coalesce(
+                            related.payload->>'source_folder', ''
+                        )), '_', '-') IN ('sent', 'sent-mail', 'outbox')
+                        AND EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(related.payload->'participants')
+                                AS sender_participant(value)
+                            WHERE lower(coalesce(
+                                sender_participant.value->>'kind', ''
+                            )) = 'from'
+                              AND split_part(lower(coalesce(
+                                  sender_participant.value->>'address', ''
+                              )), '@', 2) = 'pfg.io'
+                        )
+                    ) OR (
+                        {} = 'quo'
+                        AND lower(coalesce(
+                            related.direction,
+                            related.payload->>'direction',
+                            related.payload#>>'{data,object,direction}',
+                            ''
+                        )) IN ('outbound', 'outgoing', 'sent')
+                    ) OR (
+                        {} NOT IN ('zillow', 'quo')
+                        AND lower(coalesce(related.direction, '')) = 'outbound'
+                    )
+                  )
                   AND nullif(btrim(coalesce(
-                      raw_row.payload->>'provider_request_ref',
-                      raw_row.payload->>'request_ref',
-                      raw_row.payload->>'provider_message_id',
-                      raw_row.payload->>'message_id'
+                      related.payload->'provider_ids'->>'message',
+                      related.payload#>>'{data,object,id}',
+                      related.payload->>'provider_request_ref',
+                      related.payload->>'request_ref',
+                      related.payload->>'provider_message_id',
+                      related.payload->>'message_id',
+                      related.source_message_id
                   )), '') IS NOT NULL
-                ORDER BY message_row.id DESC
+                ORDER BY related.sent_at DESC, related.id DESC
                 LIMIT 1
             ), dependency AS (
                 SELECT CASE
@@ -93,10 +231,24 @@ class DatabasePreflightEvidenceLoader:
             LEFT JOIN verified_outbound ON true
             """,
             [
-                context.source_message_id,
+                provider_family,
+                context.target.target_id,
+                context.target.target_id,
+                provider_family,
+                context.provider_account,
+                context.thread_identity,
+                context.thread_identity,
+                recipient_phone,
+                recipient_phone,
+                provider_family,
                 context.channel_id,
-                context.channel_id,
+                context.source_sent_at,
                 context.source_message_id,
+                context.source_sent_at,
+                context.source_message_id,
+                provider_family,
+                provider_family,
+                provider_family,
                 context.intent_kind.value,
                 context.wakeup_event_id,
                 context.wakeup_event_id,

@@ -77,9 +77,7 @@ async def test_worker_isolates_poison_action_and_continues_batch():
         store=store,
         service=service,
         batch_size=20,
-        on_error=lambda action_id, operation, error: failures.append(
-            (action_id, operation, type(error).__name__)
-        ),
+        on_error=lambda action_id, operation, error: failures.append((action_id, operation, type(error).__name__)),
     )
 
     assert await worker.run_once() == 2

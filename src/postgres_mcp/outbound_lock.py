@@ -27,10 +27,7 @@ from .sql import SafeSqlDriver
 VALID_OPS = ("acquire", "complete", "release", "check")
 
 # The full lock row, selected the same way everywhere so evidence fields are always present.
-_LOCK_COLUMNS = (
-    "id, identity_key, property_scope, intent_kind, holder, request_ref, "
-    "completed, acquired_at, expires_at, completed_at, released_at"
-)
+_LOCK_COLUMNS = "id, identity_key, property_scope, intent_kind, holder, request_ref, completed, acquired_at, expires_at, completed_at, released_at"
 
 
 def _iso(value: Any) -> Any:
@@ -46,8 +43,7 @@ def is_duplicate_send_evidence(cells: dict[str, Any]) -> bool:
     has released_at set, and a plain release (abort) has released_at set but is NOT
     evidence of a send."""
     return cells.get("completed_at") is not None and bool(
-        (cells.get("request_ref") or "").strip() if isinstance(cells.get("request_ref"), str)
-        else cells.get("request_ref")
+        (cells.get("request_ref") or "").strip() if isinstance(cells.get("request_ref"), str) else cells.get("request_ref")
     )
 
 
@@ -152,10 +148,7 @@ async def run_outbound_lock(
         params.append(intent_kind)
     where.append("acquired_at > now() - make_interval(days => {})")
     params.append(max(1, int(days)))
-    query = (
-        f"SELECT {_LOCK_COLUMNS} FROM outbound_intent_locks "
-        f"WHERE {' AND '.join(where)} ORDER BY acquired_at DESC LIMIT 50"
-    )
+    query = f"SELECT {_LOCK_COLUMNS} FROM outbound_intent_locks WHERE {' AND '.join(where)} ORDER BY acquired_at DESC LIMIT 50"
     rows = await SafeSqlDriver.execute_param_query(
         driver,
         cast(LiteralString, query),

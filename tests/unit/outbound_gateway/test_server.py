@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
@@ -13,10 +15,13 @@ from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
 from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_INTENTS
+from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_INTENTS_BY_PROVIDER
 from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER
 from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
+from postgres_mcp.outbound_gateway.server import _enabled_intents_by_provider
+from postgres_mcp.outbound_gateway.server import _enabled_operations_by_provider
 from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
 
@@ -33,19 +38,34 @@ def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
     assert DEFAULT_PROPERTY_ALIASES["144 bullman street"] == "building:bullman-st"
     assert DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER == {
         "hotpads": frozenset({"email.send"}),
-        "quo": frozenset({"quo.sms.send"}),
         "zillow": frozenset({"email.send"}),
     }
     assert DEFAULT_ENABLED_INTENTS == frozenset({"inquiry_reply", "showing_offer"})
+    assert DEFAULT_ENABLED_INTENTS_BY_PROVIDER == {
+        "hotpads": frozenset({"inquiry_reply", "showing_offer"}),
+        "zillow": frozenset({"inquiry_reply", "showing_offer"}),
+    }
 
 
 def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
     monkeypatch.delenv("QUO_MCP_TOKEN", raising=False)
     assert _bearer_headers("QUO_MCP_TOKEN") == {}
     monkeypatch.setenv("QUO_MCP_TOKEN", "provider-secret")
-    assert _bearer_headers("QUO_MCP_TOKEN") == {
-        "Authorization": "Bearer provider-secret"
-    }
+    assert _bearer_headers("QUO_MCP_TOKEN") == {"Authorization": "Bearer provider-secret"}
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "loader"),
+    [
+        ("OUTBOUND_PROVIDER_OPERATIONS_JSON", _enabled_operations_by_provider),
+        ("OUTBOUND_PROVIDER_INTENTS_JSON", _enabled_intents_by_provider),
+    ],
+)
+def test_explicit_empty_provider_scope_fails_closed(monkeypatch, environment_name, loader):
+    monkeypatch.setenv(environment_name, "{}")
+
+    with pytest.raises(ValueError, match="non-empty JSON object"):
+        loader()
 
 
 def public(status=PublicStatus.SENT, detail="provider_receipt_verified"):

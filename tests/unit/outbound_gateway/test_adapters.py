@@ -1,3 +1,5 @@
+# pyright: reportArgumentType=false, reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
+from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.calendar import CalendarAdapter
 from postgres_mcp.outbound_gateway.adapters.cliq import CliqAdapter
 from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
@@ -195,6 +198,50 @@ async def test_email_reconciliation_reads_queued_thread_result_text():
     assert reconciled.disposition is ProviderDisposition.ACCEPTED
     assert reconciled.detail_code == "email_reconciled_by_message_id"
     assert reconciled.message_id == f"<outbound-action-{ACTION_UID}@pfg.example>"
+
+
+@pytest.mark.asyncio
+async def test_email_reconciliation_polls_bounded_pending_lookup_to_completion():
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        reconciliation_poll_attempts=3,
+    )
+    unknown = ProviderObservation(
+        ProviderDisposition.AMBIGUOUS,
+        "prior_timeout",
+    )
+    client = FakeClient(
+        pending("thread-lookup-1"),
+        pending("thread-lookup-1"),
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "request_id": "thread-lookup-1",
+                "result": {
+                    "tool_name": "email_get_thread",
+                    "structured_content": {
+                        "data": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "**Thread:** exact deterministic message",
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        ),
+    )
+
+    reconciled = await adapter.reconcile(client, context(), ACTION_UID, unknown)
+
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert [call[1] for call in client.calls] == [
+        "email_get_thread",
+        "request_status",
+        "request_status",
+    ]
 
 
 def test_email_adapter_applies_management_copy_only_to_configured_sources():

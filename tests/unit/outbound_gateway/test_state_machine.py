@@ -1,3 +1,5 @@
+# pyright: reportCallIssue=false
+
 from uuid import UUID
 
 import pytest
