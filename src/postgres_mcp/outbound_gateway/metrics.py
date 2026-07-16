@@ -27,6 +27,18 @@ _PROVIDER_BY_OPERATION = {
     Operation.CALENDAR_UPDATE: "agent-email",
     Operation.CALENDAR_DELETE: "agent-email",
 }
+_REPLAY_OUTCOMES = (
+    "eligible",
+    "verified_handled",
+    "superseded",
+    "manual_review",
+    "ineligible",
+    "sent",
+    "duplicate",
+    "no_op_verified_handled",
+    "no_op_superseded",
+    "no_op_ineligible",
+)
 
 
 @dataclass(frozen=True)
@@ -343,13 +355,19 @@ class GatewayObservability:
                     {"outcome": outcome},
                 )
             )
+        replay_counts = {
+            str(row.get("outcome") or "unknown"): int(row.get("count") or 0)
+            for row in replay_rows
+        }
+        for outcome in _REPLAY_OUTCOMES:
+            replay_counts.setdefault(outcome, 0)
         samples.extend(
             MetricSample(
                 "outbound_gateway_replay_items_total",
-                int(row.get("count") or 0),
-                {"outcome": str(row.get("outcome") or "unknown")},
+                count,
+                {"outcome": outcome},
             )
-            for row in replay_rows
+            for outcome, count in replay_counts.items()
         )
         for operation in Operation:
             status = await self.circuit_status(operation)

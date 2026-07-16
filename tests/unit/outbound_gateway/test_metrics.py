@@ -124,6 +124,30 @@ async def test_collect_uses_durable_aggregates_for_actions_attempts_locks_and_re
 
 
 @pytest.mark.asyncio
+async def test_collect_always_exposes_zero_replay_outcomes_when_ledger_is_empty():
+    async def execute(_driver, query, _params):
+        if "FROM outbound_actions" in query and "submitted" in query:
+            return [Row({})]
+        if "FROM outbound_action_attempts" in query:
+            return [Row({})]
+        if "FROM outbound_replay_items" in query:
+            return []
+        if "failure_count" in query:
+            return [Row({"failure_count": 0, "is_open": False, "retry_after_seconds": 0})]
+        raise AssertionError(query)
+
+    observer = GatewayObservability(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.metrics.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        rendered = render_prometheus(await observer.collect())
+
+    assert 'outbound_gateway_replay_items_total{outcome="eligible"} 0' in rendered
+    assert 'outbound_gateway_replay_items_total{outcome="sent"} 0' in rendered
+
+
+@pytest.mark.asyncio
 async def test_database_health_is_one_bounded_select():
     with patch(
         "postgres_mcp.outbound_gateway.metrics.SafeSqlDriver.execute_param_query",
