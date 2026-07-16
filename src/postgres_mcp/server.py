@@ -10,8 +10,10 @@ from enum import Enum
 from typing import Any
 from typing import List
 from typing import Literal
+from typing import LiteralString
 from typing import Optional
 from typing import Union
+from typing import cast
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
@@ -26,10 +28,10 @@ from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
-from .outbound_lock import run_outbound_lock
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .outbound_lock import run_outbound_lock
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
@@ -706,7 +708,11 @@ async def _search_table(
         f"LIMIT {{}}"
     )
 
-    rows = await SafeSqlDriver.execute_param_query(sql_driver, query, params)
+    rows = await SafeSqlDriver.execute_param_query(
+        sql_driver,
+        cast(LiteralString, query),
+        params,
+    )
     return list(rows) if rows else []
 
 
@@ -730,7 +736,7 @@ def _fmt_dt(value: Any) -> str:
     return str(value)
 
 
-def _format_message_row(cells: dict) -> str:
+def _format_message_row(cells: dict[str, Any]) -> str:
     return (
         f"[id={cells.get('id')}] source={cells.get('source')} "
         f"sent_at={_fmt_dt(cells.get('sent_at'))} "
@@ -741,7 +747,7 @@ def _format_message_row(cells: dict) -> str:
     )
 
 
-def _format_participant_row(cells: dict) -> str:
+def _format_participant_row(cells: dict[str, Any]) -> str:
     return (
         f"[id={cells.get('id')}] source={cells.get('source')} "
         f"type={cells.get('participant_type')} key={cells.get('participant_key')}\n"
@@ -749,7 +755,7 @@ def _format_participant_row(cells: dict) -> str:
     )
 
 
-def _format_channel_row(cells: dict) -> str:
+def _format_channel_row(cells: dict[str, Any]) -> str:
     return (
         f"[id={cells.get('id')}] source={cells.get('source')} "
         f"type={cells.get('channel_type')} source_channel_id={cells.get('source_channel_id')}\n"
@@ -757,7 +763,7 @@ def _format_channel_row(cells: dict) -> str:
     )
 
 
-def _format_transcript_row(cells: dict) -> str:
+def _format_transcript_row(cells: dict[str, Any]) -> str:
     return (
         f"[id={cells.get('id')}] call_id={cells.get('call_id')} "
         f"message_id={cells.get('message_id')} "

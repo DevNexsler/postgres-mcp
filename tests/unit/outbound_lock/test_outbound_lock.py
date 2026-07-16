@@ -1,8 +1,10 @@
 """Unit tests for the outbound_lock operations (pure semantics + op runner with a
 mocked sql driver — no DB)."""
 
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from datetime import datetime
+from datetime import timezone
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 import pytest
 

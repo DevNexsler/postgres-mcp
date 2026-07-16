@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from typing import LiteralString
+from typing import cast
 
 from .sql import SafeSqlDriver
 
@@ -154,5 +156,9 @@ async def run_outbound_lock(
         f"SELECT {_LOCK_COLUMNS} FROM outbound_intent_locks "
         f"WHERE {' AND '.join(where)} ORDER BY acquired_at DESC LIMIT 50"
     )
-    rows = await SafeSqlDriver.execute_param_query(driver, query, params)
+    rows = await SafeSqlDriver.execute_param_query(
+        driver,
+        cast(LiteralString, query),
+        params,
+    )
     return {"op": op, "locks": [lock_json(row.cells) for row in (rows or [])]}
