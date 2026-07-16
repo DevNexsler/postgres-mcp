@@ -31,6 +31,8 @@ _ZILLOW_PROVIDER_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
 _EMAIL_PARTICIPANT_TYPES = frozenset({"email", "email_address"})
 _PHONE_PARTICIPANT_TYPES = frozenset({"phone", "phone_number", "sms", "tel"})
 _CROSS_CHANNEL_DUPLICATE_MAX_SECONDS = 120
+_CERTIFIED_OLDER_MESSAGE_LIMIT = 100
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _ADDRESS_WORDS = {
     "n": "north",
     "s": "south",
@@ -109,6 +111,7 @@ class ActionContext:
     channel_id: int = 0
     refresh_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
     cross_channel_duplicate_message_ids: tuple[int, ...] = ()
+    certified_older_message_ids: tuple[int, ...] = ()
 
 
 def normalize_string(value: str) -> str:
@@ -281,6 +284,11 @@ class ActionContextLoader:
             record,
             envelope,
         )
+        certified_older_message_ids = self._certified_older_message_ids(
+            record,
+            provider,
+            refresh_evidence,
+        )
 
         canonical_scope = self._scope(
             request,
@@ -317,6 +325,7 @@ class ActionContextLoader:
             "channel_id": record.channel_id,
             "refresh_evidence": refresh_evidence,
             "cross_channel_duplicate_message_ids": list(cross_channel_duplicate_message_ids),
+            "certified_older_message_ids": list(certified_older_message_ids),
         }
         canonical_context = MappingProxyType(canonical_context_data)
         payload_hash = canonical_payload_hash(
@@ -365,7 +374,35 @@ class ActionContextLoader:
             channel_id=record.channel_id,
             refresh_evidence=MappingProxyType(dict(refresh_evidence)),
             cross_channel_duplicate_message_ids=cross_channel_duplicate_message_ids,
+            certified_older_message_ids=certified_older_message_ids,
         )
+
+    @staticmethod
+    def _certified_older_message_ids(
+        record: WakeEventRecord,
+        provider: str,
+        refresh_evidence: Mapping[str, Any],
+    ) -> tuple[int, ...]:
+        """Read replay-approved Zillow chronology corrections, fail closed."""
+
+        raw_ids = refresh_evidence.get("certified_older_message_ids")
+        if raw_ids is None:
+            return ()
+        if record.event_source != "outbound-replay" or provider not in _ZILLOW_PROVIDER_FAMILY:
+            return ()
+        evidence_hash = str(refresh_evidence.get("evidence_sha256") or "").casefold()
+        if (
+            refresh_evidence.get("status") not in {"covered", "browser_covered"}
+            or not _SHA256_HEX.fullmatch(evidence_hash)
+            or not _nonblank(refresh_evidence.get("covered_through"))
+            or not _nonblank(refresh_evidence.get("covered_thread_identity"))
+            or not isinstance(raw_ids, list)
+            or len(raw_ids) > _CERTIFIED_OLDER_MESSAGE_LIMIT
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in raw_ids)
+            or raw_ids != sorted(set(raw_ids))
+        ):
+            raise ContextDerivationError("invalid certified Zillow chronology evidence")
+        return tuple(raw_ids)
 
     @staticmethod
     def _cross_channel_duplicate_message_ids(

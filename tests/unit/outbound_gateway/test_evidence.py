@@ -133,6 +133,7 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
         NOW,
         700,
         [700],
+        [],
         NOW,
         700,
         "zillow",
@@ -174,6 +175,41 @@ async def test_evidence_excludes_only_canonical_cross_channel_duplicate_from_new
     query, params = calls[0]
     assert "NOT (related.id = ANY({}::bigint[]))" in query
     assert params[13] == [700, 196337]
+
+
+@pytest.mark.asyncio
+async def test_evidence_excludes_only_certified_zillow_scrape_rows_from_newer_inbound():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": None,
+                    "verified_outbound_request_ref": None,
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    certified_context = context(certified_older_message_ids=(197065, 197067))
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await DatabasePreflightEvidenceLoader(object()).load(certified_context)
+
+    query, params = calls[0]
+    normalized_query = " ".join(query.split())
+    assert (
+        "NOT ( lower(related.source) = 'zillow_rm_web_extract' "
+        "AND related.id = ANY({}::bigint[]) )"
+    ) in normalized_query
+    assert params[14] == [197065, 197067]
 
 
 @pytest.mark.asyncio

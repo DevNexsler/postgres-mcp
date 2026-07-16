@@ -577,6 +577,90 @@ async def test_near_simultaneous_cross_channel_duplicate_is_canonicalized():
 
 
 @pytest.mark.asyncio
+async def test_replay_refresh_certifies_older_zillow_scrape_rows():
+    event = record(
+        event_source="outbound-replay",
+        raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"},
+        envelope={
+            "identity": {},
+            "message": {
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "amanda.abc@convo.zillow.com",
+            },
+            "zillow_refresh": {
+                "status": "covered",
+                "covered_through": "2026-07-16T23:00:00Z",
+                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "evidence_sha256": "a" * 64,
+                "certified_older_message_ids": [197065, 197067],
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.certified_older_message_ids == (197065, 197067)
+    assert context.canonical_context["certified_older_message_ids"] == [197065, 197067]
+
+
+@pytest.mark.asyncio
+async def test_non_replay_event_cannot_certify_older_zillow_scrape_rows():
+    event = record(
+        envelope={
+            "identity": {},
+            "message": {
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "amanda.abc@convo.zillow.com",
+            },
+            "zillow_refresh": {
+                "status": "covered",
+                "covered_through": "2026-07-16T23:00:00Z",
+                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "evidence_sha256": "a" * 64,
+                "certified_older_message_ids": [197065],
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.certified_older_message_ids == ()
+    assert context.canonical_context["certified_older_message_ids"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "certified_ids",
+    ([197067, 197065], [197065, 197065], [True], [0]),
+)
+async def test_replay_rejects_invalid_certified_zillow_chronology(certified_ids):
+    event = record(
+        event_source="outbound-replay",
+        raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"},
+        envelope={
+            "identity": {},
+            "message": {
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "amanda.abc@convo.zillow.com",
+            },
+            "zillow_refresh": {
+                "status": "covered",
+                "covered_through": "2026-07-16T23:00:00Z",
+                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "evidence_sha256": "a" * 64,
+                "certified_older_message_ids": certified_ids,
+            },
+        },
+    )
+
+    with pytest.raises(
+        ContextDerivationError,
+        match="invalid certified Zillow chronology evidence",
+    ):
+        await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("duplicate_source", "duplicate_sent_at", "duplicate_message_id"),
     [

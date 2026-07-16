@@ -28,6 +28,7 @@ class DatabasePreflightEvidenceLoader:
         equivalent_inbound_ids = sorted(
             {context.source_message_id, *context.cross_channel_duplicate_message_ids}
         )
+        certified_older_message_ids = list(context.certified_older_message_ids)
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -133,6 +134,10 @@ class DatabasePreflightEvidenceLoader:
                     max(related.id) FILTER (
                         WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
                           AND NOT (related.id = ANY({}::bigint[]))
+                          AND NOT (
+                              lower(related.source) = 'zillow_rm_web_extract'
+                              AND related.id = ANY({}::bigint[])
+                          )
                           AND lower(coalesce(
                               related.direction,
                               related.payload->>'direction',
@@ -249,6 +254,7 @@ class DatabasePreflightEvidenceLoader:
                 context.source_sent_at,
                 context.source_message_id,
                 equivalent_inbound_ids,
+                certified_older_message_ids,
                 context.source_sent_at,
                 context.source_message_id,
                 provider_family,
