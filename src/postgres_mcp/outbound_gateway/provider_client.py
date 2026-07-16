@@ -7,10 +7,12 @@ import json
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import timedelta
 from enum import StrEnum
 from typing import Any
 from typing import Literal
+from typing import Mapping
 from urllib.parse import urlparse
 
 from mcp import ClientSession
@@ -45,6 +47,7 @@ class McpServerConfig:
     transport: Literal["streamable_http", "sse"]
     allowed_tools: frozenset[str]
     timeout_seconds: float = 10.0
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.url)
@@ -56,6 +59,8 @@ class McpServerConfig:
             raise ValueError("provider MCP name and tool allowlist are required")
         if not 0 < self.timeout_seconds <= 30:
             raise ValueError("provider MCP timeout must be between 0 and 30 seconds")
+        if any(not key.strip() or "\n" in key or "\r" in key or "\n" in value or "\r" in value for key, value in self.headers.items()):
+            raise ValueError("provider MCP headers must be non-empty single-line strings")
 
 
 Invoker = Callable[[McpServerConfig, str, dict[str, Any]], Awaitable[McpCallResult]]
@@ -109,6 +114,7 @@ class McpProviderClient:
         transport = streamablehttp_client if config.transport == "streamable_http" else sse_client
         async with transport(
             config.url,
+            headers=dict(config.headers) or None,
             timeout=config.timeout_seconds,
             sse_read_timeout=config.timeout_seconds,
         ) as streams:

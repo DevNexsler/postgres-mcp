@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -78,3 +81,54 @@ def test_server_config_rejects_non_loopback_and_invalid_transport():
         replace(base, url="https://example.com/sse")
     with pytest.raises(ValueError, match="transport"):
         replace(base, transport="websocket")
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_transport_receives_secret_headers_without_repr_leak():
+    captured = {}
+
+    @asynccontextmanager
+    async def transport(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        yield object(), object(), lambda: None
+
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                structuredContent={"status": "ok"},
+                content=[],
+                isError=False,
+            )
+
+    config = McpServerConfig(
+        name="agent-email",
+        url="http://127.0.0.1:9090/mcp",
+        transport="streamable_http",
+        allowed_tools=frozenset({"email_send"}),
+        headers={"Authorization": "Bearer top-secret"},
+    )
+
+    with (
+        patch(
+            "postgres_mcp.outbound_gateway.provider_client.streamablehttp_client",
+            transport,
+        ),
+        patch("postgres_mcp.outbound_gateway.provider_client.ClientSession", Session),
+    ):
+        result = await McpProviderClient._invoke_mcp(config, "email_send", {})
+
+    assert result.structured_content == {"status": "ok"}
+    assert captured["headers"] == {"Authorization": "Bearer top-secret"}
+    assert "top-secret" not in repr(config)

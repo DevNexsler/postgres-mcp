@@ -212,12 +212,14 @@ async def build_runtime() -> GatewayRuntime:
         evidence_failure_threshold=int(os.environ.get("OUTBOUND_ALERT_EVIDENCE_FAILURE_THRESHOLD", "3")),
         alert_window_seconds=int(os.environ.get("OUTBOUND_ALERT_WINDOW_SECONDS", "300")),
     )
+    agent_email_token = os.environ.get("EMAIL_MCP_TOKEN", "").strip()
     provider_client = McpProviderClient(
         {
             "agent-email": McpServerConfig(
                 name="agent-email",
                 url=os.environ.get("AGENT_EMAIL_MCP_URL", "http://127.0.0.1:9090/mcp"),
                 transport="streamable_http",
+                headers={"Authorization": f"Bearer {agent_email_token}"} if agent_email_token else {},
                 allowed_tools=frozenset(
                     {
                         "email_send",
