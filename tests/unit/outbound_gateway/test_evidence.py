@@ -110,9 +110,9 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     assert "showing_slot_validation" not in query
     assert "calendar_events" not in query
     assert "related_messages" in query
-    assert "'{data,object,conversationid}'" in query
-    assert "'{data,object,phonenumberid}'" in query
-    assert "'{data,object,direction}'" in query
+    assert "'{{data,object,conversationid}}'" in query
+    assert "'{{data,object,phonenumberid}}'" in query
+    assert "'{{data,object,direction}}'" in query
     assert "related.payload->'provider_ids'->>'message'" in query
     assert "related.source_message_id" in query
     assert "recipient.value->>'address'" in query
@@ -179,7 +179,7 @@ async def test_quo_evidence_query_binds_conversation_line_target_and_nested_rece
     assert proof.verified_outbound_request_ref == "quo-provider-702"
     query = calls[0][0].casefold()
     assert "regexp_replace" in query
-    assert "related.payload#>>'{data,object,id}'" in query
+    assert "related.payload#>>'{{data,object,id}}'" in query
     assert "lower(message_row.source) in ('quo', 'openphone')" in query
     assert calls[0][1][4:9] == [
         "PN-line-live",
@@ -213,3 +213,28 @@ async def test_same_building_calendar_overlap_is_not_loaded_as_blocking_evidence
         proof = await DatabasePreflightEvidenceLoader(object()).load(context())
 
     assert proof.overlapping_showing_prospect_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_evidence_query_survives_literal_json_path_braces():
+    class Driver:
+        async def execute_query(self, query, *args, **kwargs):
+            assert "#>>'{data,object,phoneNumberId}'" in query
+            assert "#>>'{data,object,conversationId}'" in query
+            assert "#>>'{data,object,direction}'" in query
+            return [
+                Row(
+                    {
+                        "later_inbound_message_id": None,
+                        "verified_outbound_message_id": None,
+                        "verified_outbound_request_ref": None,
+                        "latest_sent_at": NOW,
+                        "calendar_dependency_state": "not_required",
+                        "calendar_already_applied": False,
+                    }
+                )
+            ]
+
+    proof = await DatabasePreflightEvidenceLoader(Driver()).load(context())
+
+    assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED

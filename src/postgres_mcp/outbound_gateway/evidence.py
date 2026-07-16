@@ -77,20 +77,20 @@ class DatabasePreflightEvidenceLoader:
                     {} = 'quo'
                     AND lower(message_row.source) IN ('quo', 'openphone')
                     AND lower(coalesce(
-                        raw_row.payload#>>'{data,object,phoneNumberId}',
-                        raw_row.payload#>>'{data,object,phone_number_id}',
+                        raw_row.payload#>>'{{data,object,phoneNumberId}}',
+                        raw_row.payload#>>'{{data,object,phone_number_id}}',
                         ''
                     )) = lower({})
                     AND (
                         lower(coalesce(
-                            raw_row.payload#>>'{data,object,conversationId}',
-                            raw_row.payload#>>'{data,object,conversation_id}',
+                            raw_row.payload#>>'{{data,object,conversationId}}',
+                            raw_row.payload#>>'{{data,object,conversation_id}}',
                             ''
                         )) = lower({})
                         OR (
                             nullif(coalesce(
-                                raw_row.payload#>>'{data,object,conversationId}',
-                                raw_row.payload#>>'{data,object,conversation_id}',
+                                raw_row.payload#>>'{{data,object,conversationId}}',
+                                raw_row.payload#>>'{{data,object,conversation_id}}',
                                 ''
                             ), '') IS NULL
                             AND {} LIKE 'line:%'
@@ -101,22 +101,22 @@ class DatabasePreflightEvidenceLoader:
                             lower(coalesce(
                                 message_row.direction,
                                 raw_row.payload->>'direction',
-                                raw_row.payload#>>'{data,object,direction}',
+                                raw_row.payload#>>'{{data,object,direction}}',
                                 ''
                             )) IN ('inbound', 'incoming', 'received')
                             AND regexp_replace(
-                                coalesce(raw_row.payload#>>'{data,object,from}', ''),
+                                coalesce(raw_row.payload#>>'{{data,object,from}}', ''),
                                 '[^0-9]', '', 'g'
                             ) = {}
                         ) OR (
                             lower(coalesce(
                                 message_row.direction,
                                 raw_row.payload->>'direction',
-                                raw_row.payload#>>'{data,object,direction}',
+                                raw_row.payload#>>'{{data,object,direction}}',
                                 ''
                             )) IN ('outbound', 'outgoing', 'sent')
                             AND regexp_replace(
-                                coalesce(raw_row.payload#>>'{data,object,to}', ''),
+                                coalesce(raw_row.payload#>>'{{data,object,to}}', ''),
                                 '[^0-9]', '', 'g'
                             ) = {}
                         )
@@ -132,7 +132,7 @@ class DatabasePreflightEvidenceLoader:
                           AND lower(coalesce(
                               related.direction,
                               related.payload->>'direction',
-                              related.payload#>>'{data,object,direction}',
+                              related.payload#>>'{{data,object,direction}}',
                               ''
                           )) IN ('inbound', 'incoming', 'received', 'prospect')
                     ) AS later_inbound_message_id,
@@ -143,7 +143,7 @@ class DatabasePreflightEvidenceLoader:
                     related.id AS verified_outbound_message_id,
                     coalesce(
                         related.payload->'provider_ids'->>'message',
-                        related.payload#>>'{data,object,id}',
+                        related.payload#>>'{{data,object,id}}',
                         related.payload->>'provider_request_ref',
                         related.payload->>'request_ref',
                         related.payload->>'provider_message_id',
@@ -176,7 +176,7 @@ class DatabasePreflightEvidenceLoader:
                         AND lower(coalesce(
                             related.direction,
                             related.payload->>'direction',
-                            related.payload#>>'{data,object,direction}',
+                            related.payload#>>'{{data,object,direction}}',
                             ''
                         )) IN ('outbound', 'outgoing', 'sent')
                     ) OR (
@@ -186,7 +186,7 @@ class DatabasePreflightEvidenceLoader:
                   )
                   AND nullif(btrim(coalesce(
                       related.payload->'provider_ids'->>'message',
-                      related.payload#>>'{data,object,id}',
+                      related.payload#>>'{{data,object,id}}',
                       related.payload->>'provider_request_ref',
                       related.payload->>'request_ref',
                       related.payload->>'provider_message_id',
