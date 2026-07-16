@@ -83,9 +83,7 @@ def test_execute_rejects_unknown_fields_and_non_positive_or_non_integer_wake_ids
         ("calendar.delete", "calendar_mutation", "showing_delete", None, {}, EmptyArguments),
     ],
 )
-def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(
-    operation, role, intent, slot, arguments, argument_type
-):
+def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(operation, role, intent, slot, arguments, argument_type):
     request = parse_outbound_request(
         execute_payload(
             operation=operation,
@@ -146,15 +144,11 @@ def test_appointment_slot_matrix_requires_explicit_offset_and_normalizes_utc():
     with pytest.raises(ValidationError, match="explicit UTC offset"):
         parse_outbound_request(execute_payload(appointment_slot="2026-07-17T10:30:00"))
     with pytest.raises(ValidationError, match="forbidden"):
-        parse_outbound_request(
-            execute_payload(intent_kind="inquiry_reply", appointment_slot="2026-07-17T14:30:00Z")
-        )
+        parse_outbound_request(execute_payload(intent_kind="inquiry_reply", appointment_slot="2026-07-17T14:30:00Z"))
 
 
 def test_text_is_nfc_lf_normalized_and_length_bounded():
-    request = parse_outbound_request(
-        execute_payload(arguments={"text": "Cafe\u0301\r\nTour"})
-    )
+    request = parse_outbound_request(execute_payload(arguments={"text": "Cafe\u0301\r\nTour"}))
     assert request.arguments.text == "Café\nTour"
     for value in ("", "x" * 10001):
         with pytest.raises(ValidationError):

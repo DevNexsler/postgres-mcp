@@ -97,6 +97,8 @@ class ActionContext:
     recipient_phone: str | None = None
     calendar_event_url: str | None = None
     calendar_event_etag: str | None = None
+    channel_id: int = 0
+    refresh_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
 
 
 def normalize_string(value: str) -> str:
@@ -226,6 +228,7 @@ class ActionContextLoader:
         source_subject = _nonblank(record.subject)
         prospect_name = _nonblank(message.get("prospect_name")) or _nonblank(record.display_name)
         recipient_phone = normalize_phone(_nonblank(message.get("phone")) or (record.participant_key if record.participant_type == "phone" else None))
+        refresh_evidence = _mapping(raw.get("zillow_refresh") or envelope.get("zillow_refresh"))
 
         canonical_scope = self._scope(
             request,
@@ -259,6 +262,8 @@ class ActionContextLoader:
             "source_subject": source_subject,
             "prospect_name": prospect_name,
             "recipient_phone": recipient_phone,
+            "channel_id": record.channel_id,
+            "refresh_evidence": refresh_evidence,
         }
         canonical_context = MappingProxyType(canonical_context_data)
         payload_hash = canonical_payload_hash(
@@ -304,6 +309,8 @@ class ActionContextLoader:
             recipient_phone=recipient_phone,
             calendar_event_url=calendar_event_url,
             calendar_event_etag=calendar_event_etag,
+            channel_id=record.channel_id,
+            refresh_evidence=MappingProxyType(dict(refresh_evidence)),
         )
 
     @staticmethod

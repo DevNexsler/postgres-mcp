@@ -97,9 +97,7 @@ def test_lock_disposition_is_derived_from_durable_state(state, expected):
         (ActionState.MANUAL_REVIEW, None, False, PublicStatus.MANUAL_REVIEW),
     ],
 )
-def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(
-    state, completion_kind, repeated, expected
-):
+def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(state, completion_kind, repeated, expected):
     result = public_result(
         state=state,
         action_id=UUID("8f8f1a45-13a7-4bd3-a15a-f8d265bbc567"),

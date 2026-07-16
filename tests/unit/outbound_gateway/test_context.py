@@ -224,9 +224,7 @@ def request(**overrides) -> ExecuteRequest:
         ),
     ],
 )
-async def test_context_derives_provider_targets_server_side(
-    event, action, target_kind, target_id, provider_account
-):
+async def test_context_derives_provider_targets_server_side(event, action, target_kind, target_id, provider_account):
     event = WakeEventRecord(**{**event.__dict__, "wakeup_event_id": action.wakeup_event_id})
     context = await ActionContextLoader(FakeRepository(event), policy()).load(action)
     assert context.target.kind == target_kind
@@ -245,9 +243,7 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
     repo = FakeRepository(event)
     loader = ActionContextLoader(repo, policy())
     first = await loader.load(request())
-    second = await loader.load(
-        request(arguments={"text": "Friday at 10:30 works.\n— Nigel"})
-    )
+    second = await loader.load(request(arguments={"text": "Friday at 10:30 works.\n— Nigel"}))
     assert first.action_id == second.action_id
     assert first.action_id.version == 5
     assert first.payload_hash == second.payload_hash

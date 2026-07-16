@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+from datetime import datetime
+from datetime import timezone
+from types import MappingProxyType
+from unittest.mock import AsyncMock
+from unittest.mock import patch
+from uuid import UUID
+
+import pytest
+
+from postgres_mcp.outbound_gateway.context import ActionContext
+from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.evidence import DatabasePreflightEvidenceLoader
+from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import IntentKind
+from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
+from postgres_mcp.outbound_gateway.preflight import RefreshStatus
+
+NOW = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
+
+
+def context(**overrides):
+    values = dict(
+        action_id=UUID("4cbac369-48c6-5b62-95e9-41f50259e732"),
+        wakeup_event_id=7,
+        action_role=ActionRole.PROSPECT_REPLY,
+        operation=Operation.EMAIL_SEND,
+        intent_kind=IntentKind.SHOWING_OFFER,
+        appointment_slot=datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
+        arguments=MappingProxyType({"text": "hello"}),
+        source="zillow",
+        source_message_id=700,
+        source_message_key="zillow:700",
+        source_sent_at=NOW,
+        conversation_id="conversation:zillow-1",
+        conversation_watermark=700,
+        prospect_id="prospect:amanda",
+        aliases=("email:amanda@example.com",),
+        property_id="building:bullman-st",
+        property_label="138 Bullman St #144-A",
+        target=DerivedTarget("email_thread", "lead@convo.zillow.com", True),
+        provider_account="nigel-zoho",
+        routing_policy_version="v1",
+        canonical_scope=MappingProxyType({"version": "v1"}),
+        canonical_context=MappingProxyType({"identity_version": "v1"}),
+        payload_hash="a" * 64,
+        lock_holder="outbound-gateway:4cbac369-48c6-5b62-95e9-41f50259e732",
+        thread_identity="zrm-thread-1",
+        showing_lifecycle_id="showing:7",
+        calendar_event_uid=None,
+        channel_id=44,
+        refresh_evidence=MappingProxyType(
+            {
+                "status": "covered",
+                "covered_through": "2026-07-16T01:00:00Z",
+                "covered_thread_identity": "zrm-thread-1",
+                "attempt_count": 1,
+            }
+        ),
+    )
+    values.update(overrides)
+    return ActionContext(**values)
+
+
+class Row:
+    def __init__(self, cells):
+        self.cells = cells
+
+
+@pytest.mark.asyncio
+async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_gate():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": 701,
+                    "verified_outbound_request_ref": "provider-1",
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    loader = DatabasePreflightEvidenceLoader(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        proof = await loader.load(context())
+
+    assert proof.verified_outbound_message_id == 701
+    assert proof.verified_outbound_request_ref == "provider-1"
+    assert proof.verified_outbound_covers_source is True
+    assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED
+    assert proof.refresh.status is RefreshStatus.COVERED
+    assert proof.refresh.covered_thread_identity == "zrm-thread-1"
+    query = calls[0][0].casefold()
+    assert "verified_staff" not in query
+    assert "showing_slot_validation" not in query
+    assert "calendar_events" not in query
+    assert calls[0][1] == [700, 44, 44, 700, "showing_offer", 7, 7, NOW]
+
+
+@pytest.mark.asyncio
+async def test_same_building_calendar_overlap_is_not_loaded_as_blocking_evidence():
+    async def execute(_driver, _query, _params):
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": None,
+                    "verified_outbound_request_ref": None,
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        proof = await DatabasePreflightEvidenceLoader(object()).load(context())
+
+    assert proof.overlapping_showing_prospect_ids == ()
