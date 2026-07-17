@@ -193,7 +193,16 @@ class OutboundActionService:
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         context = await self._context_loader.load(request)
-        action = await self._store.create_or_load(context)
+        action = None
+        if context.prospect_id.startswith("subject:"):
+            existing = await self._store.get(context.action_id)
+            if existing is not None and self._matches_durable_subject_alias_promotion(
+                existing,
+                context,
+            ):
+                action = existing
+        if action is None:
+            action = await self._store.create_or_load(context)
         if action.state is ActionState.COMPLETED:
             return self._result(action, repeated=True)
         if not self._is_due(action):
@@ -693,6 +702,18 @@ class OutboundActionService:
         action: OutboundActionRecord,
         context: ActionContext,
     ) -> bool:
+        expected_recipient = {
+            "kind": context.target.kind,
+            "target_id": context.target.target_id,
+            "verified": context.target.verified,
+        }
+        if (
+            context.action_id != action.action_id
+            or context.provider_account != action.provider_account
+            or context.routing_policy_version != action.routing_policy_version
+            or expected_recipient != dict(action.recipient_scope)
+        ):
+            return False
         stored_context = dict(action.canonical_context)
         current_context = dict(context.canonical_context)
         stored_prospect = stored_context.get("prospect_id")

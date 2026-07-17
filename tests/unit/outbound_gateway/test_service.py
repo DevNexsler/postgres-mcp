@@ -347,6 +347,65 @@ async def test_repeated_completed_execute_is_duplicate_without_provider_call():
 
 
 @pytest.mark.asyncio
+async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_create():
+    stored_prospect = "prospect:factbook:stable-id"
+    current_prospect = "subject:durable-alias-id"
+    stored_context = {"identity_version": "v1", "prospect_id": stored_prospect}
+    stored_scope = {"version": "v1", "prospect_id": stored_prospect}
+    current_context = replace(
+        context(),
+        prospect_id=current_prospect,
+        canonical_context=MappingProxyType(
+            {"identity_version": "v1", "prospect_id": current_prospect}
+        ),
+        canonical_scope=MappingProxyType(
+            {"version": "v1", "prospect_id": current_prospect}
+        ),
+    )
+    payload_hash = canonical_payload_hash(
+        {
+            "action_role": current_context.action_role.value,
+            "operation": current_context.operation.value,
+            "intent_kind": current_context.intent_kind.value,
+            "appointment_slot": current_context.appointment_slot,
+            "arguments": current_context.arguments,
+            "canonical_context": stored_context,
+        }
+    )
+    store = FakeStore(
+        row(
+            ActionState.COMPLETED,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-existing",
+            provider_message_id="mail-existing",
+            completion_kind=CompletionKind.SENT,
+            payload_hash=payload_hash,
+            canonical_context=stored_context,
+            canonical_scope=stored_scope,
+            recipient_scope={
+                "kind": "email_thread",
+                "target_id": "lead@convo.zillow.com",
+                "verified": True,
+            },
+            provider_account="nigel-zoho",
+            routing_policy_version="v1",
+        )
+    )
+    store.create_or_load = AsyncMock(
+        side_effect=RuntimeError("outbound action payload mismatch")
+    )
+    adapter = FakeAdapter()
+    gateway = service(store, adapter)
+    gateway._context_loader.load.return_value = current_context
+
+    result = await gateway.execute(request())
+
+    assert result.status is PublicStatus.DUPLICATE
+    assert adapter.calls == []
+    store.create_or_load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_verified_existing_outbound_keeps_provider_id_as_receipt_identity():
     store = FakeStore()
     adapter = FakeAdapter()
