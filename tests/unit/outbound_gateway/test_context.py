@@ -448,6 +448,59 @@ async def test_live_shape_quo_phone_number_and_nested_conversation_are_canonical
 
 
 @pytest.mark.asyncio
+async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
+    event = record(
+        wakeup_event_id=23000,
+        event_source="zillow_rm_web_extract",
+        source_event_id="zrm-event:synthetic-linked-call",
+        message_id=197184,
+        message_source="zillow_rm_web_extract",
+        source_message_id="zrm-msg:synthetic-linked-call",
+        source_channel_id="zrm-thread:synthetic-linked-call",
+        channel_type="zillow_rm_thread",
+        participant_type="phone_number",
+        participant_key="+19085550140",
+        display_name="Missed Call Prospect",
+        raw_payload={
+            "source": "zillow_rm_web_extract",
+            "phone": "+19085550140",
+            "message_kind": "zillow_rm_call_recording",
+            "related_call": {
+                "call_id": 2549,
+                "source_call_id": "synthetic-provider-call-2549",
+                "to_number": "+17623726083",
+            },
+        },
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "Missed Call Prospect",
+                "property": "138 Test St #1",
+                "phone": "+19085550140",
+                "proxy_email": None,
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            wakeup_event_id=23000,
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"text": "Hi, we missed your call. How can we help? — Nigel"},
+        )
+    )
+
+    assert context.source == "zillow"
+    assert context.target.kind == "quo_conversation"
+    assert context.target.target_id == "+19085550140"
+    assert context.target.verified is True
+    assert context.provider_account == "leasing-main"
+    assert context.recipient_phone == "+19085550140"
+
+
+@pytest.mark.asyncio
 async def test_quo_line_id_must_match_server_owned_route():
     event = record(
         event_source="quo",
