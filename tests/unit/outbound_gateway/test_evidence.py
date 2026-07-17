@@ -173,8 +173,42 @@ async def test_evidence_excludes_only_canonical_cross_channel_duplicate_from_new
         await DatabasePreflightEvidenceLoader(object()).load(duplicate_context)
 
     query, params = calls[0]
-    assert "NOT (related.id = ANY({}::bigint[]))" in query
+    normalized_query = " ".join(query.split())
+    assert ("NOT ( coalesce(related.canonical_message_id, related.id) = ANY({}::bigint[]) )") in normalized_query
     assert params[13] == [700, 196337]
+
+
+@pytest.mark.asyncio
+async def test_evidence_excludes_durable_same_message_canonical_duplicates():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": None,
+                    "verified_outbound_message_id": None,
+                    "verified_outbound_request_ref": None,
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await DatabasePreflightEvidenceLoader(object()).load(context())
+
+    query, params = calls[0]
+    normalized_query = " ".join(query.split())
+    assert "message_row.canonical_message_id" in normalized_query
+    assert "coalesce(related.canonical_message_id, related.id)" in normalized_query
+    assert "= ANY({}::bigint[])" in normalized_query
+    assert params[13] == [700]
 
 
 @pytest.mark.asyncio
@@ -205,10 +239,8 @@ async def test_evidence_excludes_only_certified_zillow_scrape_rows_from_newer_in
 
     query, params = calls[0]
     normalized_query = " ".join(query.split())
-    assert (
-        "NOT ( lower(related.source) = 'zillow_rm_web_extract' "
-        "AND related.id = ANY({}::bigint[]) )"
-    ) in normalized_query
+    expected = "NOT ( lower(related.source) = 'zillow_rm_web_extract' AND related.id = ANY({}::bigint[]) )"
+    assert expected in normalized_query
     assert params[14] == [197065, 197067]
 
 

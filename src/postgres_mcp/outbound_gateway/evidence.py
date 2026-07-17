@@ -25,9 +25,7 @@ class DatabasePreflightEvidenceLoader:
     async def load(self, context: ActionContext) -> PreflightEvidence:
         provider_family = "zillow" if context.source in {"hotpads", "zillow", "zumper"} else context.source
         recipient_phone = "".join(character for character in str(context.recipient_phone or "") if character.isdigit())
-        equivalent_inbound_ids = sorted(
-            {context.source_message_id, *context.cross_channel_duplicate_message_ids}
-        )
+        equivalent_inbound_ids = sorted({context.source_message_id, *context.cross_channel_duplicate_message_ids})
         certified_older_message_ids = list(context.certified_older_message_ids)
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -35,6 +33,7 @@ class DatabasePreflightEvidenceLoader:
             WITH related_messages AS (
                 SELECT
                     message_row.id,
+                    message_row.canonical_message_id,
                     message_row.source_message_id,
                     message_row.sent_at,
                     message_row.direction,
@@ -133,7 +132,10 @@ class DatabasePreflightEvidenceLoader:
                 SELECT
                     max(related.id) FILTER (
                         WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
-                          AND NOT (related.id = ANY({}::bigint[]))
+                          AND NOT (
+                              coalesce(related.canonical_message_id, related.id)
+                              = ANY({}::bigint[])
+                          )
                           AND NOT (
                               lower(related.source) = 'zillow_rm_web_extract'
                               AND related.id = ANY({}::bigint[])
