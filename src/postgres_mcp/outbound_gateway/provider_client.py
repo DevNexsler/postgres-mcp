@@ -28,6 +28,7 @@ class ProviderClientError(ValueError):
 class TransportErrorKind(StrEnum):
     TIMEOUT = "timeout"
     CONNECTION_LOST = "connection_lost"
+    AUTH_REJECTED = "auth_rejected"
     TRANSPORT = "transport"
 
 
@@ -101,7 +102,13 @@ class McpProviderClient:
                 error_kind=TransportErrorKind.CONNECTION_LOST,
                 safe_detail="provider_connection_lost",
             )
-        except Exception:
+        except Exception as exc:
+            if _contains_http_auth_rejection(exc):
+                return McpCallResult(
+                    is_error=True,
+                    error_kind=TransportErrorKind.AUTH_REJECTED,
+                    safe_detail="provider_auth_rejected",
+                )
             return McpCallResult(
                 is_error=True,
                 error_kind=TransportErrorKind.TRANSPORT,
@@ -138,3 +145,14 @@ class McpProviderClient:
             is_error=bool(result.isError),
             safe_detail="provider_mcp_error" if result.isError else None,
         )
+
+
+def _contains_http_auth_rejection(error: BaseException) -> bool:
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) in {401, 403}:
+        return True
+    return any(
+        _contains_http_auth_rejection(child)
+        for child in getattr(error, "exceptions", ())
+        if isinstance(child, BaseException)
+    )

@@ -142,6 +142,14 @@ def mcp_text(result: McpCallResult) -> str:
 
 
 def transport_observation(result: McpCallResult) -> ProviderObservation | None:
+    if result.error_kind is TransportErrorKind.AUTH_REJECTED:
+        return ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "provider_auth_rejected",
+            category="provider_authentication",
+            retryable=True,
+            evidence={"kind": "http_auth_rejection"},
+        )
     if result.error_kind is TransportErrorKind.TIMEOUT:
         return ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_timeout")
     if result.error_kind is TransportErrorKind.CONNECTION_LOST:

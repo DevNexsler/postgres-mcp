@@ -11,6 +11,7 @@ import pytest
 
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
+from postgres_mcp.outbound_gateway.adapters.base import transport_observation
 from postgres_mcp.outbound_gateway.adapters.calendar import CalendarAdapter
 from postgres_mcp.outbound_gateway.adapters.cliq import CliqAdapter
 from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
@@ -126,6 +127,22 @@ def completed(tool, content):
             "result": {"tool_name": tool, "structured_content": content},
         }
     )
+
+
+def test_auth_rejection_is_retryable_definitive_non_acceptance():
+    observation = transport_observation(
+        McpCallResult(
+            error_kind=TransportErrorKind.AUTH_REJECTED,
+            is_error=True,
+            safe_detail="provider_auth_rejected",
+        )
+    )
+
+    assert observation is not None
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.detail_code == "provider_auth_rejected"
+    assert observation.category == "provider_authentication"
+    assert observation.retryable is True
 
 
 @pytest.mark.asyncio

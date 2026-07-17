@@ -7,6 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from postgres_mcp.outbound_gateway.provider_client import McpCallResult
@@ -70,6 +71,42 @@ async def test_client_converts_transport_failures_to_sanitized_results(error, ki
     assert result.error_kind is kind
     assert result.is_error is True
     assert "secret" not in (result.safe_detail or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_client_classifies_http_auth_rejection_before_provider_call(status_code):
+    request = httpx.Request("GET", "http://127.0.0.1:8080/sse")
+    response = httpx.Response(status_code, request=request)
+    rejection = httpx.HTTPStatusError(
+        "sensitive upstream detail",
+        request=request,
+        response=response,
+    )
+
+    class NestedTransportError(RuntimeError):
+        def __init__(self, child):
+            super().__init__("transport setup failed")
+            self.exceptions = (child,)
+
+    async def invoke(_config, _tool, _arguments):
+        raise NestedTransportError(rejection)
+
+    config = McpServerConfig(
+        name="quo",
+        url="http://127.0.0.1:8080/sse",
+        transport="sse",
+        allowed_tools=frozenset({"send_message"}),
+        timeout_seconds=1.0,
+    )
+    client = McpProviderClient({config.name: config}, invoker=invoke)
+
+    result = await client.call("quo", "send_message", {"content": "hello"})
+
+    assert result.error_kind is TransportErrorKind.AUTH_REJECTED
+    assert result.is_error is True
+    assert result.safe_detail == "provider_auth_rejected"
+    assert "sensitive" not in repr(result)
 
 
 def test_server_config_rejects_non_loopback_and_invalid_transport():
