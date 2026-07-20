@@ -501,7 +501,7 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
 
 
 @pytest.mark.asyncio
-async def test_quo_line_id_must_match_server_owned_route():
+async def test_quo_inbound_uses_observed_receiving_line_over_default_route():
     event = record(
         event_source="quo",
         message_source="quo",
@@ -521,14 +521,18 @@ async def test_quo_line_id_must_match_server_owned_route():
         envelope={"identity": {}, "message": {"property": "16 N Main St #16"}},
     )
 
-    with pytest.raises(ContextDerivationError, match="verified target"):
-        await ActionContextLoader(FakeRepository(event), policy()).load(
-            request(
-                operation="quo.sms.send",
-                intent_kind="inquiry_reply",
-                appointment_slot=None,
-            )
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
         )
+    )
+
+    # The phoneNumberId arrived from the Quo webhook, not agent input.  Reply
+    # from that receiving line so multi-line inbound threads remain replyable.
+    assert context.target.verified is True
+    assert context.provider_account == "different-line"
 
 
 @pytest.mark.asyncio

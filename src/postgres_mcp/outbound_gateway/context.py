@@ -636,9 +636,23 @@ class ActionContextLoader:
                 _nonblank(message.get("phone"))
                 or (_nonblank(record.participant_key) if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
             )
-            account = self._policy.quo_line_by_provider.get(provider, "")
+            configured_account = self._policy.quo_line_by_provider.get(provider, "")
             nested = _mapping(_mapping(raw.get("data")).get("object"))
             observed_account = _nonblank(nested.get("phoneNumberId") or nested.get("phone_number_id"))
+            observed_direction = _nonblank(nested.get("direction"))
+            observed_inbound = str(observed_direction or "").casefold() in {
+                "inbound",
+                "incoming",
+                "received",
+            }
+            # A Quo inbound webhook is server-side provider evidence for both
+            # recipient and receiving line.  Use that exact line for replies;
+            # one configured default cannot represent multiple PFG lines.
+            account = (
+                observed_account
+                if provider == "quo" and observed_account and observed_inbound
+                else configured_account
+            )
             target_id = thread_identity if provider == "quo" else phone or ""
             return DerivedTarget(
                 "quo_conversation",
