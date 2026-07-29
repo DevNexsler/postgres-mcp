@@ -153,7 +153,16 @@ SELECT
             'malformed_provider_success', 'provider_receipt_missing',
             'provider_request_ref_missing'
         )
-    )::bigint AS malformed_evidence
+    )::bigint AS malformed_evidence,
+    count(*) FILTER (
+        WHERE to_state = 'definitive_failed'
+          AND provider_observation->>'provider_category' IS NOT NULL
+    )::bigint AS provider_rejections,
+    count(*) FILTER (WHERE to_state = 'reconciling')::bigint
+        AS ambiguous_reconciliations,
+    count(*) FILTER (
+        WHERE detail_code LIKE 'retry_budget_exhausted%'
+    )::bigint AS retry_exhaustions
 FROM outbound_action_attempts
 """
 
@@ -244,6 +253,26 @@ WITH gateway_alert_candidates AS (
     UNION ALL
 
     SELECT
+        CASE
+            WHEN state = 'definitive_failed'
+             AND coalesce(error_category, '') <> 'retry_budget_exhausted'
+                THEN 'provider_rejection'
+            ELSE 'retry_exhaustion'
+        END,
+        action_id::text, operation, state, detail_code,
+        extract(epoch FROM (now() - updated_at))::int, 1::int
+    FROM outbound_actions
+    WHERE (
+        state = 'definitive_failed'
+        AND nullif(error_category, '') IS NOT NULL
+    ) OR (
+        state IN ('dead_letter', 'manual_review')
+        AND detail_code LIKE 'retry_budget_exhausted%'
+    )
+
+    UNION ALL
+
+    SELECT
         'completion_failure', action_id::text, operation, state, detail_code,
         extract(epoch FROM (now() - updated_at))::int, 1::int
     FROM outbound_actions
@@ -291,6 +320,10 @@ class GatewayObservability:
         self.old_action_seconds = max(1, old_action_seconds)
         self.evidence_failure_threshold = max(1, evidence_failure_threshold)
         self.alert_window_seconds = max(1, alert_window_seconds)
+        self._lease_contention_count = 0
+
+    def record_lease_contention(self) -> None:
+        self._lease_contention_count += 1
 
     async def _rows(self, query: str, params: list[Any] | None = None) -> list[Mapping[str, Any]]:
         rows = await SafeSqlDriver.execute_param_query(self._driver, query, params or [])  # type: ignore[arg-type]
@@ -331,6 +364,26 @@ class GatewayObservability:
                 MetricSample(
                     "outbound_gateway_malformed_evidence_total",
                     int(attempts.get("malformed_evidence") or 0),
+                ),
+                MetricSample(
+                    "outbound_gateway_dispositions_total",
+                    int(attempts.get("provider_rejections") or 0),
+                    {"outcome": "provider_rejection"},
+                ),
+                MetricSample(
+                    "outbound_gateway_dispositions_total",
+                    int(attempts.get("ambiguous_reconciliations") or 0),
+                    {"outcome": "ambiguous_reconciliation"},
+                ),
+                MetricSample(
+                    "outbound_gateway_dispositions_total",
+                    int(attempts.get("retry_exhaustions") or 0),
+                    {"outcome": "retry_exhaustion"},
+                ),
+                MetricSample(
+                    "outbound_gateway_dispositions_total",
+                    self._lease_contention_count,
+                    {"outcome": "lease_contention"},
                 ),
                 MetricSample(
                     "outbound_gateway_pending_oldest_seconds",

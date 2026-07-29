@@ -261,6 +261,102 @@ async def test_email_reconciliation_polls_bounded_pending_lookup_to_completion()
     ]
 
 
+@pytest.mark.asyncio
+async def test_email_reconciliation_terminalizes_structured_smtp_rejection_without_sent_lookup():
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    prior = ProviderObservation(
+        ProviderDisposition.AMBIGUOUS,
+        "provider_queue_timeout",
+        provider_request_ref="req-smtp-rejected",
+    )
+    client = FakeClient(
+        McpCallResult(
+            structured_content={
+                "call_id": "call-smtp-rejected",
+                "request_id": "req-smtp-rejected",
+                "tool_name": "email_send",
+                "account_id": "nigel-zoho",
+                "status": "failed",
+                "category": "permanent_upstream_error",
+                "retryable": False,
+                "message": (
+                    "Message failed: 550 5.4.6 Unusual sending activity detected. "
+                    "<a href=https://provider.invalid/unblock>Unblock</a>"
+                ),
+                "last_attempt": {
+                    "attempt": 1,
+                    "error": "Message failed: 550 5.4.6 Unusual sending activity detected.",
+                },
+            }
+        )
+    )
+
+    rejected = await adapter.reconcile(client, context(), ACTION_UID, prior)
+
+    assert rejected.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert rejected.detail_code == "email_smtp_rejected_550_5_4_6"
+    assert rejected.provider_request_ref == "req-smtp-rejected"
+    assert rejected.provider_call_id == "call-smtp-rejected"
+    assert rejected.category == "permanent_upstream_error"
+    assert rejected.retryable is False
+    assert rejected.evidence == {
+        "kind": "smtp_rejection",
+        "provider_category": "permanent_upstream_error",
+        "reason_code": "smtp_rejected_550_5_4_6",
+        "retryable": False,
+        "smtp_enhanced_status": "5.4.6",
+        "smtp_status": 550,
+    }
+    assert [call[1] for call in client.calls] == ["request_status"]
+    assert "Unusual sending activity" not in str(rejected.evidence)
+    assert "provider.invalid" not in str(rejected.evidence)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "failed",
+            "category": "transient_upstream_error",
+            "retryable": True,
+            "message": "Connection reset after DATA",
+        },
+        {
+            "status": "failed",
+            "category": "permanent_upstream_error",
+            "retryable": False,
+            "message": "Provider failed without an SMTP status",
+        },
+        {
+            "status": "lost",
+            "category": "request_lost",
+            "retryable": False,
+            "message": "Request record expired",
+        },
+    ],
+)
+async def test_email_uncertain_terminal_results_still_reconcile_sent(payload):
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    prior = ProviderObservation(
+        ProviderDisposition.AMBIGUOUS,
+        "provider_queue_timeout",
+        provider_request_ref="req-uncertain",
+    )
+    client = FakeClient(
+        McpCallResult(structured_content={"request_id": "req-uncertain", **payload}),
+        McpCallResult(structured_content={"status": "completed"}),
+    )
+
+    result = await adapter.reconcile(client, context(), ACTION_UID, prior)
+
+    assert result.disposition is ProviderDisposition.AMBIGUOUS
+    assert [call[1] for call in client.calls] == [
+        "request_status",
+        "email_get_thread",
+    ]
+
+
 def test_email_adapter_applies_management_copy_only_to_configured_sources():
     adapter = EmailAdapter(
         sender_domains={"nigel-zoho": "pfg.io"},

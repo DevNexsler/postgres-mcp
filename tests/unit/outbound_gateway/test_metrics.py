@@ -33,6 +33,26 @@ def test_prometheus_renderer_covers_durable_gateway_surface_and_sorts_labels():
             MetricSample("outbound_gateway_provider_calls_total", 4),
             MetricSample("outbound_gateway_provider_retries_total", 2),
             MetricSample("outbound_gateway_malformed_evidence_total", 1),
+            MetricSample(
+                "outbound_gateway_dispositions_total",
+                1,
+                {"outcome": "provider_rejection"},
+            ),
+            MetricSample(
+                "outbound_gateway_dispositions_total",
+                2,
+                {"outcome": "ambiguous_reconciliation"},
+            ),
+            MetricSample(
+                "outbound_gateway_dispositions_total",
+                3,
+                {"outcome": "retry_exhaustion"},
+            ),
+            MetricSample(
+                "outbound_gateway_dispositions_total",
+                4,
+                {"outcome": "lease_contention"},
+            ),
             MetricSample("outbound_gateway_locks_total", 4, {"outcome": "acquired"}),
             MetricSample("outbound_gateway_replay_items_total", 2, {"outcome": "eligible"}),
             MetricSample("outbound_gateway_pending_oldest_seconds", 70),
@@ -50,6 +70,7 @@ def test_prometheus_renderer_covers_durable_gateway_surface_and_sorts_labels():
         "outbound_gateway_provider_calls_total",
         "outbound_gateway_provider_retries_total",
         "outbound_gateway_malformed_evidence_total",
+        "outbound_gateway_dispositions_total",
         "outbound_gateway_locks_total",
         "outbound_gateway_replay_items_total",
         "outbound_gateway_pending_oldest_seconds",
@@ -89,7 +110,18 @@ async def test_collect_uses_durable_aggregates_for_actions_attempts_locks_and_re
                 )
             ]
         if "FROM outbound_action_attempts" in query:
-            return [Row({"provider_calls": 6, "provider_retries": 2, "malformed_evidence": 1})]
+            return [
+                Row(
+                    {
+                        "provider_calls": 6,
+                        "provider_retries": 2,
+                        "malformed_evidence": 1,
+                        "provider_rejections": 1,
+                        "ambiguous_reconciliations": 2,
+                        "retry_exhaustions": 3,
+                    }
+                )
+            ]
         if "FROM outbound_replay_items" in query:
             return [Row({"outcome": "eligible", "count": 3}), Row({"outcome": "verified_handled", "count": 2})]
         if "failure_count" in query:
@@ -117,6 +149,22 @@ async def test_collect_uses_durable_aggregates_for_actions_attempts_locks_and_re
     assert 'outbound_gateway_actions_total{outcome="submitted"} 10' in rendered
     assert 'outbound_gateway_actions_total{outcome="duplicate"} 2' in rendered
     assert 'outbound_gateway_locks_total{outcome="retained"} 1' in rendered
+    assert (
+        'outbound_gateway_dispositions_total{outcome="provider_rejection"} 1'
+        in rendered
+    )
+    assert (
+        'outbound_gateway_dispositions_total{outcome="ambiguous_reconciliation"} 2'
+        in rendered
+    )
+    assert (
+        'outbound_gateway_dispositions_total{outcome="retry_exhaustion"} 3'
+        in rendered
+    )
+    assert (
+        'outbound_gateway_dispositions_total{outcome="lease_contention"} 0'
+        in rendered
+    )
     assert 'outbound_gateway_replay_items_total{outcome="eligible"} 3' in rendered
     assert "SELECT" in calls[0][0]
     assert all("body" not in query.casefold() for query, _ in calls)

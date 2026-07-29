@@ -17,6 +17,7 @@ from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.store import LeaseContentionError
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
@@ -123,7 +124,10 @@ async def test_store_uses_database_functions_and_sanitized_observations():
     assert "create_or_load_outbound_action" in calls[0][0]
     assert "record_outbound_provider_request" in calls[1][0]
     assert "must-not-persist" not in str(calls[1][1])
-    assert calls[1][1][-1] == '{"detail_code":"provider_pending","disposition":"pending"}'
+    assert calls[1][1][-1] == (
+        '{"detail_code":"provider_pending","disposition":"pending",'
+        '"retryable":false}'
+    )
 
 
 @pytest.mark.asyncio
@@ -172,6 +176,73 @@ async def test_store_schedules_bounded_next_attempt_through_database_function():
     assert scheduled.state is ActionState.UNKNOWN
     assert "schedule_outbound_action_attempt" in calls[0][0]
     assert calls[0][1] == [ACTION_ID, "unknown", 120, "provider_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_store_maps_empty_claim_result_to_expected_lease_contention():
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(return_value=[]),
+    ):
+        with pytest.raises(LeaseContentionError) as raised:
+            await store.claim(
+                ACTION_ID,
+                ActionState.UNKNOWN,
+                "worker-test",
+                60,
+            )
+
+    assert raised.value.action_id == ACTION_ID
+    assert raised.value.expected_state is ActionState.UNKNOWN
+    assert raised.value.lease_owner == "worker-test"
+
+
+@pytest.mark.asyncio
+async def test_store_persists_only_sanitized_terminal_provider_evidence():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("definitive_failed"))]
+
+    observation = ProviderObservation(
+        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+        "email_smtp_rejected_550_5_4_6",
+        provider_request_ref="req-smtp-rejected",
+        category="permanent_upstream_error",
+        retryable=False,
+        evidence={
+            "kind": "smtp_rejection",
+            "provider_category": "permanent_upstream_error",
+            "reason_code": "smtp_rejected_550_5_4_6",
+            "retryable": False,
+            "smtp_enhanced_status": "5.4.6",
+            "smtp_status": 550,
+        },
+    )
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.definitive_fail(
+            ACTION_ID,
+            ActionState.DISPATCHING,
+            "worker-test",
+            observation,
+        )
+
+    query, params = calls[0]
+    assert "definitively_fail_outbound_action" in query
+    assert len(params) == 8
+    persisted = params[-1]
+    assert '"provider_category":"permanent_upstream_error"' in persisted
+    assert '"smtp_status":550' in persisted
+    assert '"smtp_enhanced_status":"5.4.6"' in persisted
+    assert '"reason_code":"smtp_rejected_550_5_4_6"' in persisted
+    assert '"retryable":false' in persisted
+    assert "Unusual sending activity" not in persisted
 
 
 @pytest.mark.asyncio

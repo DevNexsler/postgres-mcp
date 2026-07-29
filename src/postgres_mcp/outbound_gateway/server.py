@@ -447,6 +447,10 @@ async def _work() -> None:
         service=runtime.service,
         batch_size=int(os.environ.get("OUTBOUND_WORKER_BATCH_SIZE", "20")),
         max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
+        lease_owner=os.environ.get(
+            "OUTBOUND_GATEWAY_LEASE_OWNER",
+            "outbound-gateway",
+        ),
         observability=runtime.observability,
     )
     interval = max(1.0, float(os.environ.get("OUTBOUND_WORKER_INTERVAL_SECONDS", "5")))

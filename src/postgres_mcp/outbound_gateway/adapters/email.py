@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Mapping
 from uuid import UUID
 
@@ -19,6 +20,66 @@ from .base import mcp_text_parts
 from .base import receipt_from_observation
 from .base import request_ref
 from .base import terminal_content
+
+_SMTP_REJECTION = re.compile(
+    r"(?<!\d)(?P<status>5\d{2})(?:[ \t]+(?P<enhanced>5\.\d{1,3}\.\d{1,3}))?(?!\d)"
+)
+
+
+def _authoritative_smtp_rejection(
+    result: McpCallResult,
+    *,
+    prior_ref: str | None,
+) -> ProviderObservation | None:
+    """Return sanitized non-acceptance evidence for an explicit SMTP 5xx."""
+
+    payload = result.structured_content
+    if not payload or not (
+        payload.get("status") == "failed"
+        and payload.get("tool_name") == "email_send"
+        and payload.get("category") == "permanent_upstream_error"
+        and payload.get("retryable") is False
+    ):
+        return None
+    diagnostic_parts = []
+    for value in (payload.get("message"),):
+        if isinstance(value, str):
+            diagnostic_parts.append(value)
+    last_attempt = payload.get("last_attempt")
+    if isinstance(last_attempt, Mapping):
+        for key in ("error", "summary"):
+            value = last_attempt.get(key)
+            if isinstance(value, str):
+                diagnostic_parts.append(value)
+    match = _SMTP_REJECTION.search("\n".join(diagnostic_parts))
+    if match is None:
+        return None
+    smtp_status = int(match.group("status"))
+    enhanced_status = match.group("enhanced")
+    reason_suffix = f"{smtp_status}"
+    if enhanced_status:
+        reason_suffix += f"_{enhanced_status.replace('.', '_')}"
+    reason_code = f"smtp_rejected_{reason_suffix}"
+    evidence = {
+        "kind": "smtp_rejection",
+        "provider_category": "permanent_upstream_error",
+        "reason_code": reason_code,
+        "retryable": False,
+        "smtp_status": smtp_status,
+    }
+    if enhanced_status:
+        evidence["smtp_enhanced_status"] = enhanced_status
+    ref = request_ref(payload) or prior_ref
+    call_id = payload.get("call_id")
+    return ProviderObservation(
+        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+        f"email_{reason_code}",
+        provider_request_ref=ref,
+        provider_call_id=call_id.strip() if isinstance(call_id, str) and call_id.strip() else ref,
+        category="permanent_upstream_error",
+        retryable=False,
+        evidence=evidence,
+    )
 
 
 class EmailAdapter:
@@ -127,6 +188,9 @@ class EmailAdapter:
 
     @staticmethod
     def _parse(result: McpCallResult, *, prior_ref: str | None = None) -> ProviderObservation:
+        rejection = _authoritative_smtp_rejection(result, prior_ref=prior_ref)
+        if rejection is not None:
+            return rejection
         common = initial_observation(result)
         if common is not None:
             if prior_ref and common.provider_request_ref is None:
