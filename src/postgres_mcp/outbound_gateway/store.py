@@ -20,6 +20,33 @@ from .models import IntentKind
 from .models import Operation
 from .service import OutboundActionRecord
 
+_SAFE_OBSERVATION_KEYS = frozenset(
+    {
+        "kind",
+        "provider_category",
+        "reason_code",
+        "retryable",
+        "smtp_enhanced_status",
+        "smtp_status",
+    }
+)
+
+
+class LeaseContentionError(Exception):
+    """Another valid lease owner won an expected worker claim race."""
+
+    def __init__(
+        self,
+        *,
+        action_id: UUID,
+        expected_state: ActionState,
+        lease_owner: str,
+    ):
+        super().__init__("outbound action lease contended")
+        self.action_id = action_id
+        self.expected_state = expected_state
+        self.lease_owner = lease_owner
+
 
 def _json(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -30,10 +57,17 @@ def _hash(value: Mapping[str, Any]) -> str:
 
 
 def _observation(value: ProviderObservation) -> dict[str, Any]:
-    return {
+    observation = {
         "detail_code": value.detail_code,
         "disposition": value.disposition.value,
+        "retryable": value.retryable,
     }
+    if value.category:
+        observation["provider_category"] = value.category
+    for key, item in (value.evidence or {}).items():
+        if key in _SAFE_OBSERVATION_KEYS:
+            observation[key] = item
+    return observation
 
 
 class PostgresActionStore:
@@ -109,10 +143,18 @@ class PostgresActionStore:
         lease_owner: str,
         lease_seconds: int,
     ) -> OutboundActionRecord:
-        return await self._one(
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
             "SELECT * FROM claim_outbound_action({}, {}, {}, {})",
             [action_id, expected_state.value, lease_owner, lease_seconds],
         )
+        if not rows:
+            raise LeaseContentionError(
+                action_id=action_id,
+                expected_state=expected_state,
+                lease_owner=lease_owner,
+            )
+        return self._record(rows[0].cells)
 
     async def record_provider_request(
         self,
@@ -213,7 +255,8 @@ class PostgresActionStore:
         return await self._one(
             """
             SELECT * FROM definitively_fail_outbound_action(
-                {}, {}, {}, 'authoritative_non_acceptance', {}, {}, {}, {}
+                {}, {}, {}, 'authoritative_non_acceptance', {}, {}, {}, {},
+                {}::jsonb
             )
             """,
             [
@@ -224,6 +267,7 @@ class PostgresActionStore:
                 _hash(evidence),
                 observation.category or "provider_non_acceptance",
                 observation.detail_code,
+                _json(_observation(observation)),
             ],
         )
 

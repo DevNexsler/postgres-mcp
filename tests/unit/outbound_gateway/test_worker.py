@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionState
+from postgres_mcp.outbound_gateway.store import LeaseContentionError
 from postgres_mcp.outbound_gateway.worker import OutboundWorker
 
 
@@ -77,9 +78,81 @@ async def test_worker_isolates_poison_action_and_continues_batch():
         store=store,
         service=service,
         batch_size=20,
-        on_error=lambda action_id, operation, error: failures.append((action_id, operation, type(error).__name__)),
+        lease_owner="worker-test",
+        on_error=lambda action_id, operation, state, lease_owner, error: failures.append(
+            (action_id, operation, state, lease_owner, type(error).__name__)
+        ),
     )
 
     assert await worker.run_once() == 2
     assert service.reconcile.await_args_list[1].args == (healthy,)
-    assert failures == [(poison, "reconcile", "RuntimeError")]
+    assert failures == [
+        (poison, "reconcile", ActionState.UNKNOWN, "worker-test", "RuntimeError")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_treats_valid_lease_contention_as_benign_and_continues_batch():
+    contended = UUID(int=31)
+    healthy = UUID(int=32)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [
+        (contended, ActionState.UNKNOWN),
+        (healthy, ActionState.UNKNOWN),
+    ]
+    service = AsyncMock()
+    service.reconcile.side_effect = [
+        LeaseContentionError(
+            action_id=contended,
+            expected_state=ActionState.UNKNOWN,
+            lease_owner="worker-test",
+        ),
+        None,
+    ]
+    failures = []
+    contentions = []
+    observability = AsyncMock()
+    observability.scan_alerts.return_value = []
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        batch_size=20,
+        lease_owner="worker-test",
+        observability=observability,
+        on_error=lambda *args: failures.append(args),
+        on_contention=lambda action_id, operation, state, lease_owner: contentions.append(
+            (action_id, operation, state, lease_owner)
+        ),
+    )
+
+    assert await worker.run_once() == 2
+    assert service.reconcile.await_args_list[1].args == (healthy,)
+    assert failures == []
+    assert contentions == [
+        (contended, "reconcile", ActionState.UNKNOWN, "worker-test")
+    ]
+    observability.record_lease_contention.assert_called_once_with()
+
+
+def test_unexpected_worker_error_diagnostic_is_actionable_and_sanitized(capsys):
+    action_id = UUID(int=41)
+    error = RuntimeError("password=secret customer payload")
+
+    OutboundWorker._default_error(
+        action_id,
+        "reconcile",
+        ActionState.UNKNOWN,
+        "worker-test",
+        error,
+    )
+
+    diagnostic = capsys.readouterr().out
+    assert '"level": "error"' in diagnostic
+    assert f'"action_id": "{action_id}"' in diagnostic
+    assert '"operation": "reconcile"' in diagnostic
+    assert '"expected_state": "unknown"' in diagnostic
+    assert '"lease_owner": "worker-test"' in diagnostic
+    assert '"detail_code": "unexpected_runtime_error"' in diagnostic
+    assert "secret" not in diagnostic
+    assert "customer payload" not in diagnostic
