@@ -524,6 +524,8 @@ class ActionContextLoader:
             return "quo"
         if record.message_source == "zoho_cliq":
             return "cliq"
+        if record.message_source == "tenantcloud_api":
+            return "tenantcloud"
         return record.message_source.casefold()
 
     @staticmethod
@@ -756,7 +758,7 @@ class ActionContextLoader:
         envelope: Mapping[str, Any],
         provider: str,
     ) -> tuple[int, str, dict[str, str]]:
-        if record.event_source not in {"tenantcloud", "tenantcloud_claim"}:
+        if record.event_source not in {"tenantcloud_api", "tenantcloud_claim"}:
             raise ContextDerivationError("TenantCloud source is required")
         if provider != "tenantcloud" or record.message_source != "tenantcloud_api":
             raise ContextDerivationError("TenantCloud provider is required")

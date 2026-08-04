@@ -137,7 +137,7 @@ def tenantcloud_record(*, family="lead", entity_ids=None, **overrides):
         "source_message_id": "tenantcloud:message:700",
         "source_channel_id": "tenantcloud:lead-thread:8001",
         "channel_type": "tenantcloud_lead",
-        "raw_payload": {"provider": "tenantcloud"},
+        "raw_payload": {},
         "tenantcloud_claim_id": 301,
         "tenantcloud_claim_family": family,
         "tenantcloud_claim_state": "claimed",
@@ -255,7 +255,9 @@ async def test_tenantcloud_context_uses_only_claim_linked_provider_identity(oper
     ("operation", "record_overrides", "error"),
     [
         ("tenantcloud.lead.status.update", {"event_source": "zoho_mail"}, "source"),
+        ("tenantcloud.lead.status.update", {"event_source": "tenantcloud"}, "source"),
         ("tenantcloud.lead.status.update", {"raw_payload": {"provider": "zillow"}}, "provider"),
+        ("tenantcloud.lead.status.update", {"message_source": "zoho_mail"}, "provider"),
         ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": None}, "claim"),
         ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": True}, "claim"),
         ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": 302}, "claim"),
@@ -270,6 +272,19 @@ async def test_tenantcloud_context_rejects_untrusted_claim_and_channel_shapes(op
 
     with pytest.raises(ContextDerivationError, match=error):
         await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_source", ["tenantcloud_api", "tenantcloud_claim"])
+async def test_tenantcloud_context_accepts_production_wake_sources(event_source):
+    event = tenantcloud_record(event_source=event_source)
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        tenantcloud_request("tenantcloud.lead.status.update")
+    )
+
+    assert context.provider_account == "tenantcloud"
+    assert context.canonical_context["tenantcloud_claim_id"] == 301
 
 
 @pytest.mark.asyncio
