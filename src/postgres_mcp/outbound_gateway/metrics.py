@@ -26,6 +26,10 @@ _PROVIDER_BY_OPERATION = {
     Operation.CALENDAR_CREATE: "agent-email",
     Operation.CALENDAR_UPDATE: "agent-email",
     Operation.CALENDAR_DELETE: "agent-email",
+    Operation.TENANTCLOUD_MESSAGE_SEND: "tenantcloud",
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: "tenantcloud",
+    Operation.TENANTCLOUD_MAINTENANCE_CREATE: "tenantcloud",
+    Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: "tenantcloud",
 }
 _REPLAY_OUTCOMES = (
     "eligible",

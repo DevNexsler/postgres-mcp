@@ -35,6 +35,10 @@ class WakeEventRecord:
     display_name: str | None
     envelope: dict[str, Any]
     raw_payload: dict[str, Any]
+    tenantcloud_claim_id: int | None = None
+    tenantcloud_claim_family: str | None = None
+    tenantcloud_claim_state: str | None = None
+    tenantcloud_action_owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,13 +99,19 @@ class OutboundGatewayRepository:
                 participant_row.participant_key,
                 participant_row.display_name,
                 event_row.envelope,
-                coalesce(raw_row.payload, '{{}}'::jsonb) AS raw_payload
+                coalesce(raw_row.payload, '{{}}'::jsonb) AS raw_payload,
+                event_row.tenantcloud_claim_id,
+                claim_row.event_family AS tenantcloud_claim_family,
+                claim_row.claim_state AS tenantcloud_claim_state,
+                claim_row.action_owner AS tenantcloud_action_owner
             FROM hermes_wakeup_events AS event_row
             JOIN messages AS message_row ON message_row.id = event_row.message_id
             JOIN channels AS channel_row ON channel_row.id = message_row.channel_id
             LEFT JOIN participants AS participant_row
               ON participant_row.id = message_row.sender_participant_id
             LEFT JOIN raw_events AS raw_row ON raw_row.id = message_row.raw_event_id
+            LEFT JOIN tenantcloud_event_claims AS claim_row
+              ON claim_row.claim_id = event_row.tenantcloud_claim_id
             WHERE event_row.id = {}
             """,
             [wakeup_event_id],

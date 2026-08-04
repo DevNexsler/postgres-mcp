@@ -82,6 +82,22 @@ class PostgresActionStore:
             lock_intent = f"{context.intent_kind.value}:turn:{context.source_message_id}"
         elif context.action_role is ActionRole.CALENDAR_MUTATION:
             lock_intent = f"{context.intent_kind.value}:lifecycle:{context.showing_lifecycle_id}"
+        elif context.action_role is ActionRole.PROVIDER_MUTATION:
+            claim_id = context.canonical_context["tenantcloud_claim_id"]
+            source_id = context.canonical_context["source_event_id"]
+            desired_hash = context.canonical_scope["desired_state_hash"]
+            prefix = f"v1:claim:{claim_id}:source:{source_id}:op:{context.operation.value}:target:{context.target.target_id}"
+            if context.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
+                provider_ids = context.canonical_context["provider_ids"]
+                normalized_text_hash = sha256(str(context.arguments["text"]).encode("utf-8")).hexdigest()
+                lock_intent = (
+                    f"{prefix}:property:{provider_ids['property_id']}:unit:{provider_ids['unit_id']}:"
+                    f"category:{context.arguments['category_id']}:"
+                    f"initiated:{context.arguments['initiated_at']}:"
+                    f"text:{normalized_text_hash}:state:{desired_hash}"
+                )
+            else:
+                lock_intent = f"{prefix}:state:{desired_hash}"
         else:
             lock_intent = f"{context.intent_kind.value}:event:{context.wakeup_event_id}"
         return await self._one(

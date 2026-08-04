@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
+from hashlib import sha256
 from types import MappingProxyType
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -83,6 +85,34 @@ def context():
         thread_identity="zrm-thread-1",
         showing_lifecycle_id="showing:7",
         calendar_event_uid=None,
+    )
+
+
+def provider_context(operation, arguments, target, *, claim_id=301, source_event_id="tenantcloud:claim:301", desired_hash="d" * 64):
+    intent = {
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+    }[operation]
+    return replace(
+        context(),
+        action_role=ActionRole.PROVIDER_MUTATION,
+        operation=operation,
+        intent_kind=intent,
+        appointment_slot=None,
+        arguments=MappingProxyType(arguments),
+        target=target,
+        provider_account="tenantcloud",
+        canonical_context=MappingProxyType(
+            {
+                "identity_version": "v1",
+                "tenantcloud_claim_id": claim_id,
+                "source_event_id": source_event_id,
+                "operation_target": {"kind": target.kind, "target_id": target.target_id},
+                **({"provider_ids": {"property_id": "12", "unit_id": "34"}} if operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE else {}),
+            }
+        ),
+        canonical_scope=MappingProxyType({"version": "v1", "desired_state_hash": desired_hash}),
     )
 
 
@@ -191,3 +221,130 @@ async def test_prospect_lock_scope_includes_canonical_source_turn():
 
     assert "prepare_outbound_action_and_acquire_lock" in calls[0][0]
     assert calls[0][1][4] == "showing_offer:turn:700"
+
+
+async def prepared_lock_intent(subject):
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("prepared"))]
+
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await PostgresActionStore(object()).prepare(subject, ActionState.RECEIVED)
+    return calls[0][1][4]
+
+
+@pytest.mark.asyncio
+async def test_provider_status_lock_has_versioned_claim_source_target_and_desired_state():
+    subject = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "6001", True),
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert lock_intent == ("v1:claim:301:source:tenantcloud:claim:301:op:tenantcloud.lead.status.update:target:6001:state:" + "d" * 64)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_create_lock_uses_explicit_boundaries_and_hashes_text():
+    text = "Café\nPipe"
+    subject = provider_context(
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+        {
+            "category_id": 57,
+            "title": "Kitchen leak",
+            "priority": "normal",
+            "initiated_at": "2026-08-04",
+            "text": text,
+            "entry_allowed": False,
+            "available_on": "2026-08-05",
+        },
+        DerivedTarget("tenantcloud_property_unit", "property:12:unit:34", True),
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert lock_intent == (
+        "v1:claim:301:source:tenantcloud:claim:301:"
+        "op:tenantcloud.maintenance.create:target:property:12:unit:34:"
+        "property:12:unit:34:category:57:initiated:2026-08-04:text:"
+        f"{sha256(text.encode('utf-8')).hexdigest()}:state:{'d' * 64}"
+    )
+    assert text not in lock_intent
+    assert "Café" not in lock_intent
+
+
+@pytest.mark.asyncio
+async def test_provider_lock_changes_for_desired_state_and_distinct_wake_identity():
+    base = provider_context(
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
+        {"status": 2},
+        DerivedTarget("tenantcloud_maintenance_request", "81", True),
+    )
+    changed_state = replace(
+        base,
+        arguments=MappingProxyType({"status": 3}),
+        canonical_scope=MappingProxyType({"version": "v1", "desired_state_hash": "e" * 64}),
+    )
+    distinct_wake = replace(
+        base,
+        canonical_context=MappingProxyType(
+            {
+                **base.canonical_context,
+                "tenantcloud_claim_id": 302,
+                "source_event_id": "tenantcloud:claim:302",
+            }
+        ),
+    )
+
+    base_key = await prepared_lock_intent(base)
+    same_key = await prepared_lock_intent(replace(base, action_id=UUID("f255a04a-93df-4e55-afd7-da866f992111")))
+    changed_key = await prepared_lock_intent(changed_state)
+    distinct_key = await prepared_lock_intent(distinct_wake)
+
+    assert same_key == base_key
+    assert changed_key != base_key
+    assert distinct_key != base_key
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_keeps_existing_reply_lock_identity():
+    subject = replace(
+        context(),
+        operation=Operation.TENANTCLOUD_MESSAGE_SEND,
+        intent_kind=IntentKind.INQUIRY_REPLY,
+        appointment_slot=None,
+        arguments=MappingProxyType({"text": "Reply"}),
+    )
+
+    assert await prepared_lock_intent(subject) == "inquiry_reply:turn:700"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "operation", "intent", "expected"),
+    [
+        (
+            ActionRole.CALENDAR_MUTATION,
+            Operation.CALENDAR_CREATE,
+            IntentKind.SHOWING_CREATE,
+            "showing_create:lifecycle:showing:7",
+        ),
+        (
+            ActionRole.INTERNAL_NOTIFICATION,
+            Operation.CLIQ_CHANNEL_POST,
+            IntentKind.LEAD_ALERT,
+            "lead_alert:event:7",
+        ),
+    ],
+)
+async def test_existing_nonreply_lock_keys_are_exact(role, operation, intent, expected):
+    subject = replace(context(), action_role=role, operation=operation, intent_kind=intent)
+
+    assert await prepared_lock_intent(subject) == expected

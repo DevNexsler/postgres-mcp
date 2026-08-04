@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
@@ -125,6 +126,207 @@ def request(**overrides) -> ExecuteRequest:
     parsed = parse_outbound_request(payload)
     assert isinstance(parsed, ExecuteRequest)
     return parsed
+
+
+def tenantcloud_record(*, family="lead", entity_ids=None, **overrides):
+    values = {
+        **record().__dict__,
+        "event_source": "tenantcloud_claim",
+        "message_source": "tenantcloud_api",
+        "source_event_id": "tenantcloud:claim:301",
+        "source_message_id": "tenantcloud:message:700",
+        "source_channel_id": "tenantcloud:lead-thread:8001",
+        "channel_type": "tenantcloud_lead",
+        "raw_payload": {"provider": "tenantcloud"},
+        "tenantcloud_claim_id": 301,
+        "tenantcloud_claim_family": family,
+        "tenantcloud_claim_state": "claimed",
+        "tenantcloud_action_owner": "tenantcloud_api",
+        "envelope": {
+            "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
+            "message": {"direct_email": "tenant@example.com"},
+            "tenantcloud": {
+                "claim_id": 301,
+                "action_owner": "tenantcloud_api",
+                "claim_state": "claimed",
+                "event_family": family,
+                "entity_ids": entity_ids or {"lead_id": "6001", "listing_id": "5001", "thread_id": "8001"},
+            },
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def tenantcloud_request(operation):
+    cases = {
+        "tenantcloud.message.send": {
+            "action_role": "prospect_reply",
+            "intent_kind": "inquiry_reply",
+            "arguments": {"text": "Thanks"},
+        },
+        "tenantcloud.lead.status.update": {
+            "action_role": "provider_mutation",
+            "intent_kind": "tenantcloud_lead_status",
+            "arguments": {"status": "working"},
+        },
+        "tenantcloud.maintenance.create": {
+            "action_role": "provider_mutation",
+            "intent_kind": "tenantcloud_maintenance_create",
+            "arguments": {
+                "category_id": 57,
+                "title": "Kitchen leak",
+                "priority": "normal",
+                "initiated_at": "2026-08-04",
+                "text": "Pipe is leaking\r\nunder sink",
+                "entry_allowed": False,
+                "available_on": "2026-08-05",
+            },
+        },
+        "tenantcloud.maintenance.status.update": {
+            "action_role": "provider_mutation",
+            "intent_kind": "tenantcloud_maintenance_status",
+            "arguments": {"status": 3},
+        },
+    }
+    return request(operation=operation, appointment_slot=None, **cases[operation])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "family", "entity_ids", "target_kind", "target_id"),
+    [
+        (
+            "tenantcloud.message.send",
+            "lead",
+            {"lead_id": "6001", "thread_id": "8001"},
+            "tenantcloud_thread",
+            "8001",
+        ),
+        (
+            "tenantcloud.lead.status.update",
+            "lead",
+            {"lead_id": "6001", "thread_id": "8001"},
+            "tenantcloud_lead",
+            "6001",
+        ),
+        (
+            "tenantcloud.maintenance.create",
+            "maintenance",
+            {"property_id": "12", "unit_id": "34", "thread_id": "8201"},
+            "tenantcloud_property_unit",
+            "property:12:unit:34",
+        ),
+        (
+            "tenantcloud.maintenance.status.update",
+            "maintenance",
+            {"request_id": "81", "property_id": "12", "unit_id": "34", "thread_id": "8201"},
+            "tenantcloud_maintenance_request",
+            "81",
+        ),
+    ],
+)
+async def test_tenantcloud_context_uses_only_claim_linked_provider_identity(operation, family, entity_ids, target_kind, target_id):
+    channel = f"tenantcloud:{family}-thread:{entity_ids['thread_id']}"
+    event = tenantcloud_record(
+        family=family,
+        entity_ids=entity_ids,
+        source_channel_id=channel,
+        channel_type=f"tenantcloud_{family}",
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+
+    assert context.target.kind == target_kind
+    assert context.target.target_id == target_id
+    assert context.provider_account == "tenantcloud"
+    assert context.canonical_context["tenantcloud_claim_id"] == 301
+    assert context.canonical_context["source_event_id"] == "tenantcloud:claim:301"
+    assert context.canonical_context["operation_target"] == {
+        "kind": target_kind,
+        "target_id": target_id,
+    }
+    assert context.canonical_context["provider_ids"] == entity_ids
+    assert context.canonical_context["routing_policy_version"] == "appointment-v1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "record_overrides", "error"),
+    [
+        ("tenantcloud.lead.status.update", {"event_source": "zoho_mail"}, "source"),
+        ("tenantcloud.lead.status.update", {"raw_payload": {"provider": "zillow"}}, "provider"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": None}, "claim"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": True}, "claim"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": 302}, "claim"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_claim_state": "pending"}, "state"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_action_owner": "legacy"}, "owner"),
+        ("tenantcloud.lead.status.update", {"tenantcloud_claim_family": "maintenance"}, "family"),
+        ("tenantcloud.message.send", {"source_channel_id": "tenantcloud:lead-thread:9999"}, "thread"),
+    ],
+)
+async def test_tenantcloud_context_rejects_untrusted_claim_and_channel_shapes(operation, record_overrides, error):
+    event = tenantcloud_record(**record_overrides)
+
+    with pytest.raises(ContextDerivationError, match=error):
+        await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "family", "entity_ids"),
+    [
+        ("tenantcloud.message.send", "lead", {"lead_id": "6001"}),
+        ("tenantcloud.lead.status.update", "lead", {"thread_id": "8001"}),
+        ("tenantcloud.lead.status.update", "lead", {"lead_id": True, "thread_id": "8001"}),
+        ("tenantcloud.lead.status.update", "lead", {"lead_id": "0", "thread_id": "8001"}),
+        ("tenantcloud.lead.status.update", "lead", {"lead_id": "6001 or 6002", "thread_id": "8001"}),
+        ("tenantcloud.lead.status.update", "lead", {"lead_id": "9223372036854775808", "thread_id": "8001"}),
+        ("tenantcloud.lead.status.update", "lead", {"lead_id": "6001", "leadId": "6002", "thread_id": "8001"}),
+        ("tenantcloud.maintenance.create", "maintenance", {"property_id": "12", "thread_id": "8201"}),
+        ("tenantcloud.maintenance.status.update", "maintenance", {"property_id": "12", "thread_id": "8201"}),
+        ("tenantcloud.maintenance.status.update", "lead", {"request_id": "81", "thread_id": "8001"}),
+    ],
+)
+async def test_tenantcloud_context_rejects_missing_conflicting_or_cross_family_ids(operation, family, entity_ids):
+    event = tenantcloud_record(
+        family=family,
+        entity_ids=entity_ids,
+        source_channel_id=f"tenantcloud:{family}-thread:{entity_ids.get('thread_id', '8001')}",
+        channel_type=f"tenantcloud_{family}",
+    )
+
+    with pytest.raises(ContextDerivationError):
+        await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias():
+    event = tenantcloud_record(
+        family="maintenance",
+        entity_ids={"request_id": "81"},
+        source_channel_id="tenantcloud:maintenance-request:81",
+        channel_type="tenantcloud_maintenance",
+        participant_type=None,
+        participant_key=None,
+        envelope={
+            "identity": {},
+            "message": {},
+            "tenantcloud": {
+                "claim_id": 301,
+                "action_owner": "tenantcloud_api",
+                "claim_state": "claimed",
+                "event_family": "maintenance",
+                "entity_ids": {"request_id": "81"},
+            },
+        },
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        tenantcloud_request("tenantcloud.maintenance.status.update")
+    )
+
+    assert context.prospect_id == "tenantcloud:claim:301"
 
 
 @pytest.mark.asyncio
