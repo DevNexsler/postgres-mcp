@@ -19,6 +19,9 @@ from .models import CompletionKind
 from .models import IntentKind
 from .models import Operation
 from .service import OutboundActionRecord
+from .service import OutboundActionService
+
+_VERIFIED_READBACK_EVIDENCE_KEYS = frozenset({"canonical_observed_state", "readback_timestamp", "evidence_hash"})
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -34,6 +37,13 @@ def _observation(value: ProviderObservation) -> dict[str, Any]:
         "detail_code": value.detail_code,
         "disposition": value.disposition.value,
     }
+
+
+def _verified_readback_evidence(value: ProviderObservation) -> Mapping[str, Any] | None:
+    evidence = value.evidence
+    if not isinstance(evidence, Mapping) or set(evidence) != _VERIFIED_READBACK_EVIDENCE_KEYS:
+        return None
+    return evidence
 
 
 class PostgresActionStore:
@@ -156,8 +166,31 @@ class PostgresActionStore:
         observation: ProviderObservation,
     ) -> OutboundActionRecord:
         authoritative = next_state is ActionState.RETRY_READY
-        evidence = dict(observation.evidence or {}) if authoritative else {}
-        evidence_reference = observation.provider_request_ref or observation.detail_code if authoritative else None
+        verified_readback = (
+            _verified_readback_evidence(observation) if next_state is ActionState.PROVIDER_ACCEPTED else None
+        )
+        sanitized = _observation(observation)
+        if authoritative:
+            evidence = dict(observation.evidence or {})
+            evidence_kind = "authoritative_non_acceptance"
+            evidence_reference = observation.provider_request_ref or observation.detail_code
+            evidence_hash = _hash(evidence)
+        elif verified_readback is not None:
+            # Verified-readback evidence for TenantCloud writes is already
+            # sanitized by construction (canonical observed state, a
+            # readback timestamp, and a hash -- never raw HTTP bodies or
+            # secrets). Persist it so a crash between this transition and
+            # the completion write can be recovered from durable evidence
+            # instead of re-touching the provider.
+            evidence = dict(verified_readback)
+            evidence_kind = "verified_readback"
+            evidence_reference = observation.provider_request_ref or evidence["evidence_hash"]
+            evidence_hash = OutboundActionService.evidence_hash(evidence)
+            sanitized = {**sanitized, "evidence": evidence}
+        else:
+            evidence_kind = None
+            evidence_reference = None
+            evidence_hash = None
         return await self._one(
             """
             SELECT * FROM transition_outbound_action(
@@ -174,10 +207,10 @@ class PostgresActionStore:
                 observation.provider_call_id,
                 observation.provider_request_ref,
                 observation.message_id,
-                _json(_observation(observation)),
-                "authoritative_non_acceptance" if authoritative else None,
+                _json(sanitized),
+                evidence_kind,
                 evidence_reference,
-                _hash(evidence) if authoritative else None,
+                evidence_hash,
                 observation.category,
                 observation.detail_code if next_state is ActionState.UNKNOWN else None,
             ],
@@ -306,6 +339,12 @@ class PostgresActionStore:
     def _record(cells: Mapping[str, Any]) -> OutboundActionRecord:
         completion = cells.get("completion_kind")
         action_uid = cells.get("action_uid")
+        last_observation = cells.get("last_observation")
+        readback_evidence = (
+            last_observation.get("evidence")
+            if isinstance(last_observation, Mapping) and isinstance(last_observation.get("evidence"), Mapping)
+            else None
+        )
         return OutboundActionRecord(
             action_id=UUID(str(cells["action_id"])),
             wakeup_event_id=int(cells["wakeup_event_id"]),
@@ -329,4 +368,8 @@ class PostgresActionStore:
             recipient_scope=dict(cells.get("recipient_scope") or {}),
             provider_account=str(cells.get("provider_account") or ""),
             routing_policy_version=str(cells.get("routing_policy_version") or ""),
+            provider_evidence_kind=cells.get("evidence_kind"),
+            provider_evidence_reference=cells.get("evidence_reference"),
+            provider_evidence_hash=cells.get("evidence_hash"),
+            provider_readback_evidence=dict(readback_evidence) if readback_evidence else {},
         )

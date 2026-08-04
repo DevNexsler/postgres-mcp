@@ -7,6 +7,7 @@ import json
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from hashlib import sha256
 from typing import Any
@@ -62,6 +63,10 @@ class OutboundActionRecord:
     recipient_scope: Mapping[str, Any]
     provider_account: str
     routing_policy_version: str
+    provider_evidence_kind: str | None = None
+    provider_evidence_reference: str | None = None
+    provider_evidence_hash: str | None = None
+    provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
 
     def execute_request(self) -> ExecuteRequest:
         return ExecuteRequest.model_validate(
@@ -155,6 +160,16 @@ class ClosedCircuitGuard:
 
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], Awaitable[None]]
+
+_TENANTCLOUD_OPERATIONS = frozenset(
+    {
+        Operation.TENANTCLOUD_MESSAGE_SEND,
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
+    }
+)
+_VERIFIED_READBACK_EVIDENCE_KEYS = frozenset({"canonical_observed_state", "readback_timestamp", "evidence_hash"})
 
 
 class OutboundActionService:
@@ -405,6 +420,16 @@ class OutboundActionService:
             and action.provider_message_id
             and action.provider_accepted_at
         ):
+            return None
+        if action.operation in _TENANTCLOUD_OPERATIONS and not self._verified_tenantcloud_evidence(action):
+            # TenantCloud writes are irreversible provider-side actions
+            # (lead status, maintenance requests). The generic ref/id/accepted_at
+            # heuristic above is not proof enough here: only durable evidence
+            # that says "verified readback" AND whose hash matches the
+            # persisted canonical state may complete without provider I/O.
+            # Anything else -- including a crash between the PROVIDER_ACCEPTED
+            # transition and the evidence write -- must go through bounded
+            # reconciliation instead of being trusted blindly.
             return None
         provider_request_ref = action.provider_request_ref
         provider_message_id = action.provider_message_id
@@ -787,6 +812,15 @@ class OutboundActionService:
     @staticmethod
     def evidence_hash(evidence: Mapping[str, Any] | None) -> str:
         return sha256(json.dumps(evidence or {}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _verified_tenantcloud_evidence(action: OutboundActionRecord) -> bool:
+        if action.provider_evidence_kind != "verified_readback" or not action.provider_evidence_hash:
+            return False
+        evidence = dict(action.provider_readback_evidence)
+        if set(evidence) != _VERIFIED_READBACK_EVIDENCE_KEYS:
+            return False
+        return OutboundActionService.evidence_hash(evidence) == action.provider_evidence_hash
 
     @staticmethod
     def _result(action: OutboundActionRecord, *, repeated: bool = False) -> PublicResult:

@@ -471,6 +471,184 @@ async def test_provider_accepted_exhaustion_recovers_persisted_receipt():
     assert store.current.provider_message_id == "mail-accepted"
 
 
+def tenantcloud_context(**overrides):
+    values = dict(
+        action_id=ACTION_ID,
+        wakeup_event_id=7,
+        action_role=ActionRole.PROVIDER_MUTATION,
+        operation=Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        intent_kind=IntentKind.TENANTCLOUD_LEAD_STATUS,
+        appointment_slot=None,
+        arguments=MappingProxyType({"status": "working"}),
+        source="tenantcloud",
+        source_message_id=700,
+        source_message_key="tenantcloud_api:700",
+        source_sent_at=NOW,
+        conversation_id="conversation:tenantcloud-1",
+        conversation_watermark=700,
+        prospect_id="tenantcloud:claim:301",
+        aliases=(),
+        property_id=None,
+        property_label=None,
+        target=DerivedTarget("tenantcloud_lead", "6001", True),
+        provider_account="tenantcloud",
+        routing_policy_version="v1",
+        canonical_scope=MappingProxyType({"version": "v1"}),
+        canonical_context=MappingProxyType({"identity_version": "v1"}),
+        payload_hash="a" * 64,
+        lock_holder=f"outbound-gateway:{ACTION_ID}",
+        thread_identity="tenantcloud:lead-thread:6001",
+        showing_lifecycle_id="showing:wake:7",
+        calendar_event_uid=None,
+    )
+    values.update(overrides)
+    return ActionContext(**values)
+
+
+def tenantcloud_row(state=ActionState.RECEIVED, **overrides):
+    values = dict(
+        action_id=ACTION_ID,
+        wakeup_event_id=7,
+        action_role=ActionRole.PROVIDER_MUTATION,
+        operation=Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        intent_kind=IntentKind.TENANTCLOUD_LEAD_STATUS,
+        appointment_slot=None,
+        arguments={"status": "working"},
+        state=state,
+        action_uid=ACTION_UID if state is not ActionState.RECEIVED else None,
+        provider_request_ref=None,
+        provider_message_id=None,
+        provider_accepted_at=None,
+        completion_kind=None,
+        detail_code=state.value,
+        attempt_count=0,
+        next_attempt_at=NOW,
+        payload_hash="",
+        canonical_context={},
+        canonical_scope={},
+        recipient_scope={},
+        provider_account="",
+        routing_policy_version="",
+    )
+    values.update(overrides)
+    return OutboundActionRecord(**values)
+
+
+def tenantcloud_service(store, adapter):
+    loader = AsyncMock()
+    loader.load.return_value = tenantcloud_context()
+    preflight = AsyncMock()
+    preflight.load.return_value = evidence()
+    return OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+        response_budget_seconds=1,
+        sleep=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_persisted_acceptance_with_verified_readback_recovers_without_provider_io():
+    verified_evidence = {
+        "canonical_observed_state": {"status": "working"},
+        "readback_timestamp": "2026-07-16T01:00:00Z",
+        "evidence_hash": "e" * 64,
+    }
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="lead:6001",
+            provider_message_id="tenantcloud-lead:6001:working",
+            provider_accepted_at=NOW,
+            provider_evidence_kind="verified_readback",
+            provider_evidence_hash=OutboundActionService.evidence_hash(verified_evidence),
+            provider_readback_evidence=verified_evidence,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await tenantcloud_service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["claim", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_persisted_acceptance_without_verified_readback_reconciles_never_dispatches_second_write():
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="lead:6001",
+            provider_message_id="tenantcloud-lead:6001:working",
+            provider_accepted_at=NOW,
+            # No provider_evidence_kind/hash persisted -- e.g. the worker
+            # crashed after the durable PROVIDER_ACCEPTED transition but
+            # before the completion evidence made it to durable storage.
+        )
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_reconciled",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=NOW,
+        evidence={
+            "canonical_observed_state": {"status": "working"},
+            "readback_timestamp": "2026-07-16T01:00:00Z",
+            "evidence_hash": "e" * 64,
+        },
+    )
+    adapter = FakeAdapter(accepted)
+
+    result = await tenantcloud_service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == [("reconcile",)]
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_persisted_acceptance_with_hash_mismatch_reconciles():
+    tampered_evidence = {
+        "canonical_observed_state": {"status": "working"},
+        "readback_timestamp": "2026-07-16T01:00:00Z",
+        "evidence_hash": "e" * 64,
+    }
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="lead:6001",
+            provider_message_id="tenantcloud-lead:6001:working",
+            provider_accepted_at=NOW,
+            provider_evidence_kind="verified_readback",
+            provider_evidence_hash="0" * 64,
+            provider_readback_evidence=tampered_evidence,
+        )
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_reconciled",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=NOW,
+        evidence=tampered_evidence,
+    )
+    adapter = FakeAdapter(accepted)
+
+    result = await tenantcloud_service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == [("reconcile",)]
+
+
 @pytest.mark.asyncio
 async def test_same_property_overlap_does_not_block_ready_preflight():
     store = FakeStore()

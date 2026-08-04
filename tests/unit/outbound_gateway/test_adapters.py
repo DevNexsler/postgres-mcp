@@ -16,6 +16,7 @@ from postgres_mcp.outbound_gateway.adapters.calendar import CalendarAdapter
 from postgres_mcp.outbound_gateway.adapters.cliq import CliqAdapter
 from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
 from postgres_mcp.outbound_gateway.adapters.quo import QuoSmsAdapter
+from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.models import ActionRole
@@ -445,3 +446,463 @@ async def test_provider_failures_without_acceptance_proof_remain_ambiguous(resul
     assert observation.disposition is expected
     assert observation.detail_code == detail
     assert observation.disposition is not ProviderDisposition.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# TenantCloud adapter
+#
+# The shared TenantCloudMutations facade (a different repo's module) exposes
+# named, readback-verified methods. The fake below mirrors its exact method
+# signatures and result shapes (MutationExecution/MutationObservation/
+# ReconciliationResult) via plain attribute-only fakes so this adapter never
+# imports across repos -- see scripts/tenantcloud_mutations.py in
+# Comm-Data-Store for the authoritative shapes.
+
+
+class FakeDisposition:
+    def __init__(self, value: str):
+        self.value = value
+
+
+TC_ACCEPTED = FakeDisposition("accepted")
+TC_DEFINITIVE_NON_ACCEPTANCE = FakeDisposition("definitive_non_acceptance")
+TC_UNKNOWN = FakeDisposition("unknown")
+
+
+class FakeAudit:
+    def __init__(self, error_code=None):
+        self.error_code = error_code
+
+
+class FakeMutationResult:
+    def __init__(self, disposition, error_code=None):
+        self.disposition = disposition
+        self.audit = FakeAudit(error_code)
+
+
+class FakeMutationObservation:
+    def __init__(
+        self,
+        *,
+        target_reference,
+        provider_object_id,
+        canonical_observed_state,
+        readback_timestamp="2026-07-16T01:00:00Z",
+        evidence_hash="e" * 64,
+        readback_verified=True,
+    ):
+        self.target_reference = target_reference
+        self.provider_object_id = provider_object_id
+        self.canonical_observed_state = canonical_observed_state
+        self.readback_timestamp = readback_timestamp
+        self.evidence_hash = evidence_hash
+        self.readback_verified = readback_verified
+
+
+class FakeMutationExecution:
+    def __init__(self, mutation, observation, error_code):
+        self.mutation = mutation
+        self.observation = observation
+        self.error_code = error_code
+
+    @property
+    def verified(self) -> bool:
+        return self.observation is not None and self.observation.readback_verified
+
+
+class FakeReconciliationResult:
+    def __init__(self, disposition, observation, error_code):
+        self.disposition = disposition
+        self.observation = observation
+        self.error_code = error_code
+
+
+class FakeTenantCloudMutations:
+    """Mirrors TenantCloudMutations' named write/reconcile methods only --
+    the adapter must never need MutationOperation, which lives in the other
+    repo and cannot be imported here."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.send_message_result = None
+        self.mark_lead_working_result = None
+        self.create_maintenance_request_result = None
+        self.update_maintenance_status_result = None
+        self.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
+        self.reconcile_lead_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
+        self.reconcile_maintenance_create_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
+        self.reconcile_maintenance_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
+
+    def send_message(self, thread_id, body):
+        self.calls.append(("send_message", (thread_id, body), {}))
+        return self.send_message_result
+
+    def mark_lead_working(self, lead_id):
+        self.calls.append(("mark_lead_working", (lead_id,), {}))
+        return self.mark_lead_working_result
+
+    def create_maintenance_request(self, **kwargs):
+        self.calls.append(("create_maintenance_request", (), kwargs))
+        return self.create_maintenance_request_result
+
+    def update_maintenance_status(self, request_id, status):
+        self.calls.append(("update_maintenance_status", (request_id, status), {}))
+        return self.update_maintenance_status_result
+
+    def reconcile_message(self, thread_id, body, *, source_turn_at):
+        self.calls.append(("reconcile_message", (thread_id, body), {"source_turn_at": source_turn_at}))
+        return self.reconcile_message_result
+
+    def reconcile_lead_status(self, lead_id):
+        self.calls.append(("reconcile_lead_status", (lead_id,), {}))
+        return self.reconcile_lead_status_result
+
+    def reconcile_maintenance_create(self, *, dispatched_after, **kwargs):
+        self.calls.append(("reconcile_maintenance_create", (), {"dispatched_after": dispatched_after, **kwargs}))
+        return self.reconcile_maintenance_create_result
+
+    def reconcile_maintenance_status(self, request_id, status):
+        self.calls.append(("reconcile_maintenance_status", (request_id, status), {}))
+        return self.reconcile_maintenance_status_result
+
+
+def tenantcloud_context(operation: Operation, **overrides):
+    role = ActionRole.PROSPECT_REPLY if operation is Operation.TENANTCLOUD_MESSAGE_SEND else ActionRole.PROVIDER_MUTATION
+    intent = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: IntentKind.INQUIRY_REPLY,
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+    }[operation]
+    target = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: DerivedTarget("tenantcloud_thread", "555", True),
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: DerivedTarget("tenantcloud_lead", "6001", True),
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: DerivedTarget("tenantcloud_property_unit", "property:12:unit:34", True),
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: DerivedTarget("tenantcloud_maintenance_request", "81", True),
+    }[operation]
+    arguments = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: {"text": "Friday at 10:30 works. — Nigel"},
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"status": "working"},
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: {
+            "category_id": 57,
+            "title": "Kitchen leak",
+            "priority": "normal",
+            "initiated_at": "2026-08-04",
+            "text": "Sink leaking under cabinet",
+            "entry_allowed": False,
+            "available_on": None,
+        },
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"status": 2},
+    }[operation]
+    canonical_context = {"identity_version": "v1"}
+    if operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
+        canonical_context["provider_ids"] = {"property_id": "12", "unit_id": "34"}
+    values = dict(
+        action_id=ACTION_ID,
+        wakeup_event_id=7,
+        action_role=role,
+        operation=operation,
+        intent_kind=intent,
+        appointment_slot=None,
+        arguments=MappingProxyType(arguments),
+        source="tenantcloud",
+        source_message_id=700,
+        source_message_key="tenantcloud_api:700",
+        source_sent_at=NOW,
+        conversation_id="conversation:tenantcloud-1",
+        conversation_watermark=700,
+        prospect_id="tenantcloud:claim:301",
+        aliases=(),
+        property_id=None,
+        property_label=None,
+        target=target,
+        provider_account="tenantcloud",
+        routing_policy_version="v1",
+        canonical_scope=MappingProxyType({"version": "v1"}),
+        canonical_context=MappingProxyType(canonical_context),
+        payload_hash="a" * 64,
+        lock_holder=f"outbound-gateway:{ACTION_ID}",
+        thread_identity="tenantcloud:lead-thread:555",
+        showing_lifecycle_id="showing:wake:7",
+        calendar_event_uid=None,
+    )
+    values.update(overrides)
+    return ActionContext(**values)
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_send_performs_one_write_and_verified_readback():
+    facade = FakeTenantCloudMutations()
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        FakeMutationObservation(
+            target_reference="thread:555",
+            provider_object_id="9001",
+            canonical_observed_state={"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+    request = adapter.build_request(ctx, ACTION_UID)
+
+    observation = await adapter.invoke(facade, request)
+
+    assert [call[0] for call in facade.calls] == ["reconcile_message", "send_message"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-message:9001"
+    assert observation.evidence["canonical_observed_state"] == {"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"}
+    assert observation.evidence["evidence_hash"] == "e" * 64
+    receipt = adapter.parse_receipt(ctx, observation)
+    assert receipt is not None
+    assert receipt.provider_message_id == "tenantcloud-message:9001"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_send_already_present_skips_post():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_message_result = FakeReconciliationResult(
+        TC_ACCEPTED,
+        FakeMutationObservation(
+            target_reference="thread:555",
+            provider_object_id="9001",
+            canonical_observed_state={"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[0] for call in facade.calls] == ["reconcile_message"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-message:9001"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_lead_status_already_working_skips_patch():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_lead_status_result = FakeReconciliationResult(
+        TC_ACCEPTED,
+        FakeMutationObservation(
+            target_reference="lead:6001",
+            provider_object_id="6001",
+            canonical_observed_state={"status": "working"},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[0] for call in facade.calls] == ["reconcile_lead_status"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-lead:6001:working"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_lead_status_writes_when_not_yet_applied():
+    facade = FakeTenantCloudMutations()
+    facade.mark_lead_working_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        FakeMutationObservation(
+            target_reference="lead:6001",
+            provider_object_id="6001",
+            canonical_observed_state={"status": "working"},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[0] for call in facade.calls] == ["reconcile_lead_status", "mark_lead_working"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-lead:6001:working"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_maintenance_create_already_present_skips_post():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_maintenance_create_result = FakeReconciliationResult(
+        TC_ACCEPTED,
+        FakeMutationObservation(
+            target_reference="maintenance_request:4200",
+            provider_object_id="4200",
+            canonical_observed_state={"status": 1},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[0] for call in facade.calls] == ["reconcile_maintenance_create"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-maintenance:4200"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_maintenance_status_update_writes_and_verifies():
+    facade = FakeTenantCloudMutations()
+    facade.update_maintenance_status_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        FakeMutationObservation(
+            target_reference="maintenance_request:81",
+            provider_object_id="81",
+            canonical_observed_state={"status": 2},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[0] for call in facade.calls] == ["reconcile_maintenance_status", "update_maintenance_status"]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "tenantcloud-maintenance:81"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_auth_rejection_before_dispatch_is_retryable_non_acceptance():
+    facade = FakeTenantCloudMutations()
+    facade.mark_lead_working_result = FakeMutationExecution(
+        FakeMutationResult(TC_DEFINITIVE_NON_ACCEPTANCE, "authentication_unavailable"),
+        None,
+        "authentication_unavailable",
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.retryable is True
+    assert observation.category == "provider_authentication"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation_result",
+    [
+        FakeMutationResult(TC_UNKNOWN, "authentication_rejected"),
+        FakeMutationResult(TC_UNKNOWN, "transport_error"),
+    ],
+)
+async def test_tenantcloud_auth_rejection_timeout_or_connection_loss_after_dispatch_is_ambiguous(mutation_result):
+    facade = FakeTenantCloudMutations()
+    facade.mark_lead_working_result = FakeMutationExecution(mutation_result, None, mutation_result.audit.error_code)
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.disposition is not ProviderDisposition.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_accepted_write_without_verified_readback_stays_ambiguous():
+    facade = FakeTenantCloudMutations()
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        None,
+        "readback_mismatch",
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.disposition is not ProviderDisposition.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_reconciliation_uses_bounded_exact_tuple_search_never_blind_post():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_message_result = FakeReconciliationResult(
+        TC_ACCEPTED,
+        FakeMutationObservation(
+            target_reference="thread:555",
+            provider_object_id="9001",
+            canonical_observed_state={"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+    prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
+
+    reconciled = await adapter.reconcile(facade, ctx, ACTION_UID, prior)
+
+    assert [call[0] for call in facade.calls] == ["reconcile_message"]
+    call = facade.calls[0]
+    assert call[1] == ("555", "Friday at 10:30 works. — Nigel")
+    assert call[2]["source_turn_at"] == NOW
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert reconciled.message_id == "tenantcloud-message:9001"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_maintenance_create_reconciliation_uses_bounded_full_tuple_search_never_blind_post():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_maintenance_create_result = FakeReconciliationResult(
+        TC_ACCEPTED,
+        FakeMutationObservation(
+            target_reference="maintenance_request:4200",
+            provider_object_id="4200",
+            canonical_observed_state={"status": 1},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
+    prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
+
+    reconciled = await adapter.reconcile(facade, ctx, ACTION_UID, prior)
+
+    assert [call[0] for call in facade.calls] == ["reconcile_maintenance_create"]
+    call = facade.calls[0]
+    assert call[2]["dispatched_after"] == NOW
+    assert call[2]["property_id"] == "12"
+    assert call[2]["unit_id"] == "34"
+    assert call[2]["category_id"] == 57
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert reconciled.message_id == "tenantcloud-maintenance:4200"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["no_match", "ambiguous_match"])
+async def test_tenantcloud_reconciliation_with_zero_or_multiple_matches_remains_unknown(error_code):
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, error_code)
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+    prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
+
+    reconciled = await adapter.reconcile(facade, ctx, ACTION_UID, prior)
+
+    assert reconciled.disposition is ProviderDisposition.AMBIGUOUS
+    assert reconciled.disposition is not ProviderDisposition.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_status_reconciliation_retries_patch_only_after_authoritative_absence():
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_lead_status_result = FakeReconciliationResult(
+        TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence"
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+    prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
+
+    reconciled = await adapter.reconcile(facade, ctx, ACTION_UID, prior)
+
+    assert reconciled.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert reconciled.retryable is True

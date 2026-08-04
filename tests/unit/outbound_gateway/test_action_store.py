@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
@@ -19,6 +20,7 @@ from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
@@ -348,3 +350,104 @@ async def test_existing_nonreply_lock_keys_are_exact(role, operation, intent, ex
     subject = replace(context(), action_role=role, operation=operation, intent_kind=intent)
 
     assert await prepared_lock_intent(subject) == expected
+
+
+VERIFIED_READBACK_EVIDENCE = {
+    "canonical_observed_state": {"status": "working"},
+    "readback_timestamp": "2026-07-16T01:00:00Z",
+    "evidence_hash": "e" * 64,
+}
+
+
+@pytest.mark.asyncio
+async def test_transition_to_provider_accepted_persists_sanitized_verified_readback_evidence():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [
+            Row(
+                {
+                    **action_row("provider_accepted"),
+                    "operation": "tenantcloud.lead.status.update",
+                    "evidence_kind": "verified_readback",
+                    "evidence_reference": "lead:6001",
+                    "evidence_hash": OutboundActionService.evidence_hash(VERIFIED_READBACK_EVIDENCE),
+                    "last_observation": {
+                        "detail_code": "tenantcloud_lead_status_accepted",
+                        "disposition": "accepted",
+                        "evidence": VERIFIED_READBACK_EVIDENCE,
+                    },
+                }
+            )
+        ]
+
+    store = PostgresActionStore(object())
+    observation = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_accepted",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=None,
+        evidence=VERIFIED_READBACK_EVIDENCE,
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        result = await store.transition(
+            ACTION_ID,
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            "worker-1",
+            observation,
+        )
+
+    params = calls[0][1]
+    expected_hash = OutboundActionService.evidence_hash(VERIFIED_READBACK_EVIDENCE)
+    sanitized = json.loads(params[8])
+    assert params[9] == "verified_readback"
+    assert params[10] == "lead:6001"
+    assert params[11] == expected_hash
+    assert sanitized["evidence"]["canonical_observed_state"] == VERIFIED_READBACK_EVIDENCE["canonical_observed_state"]
+    assert result.provider_evidence_kind == "verified_readback"
+    assert result.provider_evidence_hash == expected_hash
+    assert result.provider_readback_evidence == VERIFIED_READBACK_EVIDENCE
+
+
+@pytest.mark.asyncio
+async def test_transition_to_provider_accepted_without_readback_shape_leaves_evidence_columns_unset():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("provider_accepted"))]
+
+    store = PostgresActionStore(object())
+    observation = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=None,
+        evidence={"kind": "provider_message_id", "provider_message_id": "mail-1"},
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        result = await store.transition(
+            ACTION_ID,
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            "worker-1",
+            observation,
+        )
+
+    params = calls[0][1]
+    assert params[9] is None
+    assert params[10] is None
+    assert params[11] is None
+    assert "provider_message_id" not in params[8]
+    assert result.provider_evidence_kind is None
+    assert result.provider_readback_evidence == {}
