@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -409,6 +410,41 @@ def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_p
 
     with pytest.raises(ValueError):
         _tenantcloud_adapters(frozenset(TENANTCLOUD_OPERATIONS))
+
+
+def test_tenantcloud_import_resolves_under_container_shaped_web_usage_mount(tmp_path, monkeypatch):
+    """The gateway container never mounts the full Web-Usage workspace -- only
+    web_usage_runner_control.py itself, at whatever path
+    TENANTCLOUD_WEB_USAGE_RUNNER_CONTROL_FILE names, with WEB_USAGE_WORKSPACE
+    set to that file's directory (see Comm-Data-Store's docker-compose.yaml).
+    The real tenantcloud_auth.py module must resolve its module-level
+    `from web_usage_runner_control import build_runner_curl_command` in that
+    shape -- not merely when the developer's full host workspace happens to
+    already sit at /home/danpark/workspace. Reproduces the container
+    ModuleNotFoundError crash-loop reported in review."""
+    real_scripts = Path(
+        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
+    )
+    if not (real_scripts / "tenantcloud_auth.py").is_file():
+        pytest.skip("real CDS scripts checkout unavailable in this environment")
+
+    container_workspace = tmp_path / "container-web-usage-workspace"
+    container_workspace.mkdir()
+    (container_workspace / "web_usage_runner_control.py").write_text(
+        "def build_runner_curl_command(**kwargs):\n    return []\n",
+        encoding="utf-8",
+    )
+    bearer_file = tmp_path / "current-token"
+    bearer_file.write_text("token", encoding="utf-8")
+    monkeypatch.setenv("TENANTCLOUD_RUNNER_CONTROL_URL", "http://127.0.0.1:8095")
+    monkeypatch.setenv("TENANTCLOUD_RUNNER_BEARER_FILE", str(bearer_file))
+    monkeypatch.setenv("TENANTCLOUD_MODULE_DIR", str(real_scripts))
+    monkeypatch.setenv("WEB_USAGE_WORKSPACE", str(container_workspace))
+    monkeypatch.delitem(sys.modules, "web_usage_runner_control", raising=False)
+
+    adapters = _tenantcloud_adapters(frozenset(TENANTCLOUD_OPERATIONS))
+
+    assert set(adapters) == set(TENANTCLOUD_OPERATIONS)
 
 
 # -- Thread-offloaded adapter wrapper (event-loop-blocking decision) -------------
