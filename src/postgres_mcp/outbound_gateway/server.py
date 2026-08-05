@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
+from types import ModuleType
 from typing import Any
+from typing import Coroutine
 from uuid import uuid5
 
 from mcp.server.fastmcp import FastMCP
@@ -21,10 +25,12 @@ from starlette.responses import PlainTextResponse
 from postgres_mcp.sql import DbConnPool
 from postgres_mcp.sql import SqlDriver
 
+from .adapters.base import ProviderAdapter
 from .adapters.calendar import CalendarAdapter
 from .adapters.cliq import CliqAdapter
 from .adapters.email import EmailAdapter
 from .adapters.quo import QuoSmsAdapter
+from .adapters.tenantcloud import TenantCloudAdapter
 from .context import ACTION_NAMESPACE
 from .context import ActionContextLoader
 from .context import RoutingPolicy
@@ -43,7 +49,29 @@ from .provider_client import McpServerConfig
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
+from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .worker import OutboundWorker
+
+# TenantCloud's API origin is a fixed literal, never a runtime-configurable
+# value. Task 7's adapter and this module both depend on this exact string;
+# nothing in this file ever reads an environment variable to build it.
+TENANTCLOUD_ORIGIN = "https://api.tenantcloud.com"
+
+# Defense in depth: these variable names do not correspond to anything this
+# module reads to build the origin above. Their presence almost certainly
+# means an operator believes they can retarget the TenantCloud origin through
+# configuration. Fail closed and loudly instead of silently ignoring the
+# attempt -- checked first, before any module loading or token acquisition.
+_TENANTCLOUD_ORIGIN_OVERRIDE_ENV_VARS = (
+    "TENANTCLOUD_API_BASE_URL",
+    "TENANTCLOUD_API_SCHEME",
+    "TENANTCLOUD_API_HOST",
+    "TENANTCLOUD_API_PORT",
+    "TENANTCLOUD_API_USERNAME",
+    "TENANTCLOUD_API_PASSWORD",
+    "TENANTCLOUD_API_QUERY",
+    "TENANTCLOUD_API_FRAGMENT",
+)
 
 DEFAULT_EMAIL_SENDER_DOMAINS = {"nigel-zoho": "pfg.io"}
 DEFAULT_EMAIL_CC_BY_SOURCE = {
@@ -146,8 +174,9 @@ def create_server(
     @mcp.tool(
         name="outbound_action",
         description=(
-            "Execute or inspect one durable outbound email, Quo, Cliq, or calendar action. "
-            "Recipients, accounts, and provider targets are derived from wakeup_event_id."
+            "Execute or inspect one durable outbound email, Quo, Cliq, calendar, or "
+            "TenantCloud action. Recipients, accounts, and provider targets are derived "
+            "from wakeup_event_id."
         ),
         structured_output=True,
     )
@@ -289,6 +318,162 @@ def _bearer_headers(name: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def _tenantcloud_enabled(enabled_operations: frozenset[Operation]) -> bool:
+    return bool(enabled_operations & TENANTCLOUD_OPERATIONS)
+
+
+def _reject_tenantcloud_origin_overrides() -> None:
+    present = sorted(name for name in _TENANTCLOUD_ORIGIN_OVERRIDE_ENV_VARS if os.environ.get(name))
+    if present:
+        raise ValueError(
+            "TenantCloud API origin is a fixed literal (" + TENANTCLOUD_ORIGIN + "); "
+            "unsupported override variable(s) set: " + ", ".join(present)
+        )
+
+
+_TENANTCLOUD_MODULE_NAMES = ("tenantcloud_auth", "tenantcloud_client", "tenantcloud_mutations")
+
+
+def _load_tenantcloud_modules(module_dir: str) -> tuple[ModuleType, ModuleType, ModuleType]:
+    if not os.path.isdir(module_dir):
+        raise ValueError(f"TenantCloud module directory not found: {module_dir} (is the CDS repo mounted at /repo?)")
+    for name in _TENANTCLOUD_MODULE_NAMES:
+        path = os.path.join(module_dir, f"{name}.py")
+        if not os.path.isfile(path):
+            raise ValueError(f"TenantCloud module not found: {path} (is the CDS repo mounted at /repo?)")
+
+    # scripts/tenantcloud_mutations.py (Comm-Data-Store) imports
+    # `from scripts.tenantcloud_client import ...` -- it belongs to that
+    # repo's own `scripts` package layout. Rather than depend on
+    # Comm-Data-Store as an installed package (a cross-repo dependency this
+    # gateway does not otherwise have), stand up a private, process-local
+    # `scripts` alias pointed at the mounted directory purely so that
+    # internal import resolves, then restore whatever (if anything) was
+    # already registered under that name so this cannot leak or collide.
+    qualified_names = tuple(f"scripts.{name}" for name in _TENANTCLOUD_MODULE_NAMES)
+    previous = {name: sys.modules.get(name) for name in ("scripts", *qualified_names)}
+    package = ModuleType("scripts")
+    package.__path__ = [module_dir]
+    sys.modules["scripts"] = package
+    for name in qualified_names:
+        sys.modules.pop(name, None)
+    try:
+        modules = tuple(importlib.import_module(f"scripts.{name}") for name in _TENANTCLOUD_MODULE_NAMES)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+    return modules  # type: ignore[return-value]
+
+
+def _build_tenantcloud_adapter() -> TenantCloudAdapter:
+    # Ordering matters: reject any attempt to override the origin before
+    # doing anything else -- in particular before reading, validating, or
+    # opening any file, and long before any HTTP call that could acquire a
+    # token.
+    _reject_tenantcloud_origin_overrides()
+
+    control_url = os.environ.get("TENANTCLOUD_RUNNER_CONTROL_URL", "").strip()
+    bearer_file = os.environ.get("TENANTCLOUD_RUNNER_BEARER_FILE", "").strip()
+    next_bearer_file = os.environ.get("TENANTCLOUD_RUNNER_NEXT_BEARER_FILE", "").strip() or None
+    module_dir = os.environ.get("TENANTCLOUD_MODULE_DIR", "/repo/scripts")
+
+    if not control_url:
+        raise ValueError("TENANTCLOUD_RUNNER_CONTROL_URL is required while a TenantCloud operation is enabled")
+    if not bearer_file:
+        raise ValueError("TENANTCLOUD_RUNNER_BEARER_FILE is required while a TenantCloud operation is enabled")
+    if not os.path.isfile(bearer_file):
+        raise ValueError(f"TENANTCLOUD_RUNNER_BEARER_FILE does not exist: {bearer_file}")
+    if next_bearer_file is not None and not os.path.isfile(next_bearer_file):
+        raise ValueError(f"TENANTCLOUD_RUNNER_NEXT_BEARER_FILE does not exist: {next_bearer_file}")
+
+    # Imported by file path, not by package name: the facade lives in a
+    # different repository (Comm-Data-Store), mounted read-only at /repo in
+    # the running container. This gateway cannot add a cross-repo Python
+    # dependency on it.
+    auth_module, client_module, mutations_module = _load_tenantcloud_modules(module_dir)
+
+    # HttpRunnerControl itself enforces literal HTTP loopback (127.0.0.1 or
+    # ::1, no credentials/query/fragment/path) at construction time, before
+    # any request is made -- see scripts/tenantcloud_auth.py in Comm-Data-Store.
+    control = auth_module.HttpRunnerControl(control_url, bearer_file, next_bearer_file)
+    auth = auth_module.TenantCloudAuth("tenantcloud-runner", control=control, profile_access=False)
+    client = client_module.TenantCloudClient(auth, base_url=TENANTCLOUD_ORIGIN)
+    mutations = mutations_module.TenantCloudMutations(client)
+    return TenantCloudAdapter(mutations=mutations)
+
+
+def _run_coroutine_sync(coro: Coroutine[Any, Any, Any]) -> Any:
+    return asyncio.run(coro)
+
+
+class _ThreadOffloadedAdapter:
+    """Wraps a ``ProviderAdapter`` whose ``invoke``/``poll``/``reconcile`` are
+    declared ``async`` but perform synchronous, blocking HTTP calls under the
+    hood.
+
+    TenantCloudAdapter (Task 7, adapters/tenantcloud.py) is built around the
+    shared ``TenantCloudMutations`` facade (Comm-Data-Store,
+    scripts/tenantcloud_mutations.py), which is entirely synchronous urllib
+    HTTP -- including up to ``TenantCloudAuth.worst_case_auth_block_seconds``
+    (180s) of blocking auth-refresh work per call. Task 7 explicitly parked
+    the decision of whether to protect the event loop from that blocking for
+    this task to make.
+
+    Decision: offload here, at the server wiring boundary, via
+    ``asyncio.to_thread``, rather than inside the adapter. The adapter stays
+    a plain synchronous-under-async implementation with no event-loop
+    concerns of its own (and is exercised that way, unwrapped, by its own
+    unit tests); this wrapper is the one place that knows the concrete
+    facade is blocking and pays the thread-hop cost for it. Every other
+    ProviderAdapter in this gateway (email/quo/cliq/calendar) calls out
+    through the async ``McpProviderClient`` and does not need this wrapper.
+    """
+
+    def __init__(self, inner: ProviderAdapter) -> None:
+        self._inner = inner
+
+    def validate(self, context: Any) -> None:
+        self._inner.validate(context)
+
+    def build_request(self, context: Any, action_uid: Any) -> Any:
+        return self._inner.build_request(context, action_uid)
+
+    def parse_receipt(self, context: Any, observation: Any) -> Any:
+        return self._inner.parse_receipt(context, observation)
+
+    async def invoke(self, client: Any, request: Any) -> Any:
+        return await asyncio.to_thread(_run_coroutine_sync, self._inner.invoke(client, request))
+
+    async def poll(self, client: Any, observation: Any) -> Any:
+        return await asyncio.to_thread(_run_coroutine_sync, self._inner.poll(client, observation))
+
+    async def reconcile(self, client: Any, context: Any, action_uid: Any, observation: Any) -> Any:
+        return await asyncio.to_thread(
+            _run_coroutine_sync,
+            self._inner.reconcile(client, context, action_uid, observation),
+        )
+
+
+def _tenantcloud_adapters(enabled_operations: frozenset[Operation]) -> dict[Operation, ProviderAdapter]:
+    """Build the (at most one) shared TenantCloud adapter, registered for all
+    four TenantCloud operations, iff at least one of them is enabled.
+
+    Fail-closed: when enabled, any missing/invalid configuration raises
+    immediately (at startup) instead of registering a partially-working or
+    silently-disabled adapter. When no TenantCloud operation is enabled,
+    this never touches the environment beyond the operations set already in
+    hand, so an unconfigured TenantCloud integration cannot break the rest
+    of the gateway.
+    """
+    if not _tenantcloud_enabled(enabled_operations):
+        return {}
+    adapter: ProviderAdapter = _ThreadOffloadedAdapter(_build_tenantcloud_adapter())
+    return {operation: adapter for operation in TENANTCLOUD_OPERATIONS}
+
+
 async def build_runtime() -> GatewayRuntime:
     database_uri = os.environ.get("DATABASE_URI")
     if not database_uri:
@@ -392,6 +577,7 @@ async def build_runtime() -> GatewayRuntime:
         Operation.CALENDAR_UPDATE: CalendarAdapter(account_by_calendar=calendar_accounts),
         Operation.CALENDAR_DELETE: CalendarAdapter(account_by_calendar=calendar_accounts),
     }
+    adapters.update(_tenantcloud_adapters(policy.enabled_operations))
     service = OutboundActionService(
         store=store,
         context_loader=ActionContextLoader(context_repository, routing),
