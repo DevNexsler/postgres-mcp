@@ -32,6 +32,8 @@ from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
+from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_persisted_arguments
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -550,6 +552,114 @@ def tenantcloud_service(store, adapter):
         response_budget_seconds=1,
         sleep=AsyncMock(),
     )
+
+
+def tenantcloud_context_for(operation, **overrides):
+    """Full ActionContext for each of the four TenantCloud operations --
+    enough detail (canonical_context claim/source/provider_ids, canonical_scope
+    desired_state_hash) for tenantcloud_persisted_arguments() to run for real,
+    the same way create_or_load() does at enqueue time."""
+    target = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: DerivedTarget("tenantcloud_thread", "555", True),
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: DerivedTarget("tenantcloud_lead", "6001", True),
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: DerivedTarget("tenantcloud_property_unit", "property:12:unit:34", True),
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: DerivedTarget("tenantcloud_maintenance_request", "81", True),
+    }[operation]
+    intent = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: IntentKind.INQUIRY_REPLY,
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+    }[operation]
+    role = ActionRole.PROSPECT_REPLY if operation is Operation.TENANTCLOUD_MESSAGE_SEND else ActionRole.PROVIDER_MUTATION
+    arguments = {
+        Operation.TENANTCLOUD_MESSAGE_SEND: {"text": "Friday at 10:30 works. — Nigel"},
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"status": "working"},
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: {
+            "category_id": 57,
+            "title": "Kitchen leak",
+            "priority": "normal",
+            "initiated_at": "2026-08-04",
+            "text": "Sink leaking under cabinet",
+            "entry_allowed": False,
+            "available_on": None,
+        },
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"status": 2},
+    }[operation]
+    canonical_context = {
+        "identity_version": "v1",
+        "tenantcloud_claim_id": 301,
+        "source_event_id": "tenantcloud:claim:301",
+    }
+    if operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
+        canonical_context["provider_ids"] = {"property_id": "12", "unit_id": "34"}
+    values = dict(
+        action_id=ACTION_ID,
+        wakeup_event_id=7,
+        action_role=role,
+        operation=operation,
+        intent_kind=intent,
+        appointment_slot=None,
+        arguments=MappingProxyType(arguments),
+        source="tenantcloud",
+        source_message_id=700,
+        source_message_key="tenantcloud_api:700",
+        source_sent_at=NOW,
+        conversation_id="conversation:tenantcloud-1",
+        conversation_watermark=700,
+        prospect_id="tenantcloud:claim:301",
+        aliases=(),
+        property_id=None,
+        property_label=None,
+        target=target,
+        provider_account="tenantcloud",
+        routing_policy_version="v1",
+        canonical_scope=MappingProxyType({"version": "v1", "desired_state_hash": "d" * 64}),
+        canonical_context=MappingProxyType(canonical_context),
+        payload_hash="a" * 64,
+        lock_holder=f"outbound-gateway:{ACTION_ID}",
+        thread_identity="tenantcloud:thread-1",
+        showing_lifecycle_id="showing:wake:7",
+        calendar_event_uid=None,
+    )
+    values.update(overrides)
+    return ActionContext(**values)
+
+
+@pytest.mark.parametrize("operation", sorted(TENANTCLOUD_OPERATIONS, key=lambda op: op.value))
+def test_execute_request_round_trips_arguments_enriched_by_create_or_load(operation):
+    """Regression test for the round-2 finding: store.create_or_load()
+    persists arguments enriched with desired_state/target_reference/
+    idempotency_key (migration 118 reads those off outbound_actions.arguments
+    directly). OutboundActionRecord.execute_request() rebuilds an
+    ExecuteRequest from action.arguments to reload context on every
+    reconcile()/resume() call -- and every ArgumentModel is a StrictModel
+    with extra="forbid", so those three gateway-owned keys must not reach
+    model_validate(). This builds arguments via the *real* enrichment path
+    (tenantcloud_persisted_arguments, exactly what create_or_load calls),
+    not a hand-authored dict, so it can't miss what create_or_load actually
+    writes.
+    """
+    context = tenantcloud_context_for(operation)
+    enriched_arguments = tenantcloud_persisted_arguments(context)
+    assert {"desired_state", "target_reference", "idempotency_key"} <= set(enriched_arguments)
+
+    row = tenantcloud_row(
+        operation=operation,
+        action_role=context.action_role,
+        intent_kind=context.intent_kind,
+        appointment_slot=context.appointment_slot,
+        arguments=dict(enriched_arguments),
+    )
+
+    rebuilt = row.execute_request()
+
+    assert rebuilt.operation is operation
+    # The rebuilt, strict-model arguments must match the *original*
+    # unenriched arguments exactly -- payload_hash was computed from these
+    # at enqueue time, before enrichment, and context re-derivation depends
+    # on getting the same arguments back.
+    assert rebuilt.arguments.model_dump(mode="json", exclude_none=False) == dict(context.arguments)
 
 
 # Exactly migration 118's six required keys

@@ -41,6 +41,7 @@ from .state_machine import public_result
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -75,6 +76,14 @@ class OutboundActionRecord:
     provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
 
     def execute_request(self) -> ExecuteRequest:
+        # create_or_load() persists TenantCloud arguments enriched with
+        # desired_state/target_reference/idempotency_key (migration 118
+        # reads those directly off outbound_actions.arguments). Every
+        # ArgumentModel is a StrictModel with extra="forbid", so those
+        # gateway-owned keys must be stripped back out before they reach
+        # model_validate() here -- this method rebuilds context on every
+        # reconcile()/resume() call, including the crash-recovery path.
+        arguments = strip_tenantcloud_persisted_argument_keys(self.operation, self.arguments)
         return ExecuteRequest.model_validate(
             {
                 "op": "execute",
@@ -83,7 +92,7 @@ class OutboundActionRecord:
                 "operation": self.operation,
                 "intent_kind": self.intent_kind,
                 "appointment_slot": self.appointment_slot,
-                "arguments": self.arguments,
+                "arguments": arguments,
             }
         )
 

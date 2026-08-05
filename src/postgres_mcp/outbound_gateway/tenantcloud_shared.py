@@ -153,6 +153,15 @@ def tenantcloud_idempotency_key(context: ActionContext) -> str:
     )
 
 
+# The three gateway-owned keys tenantcloud_persisted_arguments() adds on
+# top of the strict per-operation ArgumentModel fields. Every ArgumentModel
+# is a StrictModel with extra="forbid" (models.py), so anything that rebuilds
+# an ExecuteRequest from a persisted, enriched arguments dict (e.g.
+# OutboundActionRecord.execute_request(), used by every reconcile()/resume()
+# context reload) must strip these back out first.
+TENANTCLOUD_PERSISTED_ARGUMENT_KEYS = frozenset({"desired_state", "target_reference", "idempotency_key"})
+
+
 def tenantcloud_persisted_arguments(context: ActionContext) -> Mapping[str, Any]:
     """Arguments enriched with the fields migration 118's acceptance guard
     and bindings insert read directly off ``outbound_actions.arguments``
@@ -167,3 +176,13 @@ def tenantcloud_persisted_arguments(context: ActionContext) -> Mapping[str, Any]
         "target_reference": tenantcloud_target_reference(context),
         "idempotency_key": tenantcloud_idempotency_key(context),
     }
+
+
+def strip_tenantcloud_persisted_argument_keys(operation: Operation, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Inverse of the enrichment above -- reconstructs the strict, unenriched
+    arguments an ExecuteRequest's ArgumentModel actually validates against,
+    from a persisted (possibly enriched) arguments mapping. Non-TenantCloud
+    arguments pass through untouched."""
+    if operation not in TENANTCLOUD_OPERATIONS:
+        return arguments
+    return {key: value for key, value in arguments.items() if key not in TENANTCLOUD_PERSISTED_ARGUMENT_KEYS}
