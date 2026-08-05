@@ -19,9 +19,18 @@ from .models import CompletionKind
 from .models import IntentKind
 from .models import Operation
 from .service import OutboundActionRecord
-from .service import OutboundActionService
+from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
+from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
+from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from .tenantcloud_shared import tenantcloud_persisted_arguments
 
-_VERIFIED_READBACK_EVIDENCE_KEYS = frozenset({"canonical_observed_state", "readback_timestamp", "evidence_hash"})
+# The seven keys the TenantCloud adapter attaches to an ACCEPTED
+# ProviderObservation's evidence: migration 118's required six-key
+# p_observation shape (READBACK_OBSERVATION_KEYS) plus the facade's own
+# opaque evidence_hash, which this store strips out and sends separately as
+# p_evidence_hash (118_...sql:353-364 rejects any extra key inside
+# p_observation itself).
+_ADAPTER_EVIDENCE_KEYS = READBACK_OBSERVATION_KEYS | {"evidence_hash"}
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -41,7 +50,7 @@ def _observation(value: ProviderObservation) -> dict[str, Any]:
 
 def _verified_readback_evidence(value: ProviderObservation) -> Mapping[str, Any] | None:
     evidence = value.evidence
-    if not isinstance(evidence, Mapping) or set(evidence) != _VERIFIED_READBACK_EVIDENCE_KEYS:
+    if not isinstance(evidence, Mapping) or set(evidence) != _ADAPTER_EVIDENCE_KEYS:
         return None
     return evidence
 
@@ -54,7 +63,50 @@ class PostgresActionStore:
         rows = await SafeSqlDriver.execute_param_query(self._driver, query, params)  # type: ignore[arg-type]
         if not rows:
             raise LookupError("outbound action database function returned no row")
-        return self._record(rows[0].cells)
+        return await self._hydrated_record(rows[0].cells)
+
+    async def _hydrated_record(self, cells: Mapping[str, Any]) -> OutboundActionRecord:
+        """Merge in the TenantCloud acceptance-attempt evidence that
+        ``transition_outbound_action`` writes to ``outbound_action_attempts``
+        (evidence_kind/evidence_reference/evidence_hash/provider_observation)
+        -- migration 118 adds no such columns to ``outbound_actions`` itself,
+        and ``transition_outbound_action`` RETURNS SETOF outbound_actions, so
+        this evidence is only reachable via a follow-up read of the attempt
+        row the transition just (or previously) wrote."""
+        merged = dict(cells)
+        if str(cells.get("state")) == ActionState.PROVIDER_ACCEPTED.value and str(cells.get("operation")) in {
+            operation.value for operation in TENANTCLOUD_OPERATIONS
+        }:
+            attempt = await self._latest_provider_accepted_attempt(
+                UUID(str(cells["action_id"])), int(cells.get("attempt_count") or 0)
+            )
+            if attempt is not None:
+                merged.update(attempt)
+        return self._record(merged)
+
+    async def _latest_provider_accepted_attempt(
+        self, action_id: UUID, attempt_number: int
+    ) -> dict[str, Any] | None:
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT evidence_kind, evidence_reference, evidence_hash, provider_observation
+            FROM outbound_action_attempts
+            WHERE action_id = {} AND attempt_number = {} AND to_state = 'provider_accepted'
+            ORDER BY attempt_id DESC
+            LIMIT 1
+            """,
+            [action_id, attempt_number],
+        )
+        if not rows:
+            return None
+        cells = rows[0].cells
+        return {
+            "evidence_kind": cells.get("evidence_kind"),
+            "evidence_reference": cells.get("evidence_reference"),
+            "evidence_hash": cells.get("evidence_hash"),
+            "provider_observation": cells.get("provider_observation"),
+        }
 
     async def create_or_load(self, context: ActionContext) -> OutboundActionRecord:
         recipient_scope = {
@@ -82,7 +134,13 @@ class PostgresActionStore:
                 _json(recipient_scope),
                 context.provider_account,
                 context.routing_policy_version,
-                _json(context.arguments),
+                # Non-TenantCloud operations get context.arguments back
+                # unchanged. TenantCloud operations are enriched with
+                # desired_state/target_reference/idempotency_key so
+                # migration 118's acceptance guard (which reads these
+                # straight off outbound_actions.arguments) can compare
+                # against them later -- see tenantcloud_shared.py.
+                _json(tenantcloud_persisted_arguments(context)),
             ],
         )
 
@@ -176,17 +234,24 @@ class PostgresActionStore:
             evidence_reference = observation.provider_request_ref or observation.detail_code
             evidence_hash = _hash(evidence)
         elif verified_readback is not None:
-            # Verified-readback evidence for TenantCloud writes is already
-            # sanitized by construction (canonical observed state, a
-            # readback timestamp, and a hash -- never raw HTTP bodies or
-            # secrets). Persist it so a crash between this transition and
-            # the completion write can be recovered from durable evidence
-            # instead of re-touching the provider.
-            evidence = dict(verified_readback)
-            evidence_kind = "verified_readback"
-            evidence_reference = observation.provider_request_ref or evidence["evidence_hash"]
-            evidence_hash = OutboundActionService.evidence_hash(evidence)
-            sanitized = {**sanitized, "evidence": evidence}
+            # Migration 118's acceptance guard requires p_observation to
+            # contain *exactly* six keys (READBACK_OBSERVATION_KEYS) -- the
+            # adapter's evidence carries those six plus the facade's own
+            # opaque evidence_hash as a seventh; that seventh key must be
+            # stripped out before it becomes p_observation, and forwarded
+            # unmodified as p_evidence_hash (118_...sql:353-364,
+            # transition_outbound_action's INSERT into
+            # tenantcloud_gateway_acceptance_bindings correlates on this
+            # exact opaque value, not a store-derived one).
+            if not observation.provider_request_ref:
+                raise ValueError(
+                    "verified TenantCloud readback requires a provider_request_ref "
+                    "(no fallback -- migration 118 requires evidence_reference == provider_request_ref)"
+                )
+            evidence_kind = EVIDENCE_KIND_VERIFIED_READBACK
+            evidence_reference = observation.provider_request_ref
+            evidence_hash = verified_readback["evidence_hash"]
+            sanitized = {key: verified_readback[key] for key in READBACK_OBSERVATION_KEYS}
         else:
             evidence_kind = None
             evidence_reference = None
@@ -282,7 +347,7 @@ class PostgresActionStore:
             "SELECT * FROM outbound_actions WHERE action_id = {}",
             [action_id],
         )
-        return self._record(rows[0].cells) if rows else None
+        return await self._hydrated_record(rows[0].cells) if rows else None
 
     async def schedule_next_attempt(
         self,
@@ -339,12 +404,12 @@ class PostgresActionStore:
     def _record(cells: Mapping[str, Any]) -> OutboundActionRecord:
         completion = cells.get("completion_kind")
         action_uid = cells.get("action_uid")
-        last_observation = cells.get("last_observation")
-        readback_evidence = (
-            last_observation.get("evidence")
-            if isinstance(last_observation, Mapping) and isinstance(last_observation.get("evidence"), Mapping)
-            else None
-        )
+        # provider_observation comes straight from outbound_action_attempts
+        # (see _latest_provider_accepted_attempt) and, for a TenantCloud
+        # verified-readback attempt, *is* the six-key payload itself -- no
+        # wrapper key to unwrap.
+        provider_observation = cells.get("provider_observation")
+        readback_evidence = provider_observation if isinstance(provider_observation, Mapping) else None
         return OutboundActionRecord(
             action_id=UUID(str(cells["action_id"])),
             wakeup_event_id=int(cells["wakeup_event_id"]),

@@ -651,7 +651,18 @@ async def test_tenantcloud_message_send_performs_one_write_and_verified_readback
     assert [call[0] for call in facade.calls] == ["reconcile_message", "send_message"]
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.message_id == "tenantcloud-message:9001"
+    assert observation.provider_request_ref == "thread:555"
+    # Exactly migration 118's six required keys (118_...sql:353-364) plus the
+    # facade's own opaque evidence_hash the store must peel off separately.
+    assert set(observation.evidence) == {
+        "canonical_observed_state", "operation", "provider_object_id",
+        "target_reference", "readback_timestamp", "readback_verified", "evidence_hash",
+    }
     assert observation.evidence["canonical_observed_state"] == {"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"}
+    assert observation.evidence["operation"] == "tenantcloud.message.send"
+    assert observation.evidence["provider_object_id"] == "9001"
+    assert observation.evidence["target_reference"] == "thread:555"
+    assert observation.evidence["readback_verified"] is True
     assert observation.evidence["evidence_hash"] == "e" * 64
     receipt = adapter.parse_receipt(ctx, observation)
     assert receipt is not None
@@ -744,6 +755,34 @@ async def test_tenantcloud_maintenance_create_already_present_skips_post():
     assert [call[0] for call in facade.calls] == ["reconcile_maintenance_create"]
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.message_id == "tenantcloud-maintenance:4200"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_maintenance_create_evidence_target_reference_is_stable_property_unit():
+    # The eventual maintenance_request id does not exist at enqueue time, so
+    # migration 118's arguments->>'target_reference' comparison (118_...sql:370)
+    # can only be satisfied by a pre-write-knowable value -- the stable
+    # property:unit identifier, not the facade's own per-write
+    # "maintenance_request:<new id>" reference. provider_request_ref (used as
+    # evidence_reference, which the DB requires to equal it, 118_...sql:351)
+    # still uses the facade's own reference.
+    facade = FakeTenantCloudMutations()
+    facade.create_maintenance_request_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        FakeMutationObservation(
+            target_reference="maintenance_request:4200",
+            provider_object_id="4200",
+            canonical_observed_state={"status": 1},
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.evidence["target_reference"] == "property:12:unit:34"
+    assert observation.provider_request_ref == "maintenance_request:4200"
 
 
 @pytest.mark.asyncio

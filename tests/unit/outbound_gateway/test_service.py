@@ -552,13 +552,20 @@ def tenantcloud_service(store, adapter):
     )
 
 
+# Exactly migration 118's six required keys
+# (118_...sql:353-364 / tenantcloud_shared.READBACK_OBSERVATION_KEYS).
+VERIFIED_READBACK_EVIDENCE = {
+    "canonical_observed_state": {"status": "working"},
+    "operation": "tenantcloud.lead.status.update",
+    "provider_object_id": "6001",
+    "target_reference": "lead:6001",
+    "readback_timestamp": "2026-07-16T01:00:00Z",
+    "readback_verified": True,
+}
+
+
 @pytest.mark.asyncio
 async def test_tenantcloud_persisted_acceptance_with_verified_readback_recovers_without_provider_io():
-    verified_evidence = {
-        "canonical_observed_state": {"status": "working"},
-        "readback_timestamp": "2026-07-16T01:00:00Z",
-        "evidence_hash": "e" * 64,
-    }
     store = FakeStore(
         tenantcloud_row(
             ActionState.PROVIDER_ACCEPTED,
@@ -566,9 +573,9 @@ async def test_tenantcloud_persisted_acceptance_with_verified_readback_recovers_
             provider_request_ref="lead:6001",
             provider_message_id="tenantcloud-lead:6001:working",
             provider_accepted_at=NOW,
-            provider_evidence_kind="verified_readback",
-            provider_evidence_hash=OutboundActionService.evidence_hash(verified_evidence),
-            provider_readback_evidence=verified_evidence,
+            provider_evidence_kind="verified_provider_readback",
+            provider_evidence_hash="e" * 64,
+            provider_readback_evidence=VERIFIED_READBACK_EVIDENCE,
         )
     )
     adapter = FakeAdapter()
@@ -591,7 +598,8 @@ async def test_tenantcloud_persisted_acceptance_without_verified_readback_reconc
             provider_accepted_at=NOW,
             # No provider_evidence_kind/hash persisted -- e.g. the worker
             # crashed after the durable PROVIDER_ACCEPTED transition but
-            # before the completion evidence made it to durable storage.
+            # before a matching outbound_action_attempts row could be
+            # written or read back.
         )
     )
     accepted = ProviderObservation(
@@ -600,11 +608,38 @@ async def test_tenantcloud_persisted_acceptance_without_verified_readback_reconc
         provider_request_ref="lead:6001",
         message_id="tenantcloud-lead:6001:working",
         accepted_at=NOW,
-        evidence={
-            "canonical_observed_state": {"status": "working"},
-            "readback_timestamp": "2026-07-16T01:00:00Z",
-            "evidence_hash": "e" * 64,
-        },
+        evidence={**VERIFIED_READBACK_EVIDENCE, "evidence_hash": "e" * 64},
+    )
+    adapter = FakeAdapter(accepted)
+
+    result = await tenantcloud_service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == [("reconcile",)]
+    assert not any(call[0] == "invoke" for call in adapter.calls)
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_persisted_acceptance_with_malformed_evidence_hash_reconciles():
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="lead:6001",
+            provider_message_id="tenantcloud-lead:6001:working",
+            provider_accepted_at=NOW,
+            provider_evidence_kind="verified_provider_readback",
+            provider_evidence_hash="not-64-hex-chars",
+            provider_readback_evidence=VERIFIED_READBACK_EVIDENCE,
+        )
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_reconciled",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=NOW,
+        evidence={**VERIFIED_READBACK_EVIDENCE, "evidence_hash": "e" * 64},
     )
     adapter = FakeAdapter(accepted)
 
@@ -615,12 +650,8 @@ async def test_tenantcloud_persisted_acceptance_without_verified_readback_reconc
 
 
 @pytest.mark.asyncio
-async def test_tenantcloud_persisted_acceptance_with_hash_mismatch_reconciles():
-    tampered_evidence = {
-        "canonical_observed_state": {"status": "working"},
-        "readback_timestamp": "2026-07-16T01:00:00Z",
-        "evidence_hash": "e" * 64,
-    }
+async def test_tenantcloud_persisted_acceptance_with_incomplete_observation_reconciles():
+    incomplete_evidence = {key: value for key, value in VERIFIED_READBACK_EVIDENCE.items() if key != "target_reference"}
     store = FakeStore(
         tenantcloud_row(
             ActionState.PROVIDER_ACCEPTED,
@@ -628,9 +659,9 @@ async def test_tenantcloud_persisted_acceptance_with_hash_mismatch_reconciles():
             provider_request_ref="lead:6001",
             provider_message_id="tenantcloud-lead:6001:working",
             provider_accepted_at=NOW,
-            provider_evidence_kind="verified_readback",
-            provider_evidence_hash="0" * 64,
-            provider_readback_evidence=tampered_evidence,
+            provider_evidence_kind="verified_provider_readback",
+            provider_evidence_hash="e" * 64,
+            provider_readback_evidence=incomplete_evidence,
         )
     )
     accepted = ProviderObservation(
@@ -639,7 +670,7 @@ async def test_tenantcloud_persisted_acceptance_with_hash_mismatch_reconciles():
         provider_request_ref="lead:6001",
         message_id="tenantcloud-lead:6001:working",
         accepted_at=NOW,
-        evidence=tampered_evidence,
+        evidence={**VERIFIED_READBACK_EVIDENCE, "evidence_hash": "e" * 64},
     )
     adapter = FakeAdapter(accepted)
 
