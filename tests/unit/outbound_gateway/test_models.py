@@ -166,3 +166,212 @@ def test_status_accepts_only_op_and_uuid_action_id():
         parse_outbound_request({"op": "status", "action_id": "bad"})
     with pytest.raises(ValidationError, match="extra"):
         parse_outbound_request({"op": "status", "action_id": action_id, "wake": 1})
+
+
+@pytest.mark.parametrize(
+    ("operation", "role", "intent", "arguments", "argument_type"),
+    [
+        (
+            "tenantcloud.message.send",
+            "prospect_reply",
+            "inquiry_reply",
+            {"text": "Reply"},
+            "TextArguments",
+        ),
+        (
+            "tenantcloud.lead.status.update",
+            "provider_mutation",
+            "tenantcloud_lead_status",
+            {"status": "working"},
+            "LeadStatusArguments",
+        ),
+        (
+            "tenantcloud.maintenance.create",
+            "provider_mutation",
+            "tenantcloud_maintenance_create",
+            {
+                "category_id": 57,
+                "title": "Kitchen leak",
+                "priority": "normal",
+                "initiated_at": "2026-08-04",
+                "text": "Pipe is leaking\r\nunder sink",
+                "entry_allowed": False,
+                "available_on": "2026-08-05",
+            },
+            "MaintenanceCreateArguments",
+        ),
+        (
+            "tenantcloud.maintenance.status.update",
+            "provider_mutation",
+            "tenantcloud_maintenance_status",
+            {"status": 3},
+            "MaintenanceStatusArguments",
+        ),
+    ],
+)
+def test_tenantcloud_operations_use_exact_strict_argument_models(operation, role, intent, arguments, argument_type):
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation=operation,
+            action_role=role,
+            intent_kind=intent,
+            appointment_slot=None,
+            arguments=arguments,
+        )
+    )
+
+    assert type(parsed.arguments).__name__ == argument_type
+    assert parsed.arguments.model_config["frozen"] is True
+    if operation == "tenantcloud.maintenance.create":
+        assert parsed.arguments.text == "Pipe is leaking\nunder sink"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "operation": "tenantcloud.message.send",
+            "action_role": "provider_mutation",
+            "intent_kind": "inquiry_reply",
+            "arguments": {"text": "Reply"},
+        },
+        {
+            "operation": "tenantcloud.lead.status.update",
+            "action_role": "provider_mutation",
+            "intent_kind": "tenantcloud_maintenance_status",
+            "arguments": {"status": "working"},
+        },
+        {
+            "operation": "tenantcloud.maintenance.create",
+            "action_role": "calendar_mutation",
+            "intent_kind": "tenantcloud_maintenance_create",
+            "arguments": {},
+        },
+        {
+            "operation": "tenantcloud.maintenance.status.update",
+            "action_role": "provider_mutation",
+            "intent_kind": "tenantcloud_lead_status",
+            "arguments": {"status": 1},
+        },
+    ],
+)
+def test_tenantcloud_role_operation_intent_matrix_fails_closed(overrides):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(execute_payload(appointment_slot=None, **overrides))
+
+
+@pytest.mark.parametrize("field", ["thread_id", "lead_id", "request_id", "property_id", "unit_id"])
+def test_tenantcloud_arguments_reject_agent_supplied_provider_ids(field):
+    with pytest.raises(ValidationError, match="extra"):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.lead.status.update",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_lead_status",
+                appointment_slot=None,
+                arguments={"status": "working", field: 7},
+            )
+        )
+
+
+@pytest.mark.parametrize("status", ["new", "closed", "WORKING", 1, True])
+def test_tenantcloud_lead_status_is_exact(status):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.lead.status.update",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_lead_status",
+                appointment_slot=None,
+                arguments={"status": status},
+            )
+        )
+
+
+@pytest.mark.parametrize("status", [True, False, 0, 4, "1", None])
+def test_tenantcloud_maintenance_status_is_strict(status):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.maintenance.status.update",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_maintenance_status",
+                appointment_slot=None,
+                arguments={"status": status},
+            )
+        )
+
+
+def maintenance_create_arguments(**overrides):
+    arguments = {
+        "category_id": 57,
+        "title": "Kitchen leak",
+        "priority": "normal",
+        "initiated_at": "2026-08-04",
+        "text": "Pipe is leaking",
+        "entry_allowed": False,
+        "available_on": None,
+    }
+    arguments.update(overrides)
+    return arguments
+
+
+@pytest.mark.parametrize("category_id", [True, False, 0, -1, 1.5, "57", 9_223_372_036_854_775_808])
+def test_maintenance_create_category_id_is_positive_strict_bigint(category_id):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.maintenance.create",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_maintenance_create",
+                appointment_slot=None,
+                arguments=maintenance_create_arguments(category_id=category_id),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"priority": "high"},
+        {"priority": "NORMAL"},
+        {"entry_allowed": 0},
+        {"entry_allowed": "false"},
+        {"initiated_at": "08/04/2026"},
+        {"initiated_at": "2026-02-30"},
+        {"available_on": "08/05/2026"},
+        {"available_on": "2026-02-30"},
+        {"title": ""},
+        {"title": " Kitchen leak"},
+        {"title": "x" * 256},
+        {"text": ""},
+        {"text": "Pipe is leaking "},
+        {"text": "x" * 10_001},
+        {"unknown": "value"},
+    ],
+)
+def test_maintenance_create_rejects_noncanonical_fields(overrides):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.maintenance.create",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_maintenance_create",
+                appointment_slot=None,
+                arguments=maintenance_create_arguments(**overrides),
+            )
+        )
+
+
+def test_maintenance_create_normalizes_unicode_and_newlines_before_hashing():
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation="tenantcloud.maintenance.create",
+            action_role="provider_mutation",
+            intent_kind="tenantcloud_maintenance_create",
+            appointment_slot=None,
+            arguments=maintenance_create_arguments(text="Cafe\u0301\r\nPipe"),
+        )
+    )
+
+    assert parsed.arguments.text == "Café\nPipe"

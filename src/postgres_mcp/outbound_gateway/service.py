@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from hashlib import sha256
 from typing import Any
@@ -36,6 +38,12 @@ from .preflight import PreflightEvidence
 from .preflight import PreflightOutcome
 from .preflight import SafetyPreflight
 from .state_machine import public_result
+from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
+from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
+from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -62,8 +70,20 @@ class OutboundActionRecord:
     recipient_scope: Mapping[str, Any]
     provider_account: str
     routing_policy_version: str
+    provider_evidence_kind: str | None = None
+    provider_evidence_reference: str | None = None
+    provider_evidence_hash: str | None = None
+    provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
 
     def execute_request(self) -> ExecuteRequest:
+        # create_or_load() persists TenantCloud arguments enriched with
+        # desired_state/target_reference/idempotency_key (migration 118
+        # reads those directly off outbound_actions.arguments). Every
+        # ArgumentModel is a StrictModel with extra="forbid", so those
+        # gateway-owned keys must be stripped back out before they reach
+        # model_validate() here -- this method rebuilds context on every
+        # reconcile()/resume() call, including the crash-recovery path.
+        arguments = strip_tenantcloud_persisted_argument_keys(self.operation, self.arguments)
         return ExecuteRequest.model_validate(
             {
                 "op": "execute",
@@ -72,7 +92,7 @@ class OutboundActionRecord:
                 "operation": self.operation,
                 "intent_kind": self.intent_kind,
                 "appointment_slot": self.appointment_slot,
-                "arguments": self.arguments,
+                "arguments": arguments,
             }
         )
 
@@ -405,6 +425,16 @@ class OutboundActionService:
             and action.provider_message_id
             and action.provider_accepted_at
         ):
+            return None
+        if action.operation in TENANTCLOUD_OPERATIONS and not self._verified_tenantcloud_evidence(action):
+            # TenantCloud writes are irreversible provider-side actions
+            # (lead status, maintenance requests). The generic ref/id/accepted_at
+            # heuristic above is not proof enough here: only durable evidence
+            # that says "verified readback" AND whose hash matches the
+            # persisted canonical state may complete without provider I/O.
+            # Anything else -- including a crash between the PROVIDER_ACCEPTED
+            # transition and the evidence write -- must go through bounded
+            # reconciliation instead of being trusted blindly.
             return None
         provider_request_ref = action.provider_request_ref
         provider_message_id = action.provider_message_id
@@ -787,6 +817,37 @@ class OutboundActionService:
     @staticmethod
     def evidence_hash(evidence: Mapping[str, Any] | None) -> str:
         return sha256(json.dumps(evidence or {}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _verified_tenantcloud_evidence(action: OutboundActionRecord) -> bool:
+        """Migration 118's transition_outbound_action already enforced the
+        full acceptance guard (evidence_kind literal, six-key observation
+        shape, per-key type/format checks, and equality against the
+        persisted arguments' desired_state/target_reference/operation)
+        atomically, in the same statement that wrote evidence_kind =
+        'verified_provider_readback'. So a row bearing that literal is only
+        reachable through that guarded write. This re-checks the literal,
+        the evidence_hash's own format, and structural completeness of the
+        persisted six-key observation -- defense against a corrupted or
+        partial read, not a re-derivation of the facade's own opaque hash
+        (which, for maintenance create, is computed over a target_reference
+        that differs by design from what is persisted here -- see
+        tenantcloud_shared.py)."""
+        if action.provider_evidence_kind != EVIDENCE_KIND_VERIFIED_READBACK:
+            return False
+        if not action.provider_evidence_hash or not _HEX64.fullmatch(action.provider_evidence_hash):
+            return False
+        evidence = dict(action.provider_readback_evidence)
+        if set(evidence) != READBACK_OBSERVATION_KEYS:
+            return False
+        if not isinstance(evidence.get("canonical_observed_state"), Mapping):
+            return False
+        if evidence.get("readback_verified") is not True:
+            return False
+        for key in ("operation", "provider_object_id", "target_reference", "readback_timestamp"):
+            if not isinstance(evidence.get(key), str) or not evidence[key]:
+                return False
+        return True
 
     @staticmethod
     def _result(action: OutboundActionRecord, *, repeated: bool = False) -> PublicResult:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
+from hashlib import sha256
 from types import MappingProxyType
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -83,6 +86,34 @@ def context():
         thread_identity="zrm-thread-1",
         showing_lifecycle_id="showing:7",
         calendar_event_uid=None,
+    )
+
+
+def provider_context(operation, arguments, target, *, claim_id=301, source_event_id="tenantcloud:claim:301", desired_hash="d" * 64):
+    intent = {
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+    }[operation]
+    return replace(
+        context(),
+        action_role=ActionRole.PROVIDER_MUTATION,
+        operation=operation,
+        intent_kind=intent,
+        appointment_slot=None,
+        arguments=MappingProxyType(arguments),
+        target=target,
+        provider_account="tenantcloud",
+        canonical_context=MappingProxyType(
+            {
+                "identity_version": "v1",
+                "tenantcloud_claim_id": claim_id,
+                "source_event_id": source_event_id,
+                "operation_target": {"kind": target.kind, "target_id": target.target_id},
+                **({"provider_ids": {"property_id": "12", "unit_id": "34"}} if operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE else {}),
+            }
+        ),
+        canonical_scope=MappingProxyType({"version": "v1", "desired_state_hash": desired_hash}),
     )
 
 
@@ -191,3 +222,371 @@ async def test_prospect_lock_scope_includes_canonical_source_turn():
 
     assert "prepare_outbound_action_and_acquire_lock" in calls[0][0]
     assert calls[0][1][4] == "showing_offer:turn:700"
+
+
+async def prepared_lock_intent(subject):
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("prepared"))]
+
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await PostgresActionStore(object()).prepare(subject, ActionState.RECEIVED)
+    return calls[0][1][4]
+
+
+@pytest.mark.asyncio
+async def test_provider_status_lock_has_versioned_claim_source_target_and_desired_state():
+    subject = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "6001", True),
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert lock_intent == ("v1:claim:301:source:tenantcloud:claim:301:op:tenantcloud.lead.status.update:target:6001:state:" + "d" * 64)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_create_lock_uses_explicit_boundaries_and_hashes_text():
+    text = "Café\nPipe"
+    subject = provider_context(
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+        {
+            "category_id": 57,
+            "title": "Kitchen leak",
+            "priority": "normal",
+            "initiated_at": "2026-08-04",
+            "text": text,
+            "entry_allowed": False,
+            "available_on": "2026-08-05",
+        },
+        DerivedTarget("tenantcloud_property_unit", "property:12:unit:34", True),
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert lock_intent == (
+        "v1:claim:301:source:tenantcloud:claim:301:"
+        "op:tenantcloud.maintenance.create:target:property:12:unit:34:"
+        "property:12:unit:34:category:57:initiated:2026-08-04:text:"
+        f"{sha256(text.encode('utf-8')).hexdigest()}:state:{'d' * 64}"
+    )
+    assert text not in lock_intent
+    assert "Café" not in lock_intent
+
+
+@pytest.mark.asyncio
+async def test_provider_lock_changes_for_desired_state_and_distinct_wake_identity():
+    base = provider_context(
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
+        {"status": 2},
+        DerivedTarget("tenantcloud_maintenance_request", "81", True),
+    )
+    changed_state = replace(
+        base,
+        arguments=MappingProxyType({"status": 3}),
+        canonical_scope=MappingProxyType({"version": "v1", "desired_state_hash": "e" * 64}),
+    )
+    distinct_wake = replace(
+        base,
+        canonical_context=MappingProxyType(
+            {
+                **base.canonical_context,
+                "tenantcloud_claim_id": 302,
+                "source_event_id": "tenantcloud:claim:302",
+            }
+        ),
+    )
+
+    base_key = await prepared_lock_intent(base)
+    same_key = await prepared_lock_intent(replace(base, action_id=UUID("f255a04a-93df-4e55-afd7-da866f992111")))
+    changed_key = await prepared_lock_intent(changed_state)
+    distinct_key = await prepared_lock_intent(distinct_wake)
+
+    assert same_key == base_key
+    assert changed_key != base_key
+    assert distinct_key != base_key
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_keeps_existing_reply_lock_identity():
+    subject = replace(
+        context(),
+        operation=Operation.TENANTCLOUD_MESSAGE_SEND,
+        intent_kind=IntentKind.INQUIRY_REPLY,
+        appointment_slot=None,
+        arguments=MappingProxyType({"text": "Reply"}),
+    )
+
+    assert await prepared_lock_intent(subject) == "inquiry_reply:turn:700"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "operation", "intent", "expected"),
+    [
+        (
+            ActionRole.CALENDAR_MUTATION,
+            Operation.CALENDAR_CREATE,
+            IntentKind.SHOWING_CREATE,
+            "showing_create:lifecycle:showing:7",
+        ),
+        (
+            ActionRole.INTERNAL_NOTIFICATION,
+            Operation.CLIQ_CHANNEL_POST,
+            IntentKind.LEAD_ALERT,
+            "lead_alert:event:7",
+        ),
+    ],
+)
+async def test_existing_nonreply_lock_keys_are_exact(role, operation, intent, expected):
+    subject = replace(context(), action_role=role, operation=operation, intent_kind=intent)
+
+    assert await prepared_lock_intent(subject) == expected
+
+
+# Exactly migration 118's required six keys for p_observation
+# (118_...sql:353-364), plus the facade's own opaque evidence_hash as a
+# seventh key the adapter attaches and the store must strip before sending
+# p_observation (see tenantcloud_shared.READBACK_OBSERVATION_KEYS).
+ADAPTER_EVIDENCE = {
+    "canonical_observed_state": {"status": "working"},
+    "operation": "tenantcloud.lead.status.update",
+    "provider_object_id": "6001",
+    "target_reference": "lead:6001",
+    "readback_timestamp": "2026-07-16T01:00:00Z",
+    "readback_verified": True,
+    "evidence_hash": "e" * 64,
+}
+SIX_KEY_OBSERVATION = {key: value for key, value in ADAPTER_EVIDENCE.items() if key != "evidence_hash"}
+
+
+def _tenantcloud_accepted_row(state="provider_accepted"):
+    # transition_outbound_action RETURNS SETOF outbound_actions, which gets
+    # no new evidence columns from migration 118 -- the evidence lives on
+    # outbound_action_attempts (067) and must be fetched separately.
+    return {**action_row(state), "operation": "tenantcloud.lead.status.update"}
+
+
+@pytest.mark.asyncio
+async def test_transition_to_provider_accepted_sends_exact_six_key_observation_and_literal_evidence_kind():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        if "outbound_action_attempts" in query:
+            return [
+                Row(
+                    {
+                        "evidence_kind": "verified_provider_readback",
+                        "evidence_reference": "lead:6001",
+                        "evidence_hash": "e" * 64,
+                        "provider_observation": SIX_KEY_OBSERVATION,
+                    }
+                )
+            ]
+        return [Row(_tenantcloud_accepted_row())]
+
+    store = PostgresActionStore(object())
+    observation = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_accepted",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=None,
+        evidence=ADAPTER_EVIDENCE,
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        result = await store.transition(
+            ACTION_ID,
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            "worker-1",
+            observation,
+        )
+
+    transition_call = next(call for call in calls if "transition_outbound_action" in call[0])
+    params = transition_call[1]
+    sent_observation = json.loads(params[8])
+    assert sent_observation == SIX_KEY_OBSERVATION
+    assert set(sent_observation) == {
+        "canonical_observed_state", "operation", "provider_object_id",
+        "target_reference", "readback_timestamp", "readback_verified",
+    }
+    assert "evidence_hash" not in sent_observation
+    assert params[9] == "verified_provider_readback"
+    assert params[10] == "lead:6001"
+    assert params[10] == observation.provider_request_ref  # evidence_reference == provider_request_ref (118:351)
+    assert params[11] == "e" * 64
+
+    attempts_call = next(call for call in calls if "outbound_action_attempts" in call[0])
+    assert attempts_call[1] == [ACTION_ID, result.attempt_count]
+
+    assert result.provider_evidence_kind == "verified_provider_readback"
+    assert result.provider_evidence_hash == "e" * 64
+    assert result.provider_readback_evidence == SIX_KEY_OBSERVATION
+
+
+@pytest.mark.asyncio
+async def test_transition_to_provider_accepted_without_provider_request_ref_fails_explicitly():
+    store = PostgresActionStore(object())
+    observation = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_accepted",
+        provider_request_ref=None,
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=None,
+        evidence=ADAPTER_EVIDENCE,
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=AssertionError("must not reach the database")),
+    ):
+        with pytest.raises(ValueError, match="provider_request_ref"):
+            await store.transition(
+                ACTION_ID,
+                ActionState.DISPATCHING,
+                ActionState.PROVIDER_ACCEPTED,
+                "worker-1",
+                observation,
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_or_load_persists_desired_state_target_reference_idempotency_key_for_tenantcloud():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("received"))]
+
+    subject = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "6001", True),
+    )
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.create_or_load(subject)
+
+    persisted_arguments = json.loads(calls[0][1][-1])
+    assert persisted_arguments["status"] == "working"
+    assert persisted_arguments["desired_state"] == {"status": "working"}
+    assert persisted_arguments["target_reference"] == "lead:6001"
+    assert persisted_arguments["idempotency_key"] == (
+        "v1:claim:301:source:tenantcloud:claim:301:op:tenantcloud.lead.status.update:"
+        "target:lead:6001:state:" + "d" * 64
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_or_load_normalizes_desired_state_for_maintenance_create_with_available_on():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("received"))]
+
+    subject = provider_context(
+        Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+        {
+            "category_id": 57,
+            "title": "Kitchen leak",
+            "priority": "normal",
+            "initiated_at": "2026-08-04",
+            "text": "Sink leaking under cabinet",
+            "entry_allowed": False,
+            "available_on": "2026-08-05",
+        },
+        DerivedTarget("tenantcloud_property_unit", "property:12:unit:34", True),
+    )
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.create_or_load(subject)
+
+    persisted_arguments = json.loads(calls[0][1][-1])
+    assert persisted_arguments["desired_state"] == {
+        "property_id": "12",
+        "unit_id": "34",
+        "category_id": "57",
+        "title": "Kitchen leak",
+        "priority": "normal",
+        "initiated_at": "08/04/2026",
+        "text": "Sink leaking under cabinet",
+        "entry_allowed": False,
+        "status": 1,
+        "available_on": "08/05/2026",
+    }
+    assert persisted_arguments["target_reference"] == "property:12:unit:34"
+
+
+@pytest.mark.asyncio
+async def test_create_or_load_leaves_non_tenantcloud_arguments_byte_for_byte():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("received"))]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.create_or_load(context())
+
+    persisted_arguments = json.loads(calls[0][1][-1])
+    assert persisted_arguments == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_transition_to_provider_accepted_without_readback_shape_leaves_evidence_columns_unset():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row(action_row("provider_accepted"))]
+
+    store = PostgresActionStore(object())
+    observation = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=None,
+        evidence={"kind": "provider_message_id", "provider_message_id": "mail-1"},
+    )
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        result = await store.transition(
+            ACTION_ID,
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            "worker-1",
+            observation,
+        )
+
+    params = calls[0][1]
+    assert params[9] is None
+    assert params[10] is None
+    assert params[11] is None
+    assert "provider_message_id" not in params[8]
+    assert result.provider_evidence_kind is None
+    assert result.provider_readback_evidence == {}

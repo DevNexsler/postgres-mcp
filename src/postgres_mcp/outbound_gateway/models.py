@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from datetime import datetime
 from datetime import timezone
 from enum import StrEnum
@@ -9,6 +10,7 @@ from typing import Annotated
 from typing import Any
 from typing import Literal
 from typing import TypeAlias
+from unicodedata import category
 from unicodedata import normalize
 from uuid import UUID
 
@@ -24,6 +26,7 @@ class ActionRole(StrEnum):
     PROSPECT_REPLY = "prospect_reply"
     CALENDAR_MUTATION = "calendar_mutation"
     INTERNAL_NOTIFICATION = "internal_notification"
+    PROVIDER_MUTATION = "provider_mutation"
 
 
 class Operation(StrEnum):
@@ -34,6 +37,10 @@ class Operation(StrEnum):
     CALENDAR_CREATE = "calendar.create"
     CALENDAR_UPDATE = "calendar.update"
     CALENDAR_DELETE = "calendar.delete"
+    TENANTCLOUD_MESSAGE_SEND = "tenantcloud.message.send"
+    TENANTCLOUD_LEAD_STATUS_UPDATE = "tenantcloud.lead.status.update"
+    TENANTCLOUD_MAINTENANCE_CREATE = "tenantcloud.maintenance.create"
+    TENANTCLOUD_MAINTENANCE_STATUS_UPDATE = "tenantcloud.maintenance.status.update"
 
 
 class IntentKind(StrEnum):
@@ -47,6 +54,9 @@ class IntentKind(StrEnum):
     SHOWING_DELETE = "showing_delete"
     LEAD_ALERT = "lead_alert"
     MANUAL_REVIEW_ALERT = "manual_review_alert"
+    TENANTCLOUD_LEAD_STATUS = "tenantcloud_lead_status"
+    TENANTCLOUD_MAINTENANCE_CREATE = "tenantcloud_maintenance_create"
+    TENANTCLOUD_MAINTENANCE_STATUS = "tenantcloud_maintenance_status"
 
 
 class ActionState(StrEnum):
@@ -119,8 +129,75 @@ class EmptyArguments(StrictModel):
     pass
 
 
-ArgumentModel: TypeAlias = TextArguments | CalendarDescriptionArguments | EmptyArguments
 PositiveBigInt = Annotated[int, Field(strict=True, gt=0, le=9_223_372_036_854_775_807)]
+
+
+def normalize_tenantcloud_text(value: Any, *, field: str, maximum: int) -> str:
+    normalized = normalize_public_text(value, field=field, minimum=1, maximum=maximum)
+    if normalized != normalized.strip():
+        raise ValueError(f"{field} must not have surrounding whitespace")
+    if any(category(character) == "Cc" and character not in {"\n", "\t"} for character in normalized):
+        raise ValueError(f"{field} contains unsupported control characters")
+    return normalized
+
+
+def parse_iso_date(value: Any, *, field: str) -> date:
+    if type(value) is not str:
+        raise ValueError(f"{field} must be an ISO date string")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a real YYYY-MM-DD date") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field} must be a canonical YYYY-MM-DD date")
+    return parsed
+
+
+class LeadStatusArguments(StrictModel):
+    status: Literal["working"]
+
+
+class MaintenanceCreateArguments(StrictModel):
+    category_id: PositiveBigInt
+    title: str
+    priority: Literal["normal"]
+    initiated_at: date
+    text: str
+    entry_allowed: Annotated[bool, Field(strict=True)]
+    available_on: date | None = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: Any) -> str:
+        return normalize_tenantcloud_text(value, field="title", maximum=255)
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        return normalize_tenantcloud_text(value, field="text", maximum=10_000)
+
+    @field_validator("initiated_at", "available_on", mode="before")
+    @classmethod
+    def normalize_date(cls, value: Any, info: Any) -> date | None:
+        if value is None and info.field_name == "available_on":
+            return None
+        return parse_iso_date(value, field=info.field_name)
+
+
+class MaintenanceStatusArguments(StrictModel):
+    status: Literal[1, 2, 3]
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def validate_status(cls, value: Any) -> int:
+        if type(value) is not int or value not in {1, 2, 3}:
+            raise ValueError("status must be exactly 1, 2, or 3")
+        return value
+
+
+ArgumentModel: TypeAlias = (
+    TextArguments | CalendarDescriptionArguments | EmptyArguments | LeadStatusArguments | MaintenanceCreateArguments | MaintenanceStatusArguments
+)
 
 
 ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
@@ -131,6 +208,10 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
     Operation.CALENDAR_CREATE: CalendarDescriptionArguments,
     Operation.CALENDAR_UPDATE: CalendarDescriptionArguments,
     Operation.CALENDAR_DELETE: EmptyArguments,
+    Operation.TENANTCLOUD_MESSAGE_SEND: TextArguments,
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: LeadStatusArguments,
+    Operation.TENANTCLOUD_MAINTENANCE_CREATE: MaintenanceCreateArguments,
+    Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: MaintenanceStatusArguments,
 }
 
 
@@ -162,6 +243,22 @@ ALLOWED_COMBINATIONS: frozenset[tuple[ActionRole, Operation, IntentKind]] = froz
         (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_CREATE, IntentKind.SHOWING_CREATE),
         (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_UPDATE, IntentKind.SHOWING_UPDATE),
         (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_DELETE, IntentKind.SHOWING_DELETE),
+        (ActionRole.PROSPECT_REPLY, Operation.TENANTCLOUD_MESSAGE_SEND, IntentKind.INQUIRY_REPLY),
+        (
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+            IntentKind.TENANTCLOUD_LEAD_STATUS,
+        ),
+        (
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        ),
+        (
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
+            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+        ),
     }
 )
 
