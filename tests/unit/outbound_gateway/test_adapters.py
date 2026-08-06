@@ -945,3 +945,80 @@ async def test_tenantcloud_status_reconciliation_retries_patch_only_after_author
 
     assert reconciled.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
     assert reconciled.retryable is True
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: a provably pre-dispatch failure must retry, not escalate.
+#
+# _from_execution already classifies an invoke()-time authentication_unavailable
+# rejection as DEFINITIVE_NON_ACCEPTANCE+retryable=True (proven above by
+# test_tenantcloud_auth_rejection_before_dispatch_is_retryable_non_acceptance)
+# -- nothing could have been written if the provider never even accepted the
+# write attempt. _from_reconciliation only ever produced that same
+# provably-safe-to-retry classification for the two *status* operations
+# (via definitive_absence_detail, itself really meaning "not yet applied" --
+# a different but also-retryable reason); for the two *create* operations
+# (message.send, maintenance.create) definitive_absence_detail is None, so
+# ANY "definitive_non_acceptance" reconciliation result -- including one
+# whose error_code is authentication_unavailable, the exact same signal
+# _from_execution already trusts -- fell through to the generic ambiguous
+# bucket below. That is "the ambiguous-create reconcile path": a reconcile
+# call that could not even authenticate proves nothing was written (you
+# cannot write with less authentication than a read requires), so it should
+# retry exactly like the invoke()-time case, not escalate toward
+# reconcile/manual_review.
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_provider_rejected_non_acceptance_is_not_retryable():
+    """PIN (unchanged): a definitive provider rejection that is NOT the
+    authentication_unavailable signal (e.g. the provider validated the
+    request and rejected it on its merits) must stay non-retryable --
+    only authentication_unavailable is provably pre-dispatch."""
+    facade = FakeTenantCloudMutations()
+    facade.mark_lead_working_result = FakeMutationExecution(
+        FakeMutationResult(TC_DEFINITIVE_NON_ACCEPTANCE, "validation_rejected"),
+        None,
+        "validation_rejected",
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.retryable is False
+    assert observation.detail_code == "tenantcloud_provider_rejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "reconcile_method"),
+    [
+        (Operation.TENANTCLOUD_MESSAGE_SEND, "reconcile_message_result"),
+        (Operation.TENANTCLOUD_MAINTENANCE_CREATE, "reconcile_maintenance_create_result"),
+    ],
+)
+async def test_tenantcloud_reconciliation_auth_unavailable_on_a_create_is_retryable_not_ambiguous(operation, reconcile_method):
+    """NEW: closes the ambiguous-create reconcile path gap described above.
+    Before the fix, this produced AMBIGUOUS "tenantcloud_reconciliation_
+    authentication_unavailable" for these two operations -- the same
+    detail-code family as the live incident's
+    tenantcloud_reconciliation_no_match, just for a provably-safe-to-retry
+    reason instead of a genuinely inconclusive one."""
+    facade = FakeTenantCloudMutations()
+    setattr(
+        facade,
+        reconcile_method,
+        FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authentication_unavailable"),
+    )
+    adapter = TenantCloudAdapter(mutations=facade)
+    ctx = tenantcloud_context(operation)
+    prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
+
+    reconciled = await adapter.reconcile(facade, ctx, ACTION_UID, prior)
+
+    assert reconciled.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert reconciled.retryable is True
+    assert reconciled.category == "provider_authentication"
+    assert reconciled.detail_code == "tenantcloud_auth_rejected_before_dispatch"
