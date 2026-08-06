@@ -49,7 +49,7 @@ def request() -> ExecuteRequest:
             "operation": "email.send",
             "intent_kind": "showing_offer",
             "appointment_slot": "2026-07-17T10:30:00-04:00",
-            "arguments": {"text": "Friday at 10:30 works. — Nigel"},
+            "arguments": {"to_address": "lead@convo.zillow.com", "text": "Friday at 10:30 works. — Nigel"},
         }
     )
     assert isinstance(value, ExecuteRequest)
@@ -64,7 +64,7 @@ def context() -> ActionContext:
         operation=Operation.EMAIL_SEND,
         intent_kind=IntentKind.SHOWING_OFFER,
         appointment_slot=datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
-        arguments=MappingProxyType({"text": "Friday at 10:30 works. — Nigel"}),
+        arguments=MappingProxyType({"to_address": "lead@convo.zillow.com", "text": "Friday at 10:30 works. — Nigel"}),
         source="zillow",
         source_message_id=700,
         source_message_key="zillow:700",
@@ -118,7 +118,7 @@ def row(state=ActionState.RECEIVED, **overrides):
         operation=Operation.EMAIL_SEND,
         intent_kind=IntentKind.SHOWING_OFFER,
         appointment_slot=datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
-        arguments={"text": "Friday at 10:30 works. — Nigel"},
+        arguments={"to_address": "lead@convo.zillow.com", "text": "Friday at 10:30 works. — Nigel"},
         state=state,
         action_uid=ACTION_UID if state is not ActionState.RECEIVED else None,
         provider_request_ref=None,

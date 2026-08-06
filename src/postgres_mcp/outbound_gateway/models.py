@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from datetime import datetime
 from datetime import timezone
@@ -105,8 +106,82 @@ def normalize_public_text(value: Any, *, field: str, minimum: int, maximum: int)
     return normalized
 
 
-class TextArguments(StrictModel):
+_EMAIL_ADDRESS = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_E164_PHONE = re.compile(r"^\+[1-9]\d{1,14}$")
+
+
+def normalize_target_email(value: Any, *, field: str) -> str:
+    """Format-only email check: syntactically an address, nothing more.
+    Never checks that the address belongs to any prospect, wake, or thread --
+    the agent asserts the recipient, this only rejects garbage."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    candidate = normalize("NFC", value).strip()
+    if not _EMAIL_ADDRESS.fullmatch(candidate):
+        raise ValueError(f"{field} must look like an email address")
+    return candidate
+
+
+def normalize_target_phone(value: Any, *, field: str) -> str:
+    """Format-only E.164 check. Never checks that the number belongs to any
+    prospect, wake, or conversation."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    candidate = value.strip()
+    if not _E164_PHONE.fullmatch(candidate):
+        raise ValueError(f"{field} must be E.164 formatted, e.g. +19085550100")
+    return candidate
+
+
+def normalize_target_id(value: Any, *, field: str) -> str:
+    """Format-only non-empty-string check for opaque provider target ids
+    (Cliq channel/chat ids, calendar ids). No ownership or membership check."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    candidate = normalize("NFC", value).strip()
+    if not candidate:
+        raise ValueError(f"{field} must not be empty")
+    return candidate
+
+
+class EmailArguments(StrictModel):
+    to_address: str
     text: str
+
+    @field_validator("to_address", mode="before")
+    @classmethod
+    def normalize_to_address(cls, value: Any) -> str:
+        return normalize_target_email(value, field="to_address")
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
+
+
+class QuoSmsArguments(StrictModel):
+    to_phone: str
+    text: str
+
+    @field_validator("to_phone", mode="before")
+    @classmethod
+    def normalize_to_phone(cls, value: Any) -> str:
+        return normalize_target_phone(value, field="to_phone")
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
+
+
+class CliqArguments(StrictModel):
+    channel_or_chat_id: str
+    text: str
+
+    @field_validator("channel_or_chat_id", mode="before")
+    @classmethod
+    def normalize_channel_or_chat_id(cls, value: Any) -> str:
+        return normalize_target_id(value, field="channel_or_chat_id")
 
     @field_validator("text", mode="before")
     @classmethod
@@ -115,7 +190,13 @@ class TextArguments(StrictModel):
 
 
 class CalendarDescriptionArguments(StrictModel):
+    calendar_id: str
     description: str | None = None
+
+    @field_validator("calendar_id", mode="before")
+    @classmethod
+    def normalize_calendar_id(cls, value: Any) -> str:
+        return normalize_target_id(value, field="calendar_id")
 
     @field_validator("description", mode="before")
     @classmethod
@@ -125,8 +206,13 @@ class CalendarDescriptionArguments(StrictModel):
         return normalize_public_text(value, field="description", minimum=0, maximum=10_000)
 
 
-class EmptyArguments(StrictModel):
-    pass
+class CalendarDeleteArguments(StrictModel):
+    calendar_id: str
+
+    @field_validator("calendar_id", mode="before")
+    @classmethod
+    def normalize_calendar_id(cls, value: Any) -> str:
+        return normalize_target_id(value, field="calendar_id")
 
 
 PositiveBigInt = Annotated[int, Field(strict=True, gt=0, le=9_223_372_036_854_775_807)]
@@ -210,9 +296,11 @@ class MaintenanceStatusArguments(StrictModel):
 
 
 ArgumentModel: TypeAlias = (
-    TextArguments
+    EmailArguments
+    | QuoSmsArguments
+    | CliqArguments
     | CalendarDescriptionArguments
-    | EmptyArguments
+    | CalendarDeleteArguments
     | TenantCloudMessageArguments
     | LeadStatusArguments
     | MaintenanceCreateArguments
@@ -221,13 +309,13 @@ ArgumentModel: TypeAlias = (
 
 
 ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
-    Operation.EMAIL_SEND: TextArguments,
-    Operation.QUO_SMS_SEND: TextArguments,
-    Operation.CLIQ_CHANNEL_POST: TextArguments,
-    Operation.CLIQ_CHAT_POST: TextArguments,
+    Operation.EMAIL_SEND: EmailArguments,
+    Operation.QUO_SMS_SEND: QuoSmsArguments,
+    Operation.CLIQ_CHANNEL_POST: CliqArguments,
+    Operation.CLIQ_CHAT_POST: CliqArguments,
     Operation.CALENDAR_CREATE: CalendarDescriptionArguments,
     Operation.CALENDAR_UPDATE: CalendarDescriptionArguments,
-    Operation.CALENDAR_DELETE: EmptyArguments,
+    Operation.CALENDAR_DELETE: CalendarDeleteArguments,
     Operation.TENANTCLOUD_MESSAGE_SEND: TenantCloudMessageArguments,
     Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: LeadStatusArguments,
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: MaintenanceCreateArguments,

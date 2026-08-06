@@ -121,7 +121,7 @@ def request(**overrides) -> ExecuteRequest:
         "operation": "email.send",
         "intent_kind": "showing_offer",
         "appointment_slot": "2026-07-17T10:30:00-04:00",
-        "arguments": {"text": "Friday at 10:30 works.\r\n— Nigel"},
+        "arguments": {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"},
     }
     payload.update(overrides)
     parsed = parse_outbound_request(payload)
@@ -196,6 +196,18 @@ def tenantcloud_request(operation):
     return request(operation=operation, appointment_slot=None, **cases[operation])
 
 
+_TENANTCLOUD_HINT_KEYS = {"lead_id", "listing_id", "thread_id", "request_id", "property_id", "unit_id"}
+
+
+def tenantcloud_hint_keys(hints):
+    """suggest_targets() now also offers email/phone recipient hints
+    alongside TenantCloud claim hints (Task 5). The TenantCloud-specific
+    tests below only care about the claim-parsing half; this strips any
+    to_address/to_phone keys so they can keep asserting on that half in
+    isolation, exactly as they did before Task 5 added the rest."""
+    return {key: value for key, value in hints.items() if key in _TENANTCLOUD_HINT_KEYS}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "target_kind", "target_id"),
@@ -255,7 +267,7 @@ async def test_suggest_targets_returns_claim_linked_provider_ids(family, entity_
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == entity_ids
+    assert tenantcloud_hint_keys(hints) == entity_ids
 
 
 @pytest.mark.asyncio
@@ -289,7 +301,7 @@ async def test_suggest_targets_parses_real_production_entity_scope_key_prefixes(
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == expected
+    assert tenantcloud_hint_keys(hints) == expected
 
 
 @pytest.mark.asyncio
@@ -300,7 +312,7 @@ async def test_suggest_targets_is_advisory_and_never_raises():
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == {}
+    assert tenantcloud_hint_keys(hints) == {}
 
 
 @pytest.mark.asyncio
@@ -328,7 +340,7 @@ async def test_suggest_targets_is_empty_for_untrusted_claim_and_channel_shapes(r
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == {}
+    assert tenantcloud_hint_keys(hints) == {}
 
 
 @pytest.mark.asyncio
@@ -365,7 +377,7 @@ async def test_suggest_targets_ignores_ownership_state_source_and_channel_shape(
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == {"lead_id": "6001", "listing_id": "5001", "thread_id": "8001"}
+    assert tenantcloud_hint_keys(hints) == {"lead_id": "6001", "listing_id": "5001", "thread_id": "8001"}
 
 
 @pytest.mark.asyncio
@@ -394,7 +406,7 @@ async def test_suggest_targets_is_empty_for_malformed_or_cross_family_entity_ids
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert hints == {}
+    assert tenantcloud_hint_keys(hints) == {}
 
 
 @pytest.mark.asyncio
@@ -549,9 +561,9 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
     [
         (
             record(),
-            request(),
+            request(arguments={"to_address": "agent-chosen@example.com", "text": "Friday at 10:30 works.\r\n\u2014 Nigel"}),
             "email_thread",
-            "amanda.abc@convo.zillow.com",
+            "agent-chosen@example.com",
             "nigel-zoho",
         ),
         (
@@ -567,27 +579,9 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                     },
                 },
             ),
-            request(),
+            request(arguments={"to_address": "agent-chosen@example.com", "text": "Friday at 10:30 works.\r\n\u2014 Nigel"}),
             "email_thread",
-            "lead.123@convo.zillow.com",
-            "nigel-zoho",
-        ),
-        (
-            record(
-                raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
-                source_channel_id="tenantcloud-lead-1",
-                participant_key="tenant@example.com",
-                envelope={
-                    "identity": {},
-                    "message": {
-                        "property": "16 N Main St #16",
-                        "direct_email": "tenant@example.com",
-                    },
-                },
-            ),
-            request(appointment_slot="2026-07-17T10:00:00-04:00"),
-            "email_thread",
-            "tenant@example.com",
+            "agent-chosen@example.com",
             "nigel-zoho",
         ),
         (
@@ -608,28 +602,10 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 operation="quo.sms.send",
                 intent_kind="inquiry_reply",
                 appointment_slot=None,
+                arguments={"to_phone": "+19085551234", "text": "Thanks"},
             ),
             "quo_conversation",
-            "quo-conversation-9",
-            "leasing-main",
-        ),
-        (
-            record(
-                raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
-                source_channel_id="tenantcloud-lead-1",
-                participant_key="tenant@example.com",
-                envelope={
-                    "identity": {},
-                    "message": {
-                        "property": "16 N Main St #16",
-                        "direct_email": "tenant@example.com",
-                        "phone": "+1 908 555 0199",
-                    },
-                },
-            ),
-            request(operation="quo.sms.send"),
-            "quo_conversation",
-            "+19085550199",
+            "+19085551234",
             "leasing-main",
         ),
         (
@@ -648,11 +624,11 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 operation="cliq.channel.post",
                 intent_kind="lead_alert",
                 appointment_slot=None,
-                arguments={"text": "New lead"},
+                arguments={"channel_or_chat_id": "agent-chosen-channel", "text": "New lead"},
             ),
             "cliq_channel",
-            "tenant-leads",
-            "tenant-leads",
+            "agent-chosen-channel",
+            "agent-chosen-channel",
         ),
         (
             record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"}),
@@ -660,7 +636,7 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 action_role="calendar_mutation",
                 operation="calendar.create",
                 intent_kind="showing_create",
-                arguments={"description": "Amanda tour"},
+                arguments={"calendar_id": "nigel", "description": "Amanda tour"},
             ),
             "calendar",
             "nigel",
@@ -668,7 +644,13 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
         ),
     ],
 )
-async def test_context_derives_provider_targets_server_side(event, action, target_kind, target_id, provider_account):
+async def test_execute_target_comes_from_agent_arguments_regardless_of_wake_shape(event, action, target_kind, target_id, provider_account):
+    """Repoints the old test_context_derives_provider_targets_server_side:
+    that test asserted target *values* the retired wake-side derivation
+    produced. Now the agent supplies the value directly -- these fixtures
+    keep the same wake shapes (including ones whose own data implies a
+    *different* address/phone/channel) to prove the agent's argument wins
+    every time, not just when it happens to agree with the wake."""
     event = WakeEventRecord(**{**event.__dict__, "wakeup_event_id": action.wakeup_event_id})
     context = await ActionContextLoader(FakeRepository(event), policy()).load(action)
     assert context.target.kind == target_kind
@@ -679,6 +661,95 @@ async def test_context_derives_provider_targets_server_side(event, action, targe
     assert context.source_message_id == event.message_id
     assert context.conversation_watermark == 700
     assert len(context.payload_hash) == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "expected_hints"),
+    [
+        (record(), {"to_address": "amanda.abc@convo.zillow.com", "to_phone": "+19085550100"}),
+        (
+            record(
+                raw_payload={"provider": "hotpads", "thread_id": "zrm-thread-44"},
+                participant_key="lead.123@convo.zillow.com",
+                envelope={
+                    "identity": {},
+                    "message": {
+                        "property": "144 Bullman Street",
+                        "proxy_email": "lead.123@convo.zillow.com",
+                        "direct_email": "AmandaSnyder@live.com",
+                    },
+                },
+            ),
+            {"to_address": "lead.123@convo.zillow.com"},
+        ),
+        (
+            record(
+                raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
+                source_channel_id="tenantcloud-lead-1",
+                participant_key="tenant@example.com",
+                envelope={
+                    "identity": {},
+                    "message": {
+                        "property": "16 N Main St #16",
+                        "direct_email": "tenant@example.com",
+                    },
+                },
+            ),
+            {"to_address": "tenant@example.com"},
+        ),
+        (
+            record(
+                event_source="quo",
+                message_source="quo",
+                source_channel_id="quo-conversation-9",
+                channel_type="sms",
+                participant_type="phone",
+                participant_key="+19085550199",
+                raw_payload={"provider": "quo", "conversation_id": "quo-conversation-9"},
+                envelope={
+                    "identity": {},
+                    "message": {"property": "16 N Main St #16", "phone": "+1 908 555 0199"},
+                },
+            ),
+            {"to_phone": "+19085550199"},
+        ),
+    ],
+)
+async def test_suggest_targets_returns_the_recipient_the_old_derivation_would_have_produced(event, expected_hints):
+    """These are the exact wake fixtures the retired execute-gating
+    derivation used to enforce for EMAIL_SEND/QUO_SMS_SEND.
+    suggest_targets() is the demoted, advisory home for that same
+    resolution -- it must keep producing the same values, just as a hint
+    instead of a gate."""
+    loader = ActionContextLoader(FakeRepository(event), policy())
+    hints = await loader.suggest_targets(event.wakeup_event_id)
+    for key, value in expected_hints.items():
+        assert hints[key] == value
+
+
+@pytest.mark.asyncio
+async def test_suggest_targets_has_no_cliq_or_calendar_hint_since_routing_is_config_not_wake_derived():
+    """Cliq channel/chat and calendar selection were never derived from wake
+    content -- they were static operator config keyed by intent/profile, the
+    same for every wake regardless of what it contains. There is nothing for
+    suggest_targets to offer here; the agent supplies channel_or_chat_id and
+    calendar_id directly."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+    assert "channel_or_chat_id" not in hints
+    assert "calendar_id" not in hints
+
+
 
 
 @pytest.mark.asyncio
@@ -707,7 +778,9 @@ async def test_rollout_policy_rejects_cross_channel_provider_route():
     )
 
     with pytest.raises(ContextDerivationError, match="provider operation is disabled"):
-        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(request(operation="quo.sms.send"))
+        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(
+            request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Friday at 10:30 works.\r\n— Nigel"})
+        )
 
 
 @pytest.mark.asyncio
@@ -723,7 +796,11 @@ async def test_rollout_policy_rejects_unapproved_intent():
 
 
 @pytest.mark.asyncio
-async def test_participant_only_zillow_proxy_drives_provider_target_and_thread():
+async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_suggest():
+    """thread_identity/conversation_id bucketing is unrelated to target
+    selection and stays wake-derived. The recipient itself now comes from
+    the agent's arguments (repointed from the old direct target assertion);
+    suggest_targets is checked to still surface the same address as a hint."""
     event = record(
         message_source="zoho_mail",
         source_channel_id="INBOX",
@@ -739,13 +816,18 @@ async def test_participant_only_zillow_proxy_drives_provider_target_and_thread()
             },
         },
     )
+    loader = ActionContextLoader(FakeRepository(event), policy())
 
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+    context = await loader.load(
+        request(arguments={"to_address": "relay-only@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
+    )
+    hints = await loader.suggest_targets(event.wakeup_event_id)
 
     assert context.source == "zillow"
     assert context.target.target_id == "relay-only@convo.zillow.com"
     assert context.thread_identity == "relay-only@convo.zillow.com"
     assert context.conversation_id == "conversation:zillow:relay-only@convo.zillow.com"
+    assert hints["to_address"] == "relay-only@convo.zillow.com"
 
 
 @pytest.mark.asyncio
@@ -807,7 +889,13 @@ async def test_zillow_information_about_subject_derives_listing_address():
 
 
 @pytest.mark.asyncio
-async def test_explicit_zillow_provider_rejects_generic_participant_email():
+async def test_zillow_wake_with_no_proxy_offers_no_email_suggestion_but_execute_still_honors_the_agent():
+    """The retired derivation required a Zillow reply to go to the rotating
+    @convo.zillow.com proxy; a generic participant address (a plain gmail
+    one) produced no safe target and rejected the execute outright. That
+    ownership-style gate is gone: suggest_targets faithfully reports it has
+    nothing to offer (no to_address hint) for this wake, but the agent's own
+    choice of recipient is honored by execute regardless."""
     event = record(
         participant_type="email_address",
         participant_key="prospect@gmail.com",
@@ -817,9 +905,16 @@ async def test_explicit_zillow_provider_rejects_generic_participant_email():
             "message": {"property": "138 Bullman St #144-A"},
         },
     )
+    loader = ActionContextLoader(FakeRepository(event), policy())
 
-    with pytest.raises(ContextDerivationError, match="verified target"):
-        await ActionContextLoader(FakeRepository(event), policy()).load(request())
+    hints = await loader.suggest_targets(event.wakeup_event_id)
+    context = await loader.load(
+        request(arguments={"to_address": "prospect@gmail.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
+    )
+
+    assert "to_address" not in hints
+    assert context.target.target_id == "prospect@gmail.com"
+    assert context.target.verified is True
 
 
 @pytest.mark.asyncio
@@ -853,6 +948,7 @@ async def test_live_shape_quo_phone_number_and_nested_conversation_are_canonical
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
+            arguments={"to_phone": "+19085550199", "text": "Thanks"},
         )
     )
 
@@ -904,7 +1000,7 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"text": "Hi, we missed your call. How can we help? — Nigel"},
+            arguments={"to_phone": "+19085550140", "text": "Hi, we missed your call. How can we help? — Nigel"},
         )
     )
 
@@ -942,6 +1038,7 @@ async def test_quo_inbound_uses_observed_receiving_line_over_default_route():
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
+            arguments={"to_phone": "+19085550199", "text": "Thanks"},
         )
     )
 
@@ -985,11 +1082,14 @@ async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
+            arguments={"to_phone": "+19085550199", "text": "Thanks"},
         )
     )
     assert inquiry.intent_kind.value == "inquiry_reply"
     with pytest.raises(ContextDerivationError, match="provider intent is disabled"):
-        await ActionContextLoader(FakeRepository(event), restricted).load(request(operation="quo.sms.send"))
+        await ActionContextLoader(FakeRepository(event), restricted).load(
+            request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})
+        )
 
 
 @pytest.mark.asyncio
@@ -998,11 +1098,13 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
     repo = FakeRepository(event)
     loader = ActionContextLoader(repo, policy())
     first = await loader.load(request())
-    second = await loader.load(request(arguments={"text": "Friday at 10:30 works.\n— Nigel"}))
+    second = await loader.load(
+        request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"})
+    )
     assert first.action_id == second.action_id
     assert first.action_id.version == 5
     assert first.payload_hash == second.payload_hash
-    assert first.arguments == {"text": "Friday at 10:30 works.\n— Nigel"}
+    assert first.arguments == {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"}
     assert tuple(sorted(first.aliases)) == first.aliases
 
 
@@ -1198,18 +1300,32 @@ async def test_duplicate_provider_and_property_aliases_converge():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_aliases_and_unverified_targets_fail_closed():
+async def test_ambiguous_aliases_still_fail_closed_but_unresolvable_wake_no_longer_blocks_execute():
+    """Alias ambiguity is unrelated to target selection and still fails
+    closed. The second half used to also fail closed when the wake itself
+    carried no usable email anywhere (participant_key="unknown", no proxy/
+    direct email) -- that was the retired target-derivation gate. Now the
+    agent's own address is all that is required; suggest_targets honestly
+    has nothing to offer, but execute is unaffected."""
     with pytest.raises(ContextDerivationError, match="ambiguous"):
         await ActionContextLoader(FakeRepository(record(), ambiguous=True), policy()).load(request())
-    unsafe = record(
+    unresolvable = record(
         participant_key="unknown",
         envelope={
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
             "message": {"property": "144 Bullman Street"},
         },
     )
-    with pytest.raises(ContextDerivationError, match="verified target"):
-        await ActionContextLoader(FakeRepository(unsafe), policy()).load(request())
+    loader = ActionContextLoader(FakeRepository(unresolvable), policy())
+
+    hints = await loader.suggest_targets(unresolvable.wakeup_event_id)
+    context = await loader.load(
+        request(arguments={"to_address": "agent-chosen@example.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
+    )
+
+    assert "to_address" not in hints
+    assert context.target.target_id == "agent-chosen@example.com"
+    assert context.target.verified is True
 
 
 @pytest.mark.asyncio
@@ -1221,7 +1337,13 @@ async def test_ambiguous_aliases_and_unverified_targets_fail_closed():
         "postmaster@example.com",
     ),
 )
-async def test_system_sender_cannot_become_customer_email_target(unsafe_address):
+async def test_system_sender_offers_no_suggestion_but_execute_still_honors_the_agent(unsafe_address):
+    """The retired derivation refused to let a system/no-reply address (or,
+    for Zillow, any non-@convo.zillow.com address) become the target.
+    suggest_targets still reports nothing usable here, but execute no
+    longer gates on it -- the agent's own choice of recipient controls,
+    even one an operator might consider unwise. That is the point of this
+    task: the gateway validates format, not judgement."""
     unsafe = record(
         participant_key=unsafe_address,
         envelope={
@@ -1232,9 +1354,16 @@ async def test_system_sender_cannot_become_customer_email_target(unsafe_address)
             },
         },
     )
+    loader = ActionContextLoader(FakeRepository(unsafe), policy())
 
-    with pytest.raises(ContextDerivationError, match="verified target"):
-        await ActionContextLoader(FakeRepository(unsafe), policy()).load(request())
+    hints = await loader.suggest_targets(unsafe.wakeup_event_id)
+    context = await loader.load(
+        request(arguments={"to_address": unsafe_address, "text": "Friday at 10:30 works.\r\n— Nigel"})
+    )
+
+    assert "to_address" not in hints
+    assert context.target.target_id == unsafe_address
+    assert context.target.verified is True
 
 
 @pytest.mark.asyncio
@@ -1284,3 +1413,160 @@ async def test_repository_event_query_survives_literal_empty_json_object():
     loaded = await OutboundGatewayRepository(Driver()).load_wake_event(12345)
 
     assert loaded.wakeup_event_id == 12345
+
+
+# ============================================================================
+# Adversarial identity tests (Task 5, Step 5)
+#
+# These prove that removing server-side target derivation as an execute()
+# gate did not reopen the wrong-recipient/duplicate-send hazards that gate
+# used to guard against. For each limit-pushing wake shape below: the send
+# goes exactly where the agent said and nowhere the wake's own data implies,
+# and suggest_targets() still offers the id the retired derivation would
+# have produced.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_adversarial_quo_shared_line_send_goes_only_to_agent_supplied_phone():
+    """"Quo channel is a line, not a conversation" (the class of bug that
+    killed PR #158): a Quo phone line is shared by many counterparties, so
+    any identity derived from the wake's own channel/participant data risks
+    collapsing distinct prospects onto each other. This wake's own data
+    implies counterparty A's number (+19085550001, the message.phone /
+    participant_key the retired derivation would have used to build
+    recipient_phone). The agent instead names counterparty B
+    (+19085559999) on the very same shared-line wake. The send must go to
+    B and only B -- not to A, and not to some channel-wide bucket id."""
+    event = record(
+        event_source="quo",
+        message_source="quo",
+        source_channel_id="quo-shared-line-18",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550001",
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "quo-shared-line-18",
+                    "phoneNumberId": "leasing-main",
+                    "direction": "incoming",
+                    "from": "+19085550001",
+                }
+            }
+        },
+        envelope={
+            "identity": {},
+            "message": {"property": "16 N Main St #16", "phone": "+1 908 555 0001"},
+        },
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    hints = await loader.suggest_targets(event.wakeup_event_id)
+    context = await loader.load(
+        request(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"to_phone": "+19085559999", "text": "Thanks for reaching out"},
+        )
+    )
+
+    # The wake's own data (what the retired derivation, and today's
+    # suggest_targets, would use) points at counterparty A.
+    assert hints["to_phone"] == "+19085550001"
+    # The agent named counterparty B -- the send follows the agent exactly,
+    # never falling back to the shared line's other-counterparty history.
+    assert context.target.kind == "quo_conversation"
+    assert context.target.target_id == "+19085559999"
+    assert context.recipient_phone == "+19085559999"
+    assert context.target.verified is True
+
+
+@pytest.mark.asyncio
+async def test_adversarial_zillow_rotating_proxy_send_goes_only_to_agent_supplied_address():
+    """A Zillow lead's reply-to address is a rotating per-lead
+    @convo.zillow.com proxy. The retired derivation enforced replies go
+    *only* to that exact proxy (require_zillow_proxy=True) and would flatly
+    reject any other address, including the prospect's own real inbox. The
+    agent here deliberately supplies a different, non-proxy address; the
+    send must go there and only there -- the old proxy-only restriction is
+    no longer an execute-time gate -- while suggest_targets still reports
+    the rotating proxy the wake implies."""
+    event = record(
+        participant_type="email_address",
+        participant_key="rotation-88f3@convo.zillow.com",
+        raw_payload={"provider": "zillow", "thread_id": "zrm-thread-88f3"},
+        envelope={
+            "identity": {},
+            "message": {
+                "prospect_name": "New Prospect",
+                "property": "138 Bullman St #144-A",
+                "proxy_email": "rotation-88f3@convo.zillow.com",
+            },
+        },
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    hints = await loader.suggest_targets(event.wakeup_event_id)
+    context = await loader.load(
+        request(arguments={"to_address": "prospect-direct@gmail.com", "text": "Thanks for reaching out"})
+    )
+
+    # suggest still surfaces exactly the rotating proxy the retired
+    # derivation would have enforced.
+    assert hints["to_address"] == "rotation-88f3@convo.zillow.com"
+    # execute honors the agent's own choice even though it disagrees with
+    # (and would have been rejected by) the old Zillow-proxy-only rule.
+    assert context.target.kind == "email_thread"
+    assert context.target.target_id == "prospect-direct@gmail.com"
+    assert context.target.verified is True
+
+
+@pytest.mark.asyncio
+async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contaminate_ids():
+    """Cliq channel posts and direct chat posts are different provider
+    surfaces (a public channel vs. a 1:1 DM) that used to share one static,
+    intent-keyed config value (cliq_target_by_intent) regardless of which
+    of the two operations was invoked. Now each execute carries its own
+    channel_or_chat_id. On the very same triggering wake: a channel post
+    and a chat post must each land on exactly the id their own request
+    carried, never on the other's id and never on the old static config
+    default ("tenant-leads")."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    channel_context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "team-leads-public-channel", "text": "New lead"},
+        )
+    )
+    chat_context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.chat.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "nigel-direct-chat", "text": "New lead"},
+        )
+    )
+
+    assert channel_context.target.kind == "cliq_channel"
+    assert channel_context.target.target_id == "team-leads-public-channel"
+    assert chat_context.target.kind == "cliq_chat"
+    assert chat_context.target.target_id == "nigel-direct-chat"
+    # Neither execute fell back to the old static per-intent config value.
+    assert "tenant-leads" not in {channel_context.target.target_id, chat_context.target.target_id}

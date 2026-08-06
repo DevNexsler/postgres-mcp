@@ -181,13 +181,14 @@ def create_server(
         name="outbound_action",
         description=(
             "Execute or inspect one durable outbound email, Quo, Cliq, calendar, or "
-            "TenantCloud action. Recipients, accounts, and provider targets are derived "
-            "from wakeup_event_id. Use suggest ({\"op\": \"suggest\", \"wakeup_event_id\"}) "
-            "to ask what the wake implies -- it returns advisory target ids (e.g. "
-            "thread_id, lead_id) drawn from the wake, never blocks, and stays reachable "
-            "even when writes are disabled. Its answer is a suggestion only: an agent "
-            "may pass any target id it likes to execute, including ones that disagree "
-            "with suggest."
+            "TenantCloud action. You choose the target id (to_address, to_phone, "
+            "channel_or_chat_id, calendar_id, thread_id, lead_id, etc.) as part of "
+            "arguments -- it is never derived from wakeup_event_id for you. Use suggest "
+            "({\"op\": \"suggest\", \"wakeup_event_id\"}) to ask what the wake implies "
+            "-- it returns advisory target ids drawn from the wake, never blocks, and "
+            "stays reachable even when writes are disabled. Its answer is a suggestion "
+            "only: you may pass any target id you like to execute, including ones that "
+            "disagree with suggest."
         ),
         structured_output=True,
     )
