@@ -19,7 +19,11 @@ from uuid import uuid5
 from .models import ActionRole
 from .models import ExecuteRequest
 from .models import IntentKind
+from .models import LeadStatusArguments
+from .models import MaintenanceCreateArguments
+from .models import MaintenanceStatusArguments
 from .models import Operation
+from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
 from .repository import WakeEventRecord
 
@@ -207,16 +211,6 @@ class ActionContextLoader:
         message = _mapping(envelope.get("message"))
         raw = _mapping(record.raw_payload)
         provider = self._provider(record, raw, message)
-        tenantcloud_claim_id: int | None = None
-        tenantcloud_family: str | None = None
-        provider_ids: dict[str, str] = {}
-        if request.operation in _TENANTCLOUD_OPERATIONS:
-            tenantcloud_claim_id, tenantcloud_family, provider_ids = self._tenantcloud_identity(
-                request,
-                record,
-                envelope,
-                provider,
-            )
         if self._policy.enabled_operations_by_provider:
             allowed_operations = self._policy.enabled_operations_by_provider.get(
                 provider,
@@ -239,13 +233,14 @@ class ActionContextLoader:
         if property_scope and property_id is None:
             property_id = f"property:{property_scope.replace(' ', '-')}"
         if request.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
-            property_id = provider_ids["property_id"]
+            assert isinstance(request.arguments, MaintenanceCreateArguments)
+            property_id = str(request.arguments.property_id)
 
         aliases = self._aliases(record, envelope, message, raw)
         if (
             not aliases
             and request.action_role is not ActionRole.INTERNAL_NOTIFICATION
-            and tenantcloud_claim_id is None
+            and request.operation not in _TENANTCLOUD_OPERATIONS
         ):
             raise ContextDerivationError("no stable prospect aliases")
         if aliases:
@@ -255,8 +250,8 @@ class ActionContextLoader:
             prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
         else:
             prospect_id = (
-                f"tenantcloud:claim:{tenantcloud_claim_id}"
-                if tenantcloud_claim_id is not None
+                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
+                if record.tenantcloud_claim_id is not None
                 else "internal:none"
             )
 
@@ -274,7 +269,6 @@ class ActionContextLoader:
             thread_identity,
             message,
             raw,
-            provider_ids,
         )
         if not target.verified:
             raise ContextDerivationError("verified target could not be derived")
@@ -324,17 +318,11 @@ class ActionContextLoader:
         )
 
         arguments = MappingProxyType(request.arguments.model_dump(mode="json", exclude_none=False))
-        if tenantcloud_claim_id is not None:
-            desired_state: dict[str, Any] = dict(arguments)
-            if request.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
-                desired_state.update(
-                    property_id=provider_ids["property_id"],
-                    unit_id=provider_ids["unit_id"],
-                )
-            desired_state_hash = canonical_payload_hash(desired_state)
+        if request.operation in _TENANTCLOUD_OPERATIONS:
+            desired_state_hash = canonical_payload_hash(dict(arguments))
             canonical_scope = {
                 "version": "v1",
-                "tenantcloud_claim_id": tenantcloud_claim_id,
+                "tenantcloud_claim_id": record.tenantcloud_claim_id,
                 "source_event_id": record.source_event_id,
                 "operation": request.operation.value,
                 "target_id": target.target_id,
@@ -377,14 +365,19 @@ class ActionContextLoader:
             "cross_channel_duplicate_message_ids": list(cross_channel_duplicate_message_ids),
             "certified_older_message_ids": list(certified_older_message_ids),
         }
-        if tenantcloud_claim_id is not None:
+        if request.operation in _TENANTCLOUD_OPERATIONS:
             canonical_context_data.update(
-                tenantcloud_claim_id=tenantcloud_claim_id,
-                tenantcloud_claim_family=tenantcloud_family,
+                tenantcloud_claim_id=record.tenantcloud_claim_id,
+                tenantcloud_claim_family=record.tenantcloud_claim_family,
                 source_event_id=record.source_event_id,
                 operation_target={"kind": target.kind, "target_id": target.target_id},
-                provider_ids=provider_ids,
             )
+            if request.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
+                assert isinstance(request.arguments, MaintenanceCreateArguments)
+                canonical_context_data["provider_ids"] = {
+                    "property_id": str(request.arguments.property_id),
+                    "unit_id": str(request.arguments.unit_id),
+                }
         canonical_context = MappingProxyType(canonical_context_data)
         payload_hash = canonical_payload_hash(
             {
@@ -434,6 +427,14 @@ class ActionContextLoader:
             cross_channel_duplicate_message_ids=cross_channel_duplicate_message_ids,
             certified_older_message_ids=certified_older_message_ids,
         )
+
+    async def suggest_targets(self, wakeup_event_id: int) -> dict[str, str]:
+        """Best-effort target ids implied by a wake. Advisory only: never raises,
+        returns {} when the wake implies nothing."""
+        record = await self._repository.load_wake_event(wakeup_event_id)
+        if record is None:
+            return {}
+        return self._wake_tenantcloud_hints(record)
 
     @staticmethod
     def _certified_older_message_ids(
@@ -674,30 +675,20 @@ class ActionContextLoader:
         thread_identity: str,
         message: Mapping[str, Any],
         raw: Mapping[str, Any],
-        provider_ids: Mapping[str, str],
     ) -> tuple[DerivedTarget, str]:
         if request.operation is Operation.TENANTCLOUD_MESSAGE_SEND:
-            thread_id = provider_ids.get("thread_id", "")
-            return DerivedTarget("tenantcloud_thread", thread_id, bool(thread_id)), "tenantcloud"
+            assert isinstance(request.arguments, TenantCloudMessageArguments)
+            return DerivedTarget("tenantcloud_thread", str(request.arguments.thread_id), True), "tenantcloud"
         if request.operation is Operation.TENANTCLOUD_LEAD_STATUS_UPDATE:
-            lead_id = provider_ids.get("lead_id", "")
-            return DerivedTarget("tenantcloud_lead", lead_id, bool(lead_id)), "tenantcloud"
+            assert isinstance(request.arguments, LeadStatusArguments)
+            return DerivedTarget("tenantcloud_lead", str(request.arguments.lead_id), True), "tenantcloud"
         if request.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
-            property_id = provider_ids.get("property_id", "")
-            unit_id = provider_ids.get("unit_id", "")
-            target_id = f"property:{property_id}:unit:{unit_id}"
-            return DerivedTarget(
-                "tenantcloud_property_unit",
-                target_id,
-                bool(property_id and unit_id),
-            ), "tenantcloud"
+            assert isinstance(request.arguments, MaintenanceCreateArguments)
+            target_id = f"property:{request.arguments.property_id}:unit:{request.arguments.unit_id}"
+            return DerivedTarget("tenantcloud_property_unit", target_id, True), "tenantcloud"
         if request.operation is Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE:
-            request_id = provider_ids.get("request_id", "")
-            return DerivedTarget(
-                "tenantcloud_maintenance_request",
-                request_id,
-                bool(request_id),
-            ), "tenantcloud"
+            assert isinstance(request.arguments, MaintenanceStatusArguments)
+            return DerivedTarget("tenantcloud_maintenance_request", str(request.arguments.request_id), True), "tenantcloud"
         if request.operation is Operation.EMAIL_SEND:
             proxy = replyable_email(
                 _nonblank(message.get("proxy_email") or message.get("zillow_proxy_email") or raw.get("proxy_email") or raw.get("zillow_proxy_email")),
@@ -751,17 +742,18 @@ class ActionContextLoader:
         account = self._policy.calendar_account_by_profile.get(profile, calendar)
         return DerivedTarget("calendar", calendar, bool(calendar and account)), account
 
-    @staticmethod
-    def _tenantcloud_identity(
-        request: ExecuteRequest,
-        record: WakeEventRecord,
-        envelope: Mapping[str, Any],
-        provider: str,
-    ) -> tuple[int, str, dict[str, str]]:
+    def _wake_tenantcloud_hints(self, record: WakeEventRecord) -> dict[str, str]:
+        """Best-effort provider ids implied by a wake's TenantCloud claim
+        linkage. Advisory only -- never raises; returns {} on anything
+        missing or inconsistent instead of rejecting the wake."""
+        envelope = _mapping(record.envelope)
+        message = _mapping(envelope.get("message"))
+        raw = _mapping(record.raw_payload)
+        provider = self._provider(record, raw, message)
         if record.event_source not in {"tenantcloud_api", "tenantcloud_claim"}:
-            raise ContextDerivationError("TenantCloud source is required")
+            return {}
         if provider != "tenantcloud" or record.message_source != "tenantcloud_api":
-            raise ContextDerivationError("TenantCloud provider is required")
+            return {}
         trusted = _mapping(envelope.get("tenantcloud"))
         row_claim_id = record.tenantcloud_claim_id
         envelope_claim_id = trusted.get("claim_id")
@@ -772,39 +764,23 @@ class ActionContextLoader:
             or type(envelope_claim_id) is not int
             or envelope_claim_id != row_claim_id
         ):
-            raise ContextDerivationError("TenantCloud claim linkage is invalid")
+            return {}
         row_state = record.tenantcloud_claim_state
         if row_state not in {"claimed", "running"} or trusted.get("claim_state") != row_state:
-            raise ContextDerivationError("TenantCloud claim state is not operational")
+            return {}
         row_owner = record.tenantcloud_action_owner
         if row_owner != "tenantcloud_api" or trusted.get("action_owner") != row_owner:
-            raise ContextDerivationError("TenantCloud claim owner is unauthorized")
+            return {}
         family = record.tenantcloud_claim_family
         if family not in {"lead", "maintenance"} or trusted.get("event_family") != family:
-            raise ContextDerivationError("TenantCloud claim family is invalid")
-        expected_family = (
-            "lead"
-            if request.operation
-            in {
-                Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
-            }
-            else "maintenance"
-            if request.operation
-            in {
-                Operation.TENANTCLOUD_MAINTENANCE_CREATE,
-                Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
-            }
-            else family
-        )
-        if family != expected_family:
-            raise ContextDerivationError("TenantCloud operation uses wrong claim family")
+            return {}
 
         raw_ids = trusted.get("entity_ids")
         if not isinstance(raw_ids, Mapping):
-            raise ContextDerivationError("TenantCloud provider IDs are missing")
+            return {}
         allowed_keys = {"lead_id", "listing_id", "thread_id"} if family == "lead" else {"request_id", "property_id", "unit_id", "thread_id"}
         if any(type(key) is not str or key not in allowed_keys for key in raw_ids):
-            raise ContextDerivationError("TenantCloud provider ID aliases conflict")
+            return {}
         provider_ids: dict[str, str] = {}
         for key, value in raw_ids.items():
             if type(value) is int:
@@ -812,32 +788,24 @@ class ActionContextLoader:
             elif type(value) is str:
                 candidate = value
             else:
-                raise ContextDerivationError("TenantCloud provider ID is invalid")
+                return {}
             if not _TENANTCLOUD_ID.fullmatch(candidate):
-                raise ContextDerivationError("TenantCloud provider ID is invalid")
+                return {}
             parsed = int(candidate)
             if parsed > 9_223_372_036_854_775_807:
-                raise ContextDerivationError("TenantCloud provider ID is invalid")
+                return {}
             provider_ids[key] = str(parsed)
 
-        required = {
-            Operation.TENANTCLOUD_MESSAGE_SEND: {"thread_id"},
-            Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"lead_id"},
-            Operation.TENANTCLOUD_MAINTENANCE_CREATE: {"property_id", "unit_id"},
-            Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"request_id"},
-        }[request.operation]
-        if not required.issubset(provider_ids):
-            raise ContextDerivationError("TenantCloud operation target IDs are missing")
         thread_id = provider_ids.get("thread_id")
         if thread_id is not None:
             expected_channel = f"tenantcloud:{family}-thread:{thread_id}"
             if record.source_channel_id != expected_channel:
-                raise ContextDerivationError("TenantCloud channel thread conflicts with provider ID")
+                return {}
         if record.channel_type != f"tenantcloud_{family}":
-            raise ContextDerivationError("TenantCloud channel family conflicts with claim")
+            return {}
         if not _nonblank(record.source_event_id):
-            raise ContextDerivationError("TenantCloud source event ID is missing")
-        return row_claim_id, family, provider_ids
+            return {}
+        return provider_ids
 
     @staticmethod
     def _scope(

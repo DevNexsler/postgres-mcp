@@ -163,17 +163,19 @@ def tenantcloud_request(operation):
         "tenantcloud.message.send": {
             "action_role": "prospect_reply",
             "intent_kind": "inquiry_reply",
-            "arguments": {"text": "Thanks"},
+            "arguments": {"thread_id": 8001, "text": "Thanks"},
         },
         "tenantcloud.lead.status.update": {
             "action_role": "provider_mutation",
             "intent_kind": "tenantcloud_lead_status",
-            "arguments": {"status": "working"},
+            "arguments": {"lead_id": 6001, "status": "working"},
         },
         "tenantcloud.maintenance.create": {
             "action_role": "provider_mutation",
             "intent_kind": "tenantcloud_maintenance_create",
             "arguments": {
+                "property_id": 12,
+                "unit_id": 34,
                 "category_id": 57,
                 "title": "Kitchen leak",
                 "priority": "normal",
@@ -186,7 +188,7 @@ def tenantcloud_request(operation):
         "tenantcloud.maintenance.status.update": {
             "action_role": "provider_mutation",
             "intent_kind": "tenantcloud_maintenance_status",
-            "arguments": {"status": 3},
+            "arguments": {"request_id": 81, "status": 3},
         },
     }
     return request(operation=operation, appointment_slot=None, **cases[operation])
@@ -194,39 +196,53 @@ def tenantcloud_request(operation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("operation", "family", "entity_ids", "target_kind", "target_id"),
+    ("operation", "target_kind", "target_id"),
     [
-        (
-            "tenantcloud.message.send",
-            "lead",
-            {"lead_id": "6001", "thread_id": "8001"},
-            "tenantcloud_thread",
-            "8001",
-        ),
-        (
-            "tenantcloud.lead.status.update",
-            "lead",
-            {"lead_id": "6001", "thread_id": "8001"},
-            "tenantcloud_lead",
-            "6001",
-        ),
-        (
-            "tenantcloud.maintenance.create",
-            "maintenance",
-            {"property_id": "12", "unit_id": "34", "thread_id": "8201"},
-            "tenantcloud_property_unit",
-            "property:12:unit:34",
-        ),
-        (
-            "tenantcloud.maintenance.status.update",
-            "maintenance",
-            {"request_id": "81", "property_id": "12", "unit_id": "34", "thread_id": "8201"},
-            "tenantcloud_maintenance_request",
-            "81",
-        ),
+        ("tenantcloud.message.send", "tenantcloud_thread", "8001"),
+        ("tenantcloud.lead.status.update", "tenantcloud_lead", "6001"),
+        ("tenantcloud.maintenance.create", "tenantcloud_property_unit", "property:12:unit:34"),
+        ("tenantcloud.maintenance.status.update", "tenantcloud_maintenance_request", "81"),
     ],
 )
-async def test_tenantcloud_context_uses_only_claim_linked_provider_identity(operation, family, entity_ids, target_kind, target_id):
+async def test_tenantcloud_context_uses_agent_supplied_provider_targets(operation, target_kind, target_id):
+    """The four TenantCloud operations take their target straight off the
+    agent-supplied arguments -- the claim-linked entity_ids on the wake are
+    no longer consulted for this. canonical_context/canonical_scope still
+    carry the claim bookkeeping (tenantcloud_claim_id, source_event_id,
+    desired_state_hash) that store.py and the adapter depend on."""
+    event = tenantcloud_record()
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+
+    assert context.target.kind == target_kind
+    assert context.target.target_id == target_id
+    assert context.target.verified is True
+    assert context.provider_account == "tenantcloud"
+    assert context.canonical_context["tenantcloud_claim_id"] == 301
+    assert context.canonical_context["source_event_id"] == "tenantcloud:claim:301"
+    assert context.canonical_context["operation_target"] == {
+        "kind": target_kind,
+        "target_id": target_id,
+    }
+    assert context.canonical_context["routing_policy_version"] == "appointment-v1"
+    assert len(context.canonical_scope["desired_state_hash"]) == 64
+    if operation == "tenantcloud.maintenance.create":
+        assert context.canonical_context["provider_ids"] == {"property_id": "12", "unit_id": "34"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("family", "entity_ids"),
+    [
+        ("lead", {"lead_id": "6001", "thread_id": "8001"}),
+        ("maintenance", {"property_id": "12", "unit_id": "34", "thread_id": "8201"}),
+        ("maintenance", {"request_id": "81", "property_id": "12", "unit_id": "34", "thread_id": "8201"}),
+    ],
+)
+async def test_suggest_targets_returns_claim_linked_provider_ids(family, entity_ids):
+    """suggest_targets() is the demoted, advisory home for the derivation
+    that used to gate execute(): it still reads the wake's claim linkage,
+    but only to hint values back to the agent -- never to reject a write."""
     channel = f"tenantcloud:{family}-thread:{entity_ids['thread_id']}"
     event = tenantcloud_record(
         family=family,
@@ -235,43 +251,20 @@ async def test_tenantcloud_context_uses_only_claim_linked_provider_identity(oper
         channel_type=f"tenantcloud_{family}",
     )
 
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
-    assert context.target.kind == target_kind
-    assert context.target.target_id == target_id
-    assert context.provider_account == "tenantcloud"
-    assert context.canonical_context["tenantcloud_claim_id"] == 301
-    assert context.canonical_context["source_event_id"] == "tenantcloud:claim:301"
-    assert context.canonical_context["operation_target"] == {
-        "kind": target_kind,
-        "target_id": target_id,
-    }
-    assert context.canonical_context["provider_ids"] == entity_ids
-    assert context.canonical_context["routing_policy_version"] == "appointment-v1"
+    assert hints == entity_ids
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("operation", "record_overrides", "error"),
-    [
-        ("tenantcloud.lead.status.update", {"event_source": "zoho_mail"}, "source"),
-        ("tenantcloud.lead.status.update", {"event_source": "tenantcloud"}, "source"),
-        ("tenantcloud.lead.status.update", {"raw_payload": {"provider": "zillow"}}, "provider"),
-        ("tenantcloud.lead.status.update", {"message_source": "zoho_mail"}, "provider"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": None}, "claim"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": True}, "claim"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_claim_id": 302}, "claim"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_claim_state": "pending"}, "state"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_action_owner": "legacy"}, "owner"),
-        ("tenantcloud.lead.status.update", {"tenantcloud_claim_family": "maintenance"}, "family"),
-        ("tenantcloud.message.send", {"source_channel_id": "tenantcloud:lead-thread:9999"}, "thread"),
-    ],
-)
-async def test_tenantcloud_context_rejects_untrusted_claim_and_channel_shapes(operation, record_overrides, error):
-    event = tenantcloud_record(**record_overrides)
+async def test_suggest_targets_is_advisory_and_never_raises():
+    """A wake with no TenantCloud claim linkage at all yields {}, not an
+    error -- suggest_targets() must never reject."""
+    event = record()  # ordinary zoho_mail wake, no claim linkage whatsoever
 
-    with pytest.raises(ContextDerivationError, match=error):
-        await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+
+    assert hints == {}
 
 
 @pytest.mark.asyncio
@@ -288,31 +281,42 @@ async def test_tenantcloud_context_accepts_production_wake_sources(event_source)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("operation", "family", "entity_ids"),
-    [
-        ("tenantcloud.message.send", "lead", {"lead_id": "6001"}),
-        ("tenantcloud.lead.status.update", "lead", {"thread_id": "8001"}),
-        ("tenantcloud.lead.status.update", "lead", {"lead_id": True, "thread_id": "8001"}),
-        ("tenantcloud.lead.status.update", "lead", {"lead_id": "0", "thread_id": "8001"}),
-        ("tenantcloud.lead.status.update", "lead", {"lead_id": "6001 or 6002", "thread_id": "8001"}),
-        ("tenantcloud.lead.status.update", "lead", {"lead_id": "9223372036854775808", "thread_id": "8001"}),
-        ("tenantcloud.lead.status.update", "lead", {"lead_id": "6001", "leadId": "6002", "thread_id": "8001"}),
-        ("tenantcloud.maintenance.create", "maintenance", {"property_id": "12", "thread_id": "8201"}),
-        ("tenantcloud.maintenance.status.update", "maintenance", {"property_id": "12", "thread_id": "8201"}),
-        ("tenantcloud.maintenance.status.update", "lead", {"request_id": "81", "thread_id": "8001"}),
-    ],
-)
-async def test_tenantcloud_context_rejects_missing_conflicting_or_cross_family_ids(operation, family, entity_ids):
-    event = tenantcloud_record(
-        family=family,
-        entity_ids=entity_ids,
-        source_channel_id=f"tenantcloud:{family}-thread:{entity_ids.get('thread_id', '8001')}",
-        channel_type=f"tenantcloud_{family}",
+async def test_tenantcloud_target_comes_from_arguments_on_any_wake_shape():
+    event = record(  # ordinary zoho_mail / email_thread wake, no claim linkage
+        wakeup_event_id=1,
+        event_source="tenantcloud_claim",
+        message_source="zoho_mail",
+        channel_type="email_thread",
     )
+    request = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
+        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
+        "appointment_slot": None,
+        "arguments": {"lead_id": 2405115, "status": "working"},
+    })
 
-    with pytest.raises(ContextDerivationError):
-        await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request(operation))
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
+
+    assert context.target.kind == "tenantcloud_lead"
+    assert context.target.target_id == "2405115"
+    assert context.target.verified is True
+    assert context.provider_account == "tenantcloud"
+
+
+@pytest.mark.asyncio
+async def test_execute_ignores_a_target_that_disagrees_with_the_wake():
+    """The wake's own claim says lead 999; the agent says 2405115. The agent wins."""
+    event = tenantcloud_record(wakeup_event_id=1, entity_ids={"lead_id": "999"})
+    request = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
+        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
+        "appointment_slot": None,
+        "arguments": {"lead_id": 2405115, "status": "working"},
+    })
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
+
+    assert context.target.target_id == "2405115"
 
 
 @pytest.mark.asyncio
