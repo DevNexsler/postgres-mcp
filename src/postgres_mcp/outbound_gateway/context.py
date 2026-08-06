@@ -17,12 +17,17 @@ from uuid import UUID
 from uuid import uuid5
 
 from .models import ActionRole
+from .models import CalendarDeleteArguments
+from .models import CalendarDescriptionArguments
+from .models import CliqArguments
+from .models import EmailArguments
 from .models import ExecuteRequest
 from .models import IntentKind
 from .models import LeadStatusArguments
 from .models import MaintenanceCreateArguments
 from .models import MaintenanceStatusArguments
 from .models import Operation
+from .models import QuoSmsArguments
 from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
 from .repository import WakeEventRecord
@@ -309,9 +314,16 @@ class ActionContextLoader:
 
         source_subject = _nonblank(record.subject)
         prospect_name = _nonblank(message.get("prospect_name")) or _nonblank(record.display_name)
-        recipient_phone = normalize_phone(
-            _nonblank(message.get("phone")) or (record.participant_key if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
-        )
+        if request.operation is Operation.QUO_SMS_SEND:
+            # The agent's target is the actual SMS destination -- do not fall
+            # back to a wake-derived phone, which is exactly the "channel is
+            # a line, not a conversation" hazard this task removes.
+            assert isinstance(request.arguments, QuoSmsArguments)
+            recipient_phone = request.arguments.to_phone
+        else:
+            recipient_phone = normalize_phone(
+                _nonblank(message.get("phone")) or (record.participant_key if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
+            )
         refresh_evidence = _mapping(raw.get("zillow_refresh") or envelope.get("zillow_refresh"))
         cross_channel_duplicate_message_ids = self._cross_channel_duplicate_message_ids(
             record,
@@ -440,7 +452,51 @@ class ActionContextLoader:
         record = await self._repository.load_wake_event(wakeup_event_id)
         if record is None:
             return {}
-        return self._wake_tenantcloud_hints(record)
+        hints = dict(self._wake_tenantcloud_hints(record))
+        hints.update(self._wake_recipient_hints(record))
+        return hints
+
+    def _wake_recipient_hints(self, record: WakeEventRecord) -> dict[str, str]:
+        """Best-effort email/phone recipient a wake implies -- the same
+        proxy/direct/participant resolution (Zillow-proxy-only rule
+        included) that used to gate EMAIL_SEND and QUO_SMS_SEND's execute().
+        Advisory only: keys are present only when a value can be derived,
+        never raises, and disagreeing with what the agent sends to execute
+        is expected and not an error."""
+        envelope = _mapping(record.envelope)
+        message = _mapping(envelope.get("message"))
+        raw = _mapping(record.raw_payload)
+        provider = self._provider(record, raw, message)
+        hints: dict[str, str] = {}
+        to_address = self._wake_email_hint(record, provider, message, raw)
+        if to_address:
+            hints["to_address"] = to_address
+        to_phone = normalize_phone(
+            _nonblank(message.get("phone")) or (record.participant_key if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
+        )
+        if to_phone:
+            hints["to_phone"] = to_phone
+        return hints
+
+    @staticmethod
+    def _wake_email_hint(
+        record: WakeEventRecord,
+        provider: str,
+        message: Mapping[str, Any],
+        raw: Mapping[str, Any],
+    ) -> str | None:
+        proxy = replyable_email(
+            _nonblank(message.get("proxy_email") or message.get("zillow_proxy_email") or raw.get("proxy_email") or raw.get("zillow_proxy_email")),
+            require_zillow_proxy=provider in _ZILLOW_PROVIDER_FAMILY,
+        )
+        direct = replyable_email(_nonblank(message.get("direct_email")))
+        participant = replyable_email(
+            record.participant_key
+            if record.participant_type in _EMAIL_PARTICIPANT_TYPES and record.channel_type in {"email", "email_thread"}
+            else None,
+            require_zillow_proxy=provider in _ZILLOW_PROVIDER_FAMILY,
+        )
+        return (proxy or participant) if provider in _ZILLOW_PROVIDER_FAMILY else (proxy or direct or participant)
 
     @staticmethod
     def _certified_older_message_ids(
@@ -696,26 +752,11 @@ class ActionContextLoader:
             assert isinstance(request.arguments, MaintenanceStatusArguments)
             return DerivedTarget("tenantcloud_maintenance_request", str(request.arguments.request_id), True), "tenantcloud"
         if request.operation is Operation.EMAIL_SEND:
-            proxy = replyable_email(
-                _nonblank(message.get("proxy_email") or message.get("zillow_proxy_email") or raw.get("proxy_email") or raw.get("zillow_proxy_email")),
-                require_zillow_proxy=provider in _ZILLOW_PROVIDER_FAMILY,
-            )
-            direct = replyable_email(_nonblank(message.get("direct_email")))
-            participant = replyable_email(
-                record.participant_key
-                if record.participant_type in _EMAIL_PARTICIPANT_TYPES and record.channel_type in {"email", "email_thread"}
-                else None,
-                require_zillow_proxy=provider in _ZILLOW_PROVIDER_FAMILY,
-            )
-            target = proxy or participant if provider in _ZILLOW_PROVIDER_FAMILY else proxy or direct or participant
-            target = target or ""
+            assert isinstance(request.arguments, EmailArguments)
             account = self._policy.email_account_by_provider.get(provider, "")
-            return DerivedTarget("email_thread", target, bool(account and _EMAIL.fullmatch(target))), account
+            return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
-            phone = normalize_phone(
-                _nonblank(message.get("phone"))
-                or (_nonblank(record.participant_key) if record.participant_type in _PHONE_PARTICIPANT_TYPES else None)
-            )
+            assert isinstance(request.arguments, QuoSmsArguments)
             configured_account = self._policy.quo_line_by_provider.get(provider, "")
             nested = _mapping(_mapping(raw.get("data")).get("object"))
             observed_account = _nonblank(nested.get("phoneNumberId") or nested.get("phone_number_id"))
@@ -725,28 +766,27 @@ class ActionContextLoader:
                 "incoming",
                 "received",
             }
-            # A Quo inbound webhook is server-side provider evidence for both
-            # recipient and receiving line.  Use that exact line for replies;
-            # one configured default cannot represent multiple PFG lines.
+            # A Quo inbound webhook is server-side provider evidence for the
+            # receiving line.  Use that exact line for replies; one
+            # configured default cannot represent multiple PFG lines. This is
+            # account/line selection, not recipient identity -- the agent's
+            # to_phone (above) is the only thing that decides who receives
+            # the message.
             account = (
                 observed_account
                 if provider == "quo" and observed_account and observed_inbound
                 else configured_account
             )
-            target_id = thread_identity if provider == "quo" else phone or ""
-            return DerivedTarget(
-                "quo_conversation",
-                target_id,
-                bool(account and target_id and phone and (not observed_account or observed_account == account)),
-            ), account
+            return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
-            target_id = self._policy.cliq_target_by_intent.get(request.intent_kind.value, "")
+            assert isinstance(request.arguments, CliqArguments)
             kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
-            return DerivedTarget(kind, target_id, bool(target_id)), target_id
+            return DerivedTarget(kind, request.arguments.channel_or_chat_id, True), request.arguments.channel_or_chat_id
+        assert isinstance(request.arguments, (CalendarDescriptionArguments, CalendarDeleteArguments))
         profile = "appointment-setter"
-        calendar = self._policy.calendar_by_profile.get(profile, "")
-        account = self._policy.calendar_account_by_profile.get(profile, calendar)
-        return DerivedTarget("calendar", calendar, bool(calendar and account)), account
+        configured_calendar = self._policy.calendar_by_profile.get(profile, "")
+        account = self._policy.calendar_account_by_profile.get(profile, configured_calendar)
+        return DerivedTarget("calendar", request.arguments.calendar_id, True), account
 
     def _wake_tenantcloud_hints(self, record: WakeEventRecord) -> dict[str, str]:
         """Best-effort provider ids implied by a wake's TenantCloud claim

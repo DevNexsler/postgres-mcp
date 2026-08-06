@@ -6,13 +6,15 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from postgres_mcp.outbound_gateway.models import CalendarDeleteArguments
 from postgres_mcp.outbound_gateway.models import CalendarDescriptionArguments
-from postgres_mcp.outbound_gateway.models import EmptyArguments
+from postgres_mcp.outbound_gateway.models import CliqArguments
+from postgres_mcp.outbound_gateway.models import EmailArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.models import QuoSmsArguments
 from postgres_mcp.outbound_gateway.models import StatusRequest
 from postgres_mcp.outbound_gateway.models import SuggestRequest
-from postgres_mcp.outbound_gateway.models import TextArguments
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 
 
@@ -24,7 +26,7 @@ def execute_payload(**overrides):
         "operation": "email.send",
         "intent_kind": "showing_offer",
         "appointment_slot": "2026-07-17T10:30:00-04:00",
-        "arguments": {"text": "Hello"},
+        "arguments": {"to_address": "prospect@example.com", "text": "Hello"},
     }
     payload.update(overrides)
     return payload
@@ -36,7 +38,7 @@ def test_execute_has_exact_required_top_level_contract():
     assert request.wakeup_event_id == 12345
     assert request.appointment_slot.isoformat() == "2026-07-17T14:30:00+00:00"
     assert request.appointment_slot.tzinfo == timezone.utc
-    assert isinstance(request.arguments, TextArguments)
+    assert isinstance(request.arguments, EmailArguments)
 
     for field in (
         "op",
@@ -63,16 +65,37 @@ def test_execute_rejects_unknown_fields_and_non_positive_or_non_integer_wake_ids
 @pytest.mark.parametrize(
     ("operation", "role", "intent", "slot", "arguments", "argument_type"),
     [
-        ("email.send", "prospect_reply", "inquiry_reply", None, {"text": "Email"}, TextArguments),
-        ("quo.sms.send", "prospect_reply", "showing_offer", "2026-07-17T14:30:00Z", {"text": "SMS"}, TextArguments),
-        ("cliq.channel.post", "internal_notification", "lead_alert", None, {"text": "Lead"}, TextArguments),
-        ("cliq.chat.post", "internal_notification", "manual_review_alert", None, {"text": "Review"}, TextArguments),
+        ("email.send", "prospect_reply", "inquiry_reply", None, {"to_address": "prospect@example.com", "text": "Email"}, EmailArguments),
+        (
+            "quo.sms.send",
+            "prospect_reply",
+            "showing_offer",
+            "2026-07-17T14:30:00Z",
+            {"to_phone": "+19085550100", "text": "SMS"},
+            QuoSmsArguments,
+        ),
+        (
+            "cliq.channel.post",
+            "internal_notification",
+            "lead_alert",
+            None,
+            {"channel_or_chat_id": "tenant-leads", "text": "Lead"},
+            CliqArguments,
+        ),
+        (
+            "cliq.chat.post",
+            "internal_notification",
+            "manual_review_alert",
+            None,
+            {"channel_or_chat_id": "chat-42", "text": "Review"},
+            CliqArguments,
+        ),
         (
             "calendar.create",
             "calendar_mutation",
             "showing_create",
             "2026-07-17T14:30:00Z",
-            {"description": "Tour"},
+            {"calendar_id": "nigel", "description": "Tour"},
             CalendarDescriptionArguments,
         ),
         (
@@ -80,10 +103,10 @@ def test_execute_rejects_unknown_fields_and_non_positive_or_non_integer_wake_ids
             "calendar_mutation",
             "showing_update",
             "2026-07-17T14:30:00Z",
-            {},
+            {"calendar_id": "nigel"},
             CalendarDescriptionArguments,
         ),
-        ("calendar.delete", "calendar_mutation", "showing_delete", None, {}, EmptyArguments),
+        ("calendar.delete", "calendar_mutation", "showing_delete", None, {"calendar_id": "nigel"}, CalendarDeleteArguments),
     ],
 )
 def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(operation, role, intent, slot, arguments, argument_type):
@@ -124,15 +147,20 @@ def test_adapter_arguments_and_enums_reject_unknown_values(overrides):
             "action_role": "prospect_reply",
             "operation": "calendar.create",
             "intent_kind": "showing_offer",
-            "arguments": {},
+            "arguments": {"calendar_id": "nigel"},
         },
-        {"action_role": "internal_notification", "operation": "cliq.chat.post", "intent_kind": "showing_offer"},
+        {
+            "action_role": "internal_notification",
+            "operation": "cliq.chat.post",
+            "intent_kind": "showing_offer",
+            "arguments": {"channel_or_chat_id": "chat-1", "text": "Hi"},
+        },
         {"action_role": "prospect_reply", "operation": "email.send", "intent_kind": "showing_create"},
         {
             "action_role": "calendar_mutation",
             "operation": "calendar.delete",
             "intent_kind": "showing_update",
-            "arguments": {},
+            "arguments": {"calendar_id": "nigel"},
         },
     ],
 )
@@ -151,11 +179,13 @@ def test_appointment_slot_matrix_requires_explicit_offset_and_normalizes_utc():
 
 
 def test_text_is_nfc_lf_normalized_and_length_bounded():
-    request = parse_outbound_request(execute_payload(arguments={"text": "Cafe\u0301\r\nTour"}))
+    request = parse_outbound_request(
+        execute_payload(arguments={"to_address": "prospect@example.com", "text": "Cafe\u0301\r\nTour"})
+    )
     assert request.arguments.text == "Café\nTour"
     for value in ("", "x" * 10001):
         with pytest.raises(ValidationError):
-            parse_outbound_request(execute_payload(arguments={"text": value}))
+            parse_outbound_request(execute_payload(arguments={"to_address": "prospect@example.com", "text": value}))
 
 
 def test_status_accepts_only_op_and_uuid_action_id():
@@ -423,3 +453,113 @@ def test_maintenance_create_normalizes_unicode_and_newlines_before_hashing():
     )
 
     assert parsed.arguments.text == "Café\nPipe"
+
+
+# --- Task 5: agent-supplied targets for email, Quo, Cliq, and calendar -----
+
+
+def test_email_arguments_carry_the_agent_supplied_to_address():
+    parsed = parse_outbound_request(
+        execute_payload(arguments={"to_address": "prospect@example.com", "text": "Thanks"})
+    )
+    assert parsed.arguments.to_address == "prospect@example.com"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "no-at-sign", None, 5, True])
+def test_email_to_address_rejects_malformed_values(bad):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(execute_payload(arguments={"to_address": bad, "text": "Thanks"}))
+
+
+def test_quo_arguments_carry_the_agent_supplied_to_phone():
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"to_phone": "+19085550100", "text": "Thanks"},
+        )
+    )
+    assert parsed.arguments.to_phone == "+19085550100"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "908-555-0199", "9085550199", "+1abc5550199", None, 5, True])
+def test_quo_to_phone_rejects_non_e164_values(bad):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="quo.sms.send",
+                intent_kind="inquiry_reply",
+                appointment_slot=None,
+                arguments={"to_phone": bad, "text": "Thanks"},
+            )
+        )
+
+
+@pytest.mark.parametrize("operation", ["cliq.channel.post", "cliq.chat.post"])
+def test_cliq_arguments_carry_the_agent_supplied_channel_or_chat_id(operation):
+    role = "internal_notification"
+    intent = "lead_alert" if operation == "cliq.channel.post" else "manual_review_alert"
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation=operation,
+            action_role=role,
+            intent_kind=intent,
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "tenant-leads-7", "text": "New lead"},
+        )
+    )
+    assert parsed.arguments.channel_or_chat_id == "tenant-leads-7"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None, 5, True])
+def test_cliq_channel_or_chat_id_rejects_empty_or_wrong_type(bad):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation="cliq.channel.post",
+                action_role="internal_notification",
+                intent_kind="lead_alert",
+                appointment_slot=None,
+                arguments={"channel_or_chat_id": bad, "text": "New lead"},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "role", "intent", "slot", "arguments"),
+    [
+        (
+            "calendar.create",
+            "calendar_mutation",
+            "showing_create",
+            "2026-07-17T14:30:00Z",
+            {"calendar_id": "nigel", "description": "Tour"},
+        ),
+        (
+            "calendar.update",
+            "calendar_mutation",
+            "showing_update",
+            "2026-07-17T14:30:00Z",
+            {"calendar_id": "nigel"},
+        ),
+        ("calendar.delete", "calendar_mutation", "showing_delete", None, {"calendar_id": "nigel"}),
+    ],
+)
+def test_calendar_arguments_carry_the_agent_supplied_calendar_id(operation, role, intent, slot, arguments):
+    parsed = parse_outbound_request(
+        execute_payload(operation=operation, action_role=role, intent_kind=intent, appointment_slot=slot, arguments=arguments)
+    )
+    assert parsed.arguments.calendar_id == "nigel"
+
+
+@pytest.mark.parametrize("operation", ["calendar.create", "calendar.update", "calendar.delete"])
+@pytest.mark.parametrize("bad", ["", "   ", None, 5, True])
+def test_calendar_id_rejects_empty_or_wrong_type(operation, bad):
+    role = "calendar_mutation"
+    intent = {"calendar.create": "showing_create", "calendar.update": "showing_update", "calendar.delete": "showing_delete"}[operation]
+    slot = None if operation == "calendar.delete" else "2026-07-17T14:30:00Z"
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(operation=operation, action_role=role, intent_kind=intent, appointment_slot=slot, arguments={"calendar_id": bad})
+        )

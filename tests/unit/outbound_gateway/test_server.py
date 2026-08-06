@@ -96,7 +96,7 @@ def execute_payload():
         "operation": "email.send",
         "intent_kind": "showing_offer",
         "appointment_slot": "2026-07-17T10:30:00-04:00",
-        "arguments": {"text": "Friday at 10:30 works. — Nigel"},
+        "arguments": {"to_address": "prospect@example.com", "text": "Friday at 10:30 works. — Nigel"},
     }
 
 
