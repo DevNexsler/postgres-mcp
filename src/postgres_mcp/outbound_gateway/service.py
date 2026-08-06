@@ -248,6 +248,9 @@ class OutboundActionService:
     async def status(self, action_id: UUID) -> PublicResult:
         return self._result(await self._require_action(action_id))
 
+    async def suggest_targets(self, wakeup_event_id: int) -> dict[str, str]:
+        return await self._context_loader.suggest_targets(wakeup_event_id)
+
     async def resume(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
         if not self._is_due(action):

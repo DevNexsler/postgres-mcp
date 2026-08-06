@@ -43,6 +43,7 @@ from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
 from .models import StatusRequest
+from .models import SuggestRequest
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
@@ -120,6 +121,11 @@ async def handle_outbound_action(
         parsed = parse_outbound_request(request)
     except ValidationError as exc:
         raise ValueError("invalid outbound action request") from exc
+    if isinstance(parsed, SuggestRequest):
+        return {
+            "wakeup_event_id": parsed.wakeup_event_id,
+            "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
+        }
     if isinstance(parsed, StatusRequest):
         result = await service.status(parsed.action_id)
     else:
@@ -176,7 +182,12 @@ def create_server(
         description=(
             "Execute or inspect one durable outbound email, Quo, Cliq, calendar, or "
             "TenantCloud action. Recipients, accounts, and provider targets are derived "
-            "from wakeup_event_id."
+            "from wakeup_event_id. Use suggest ({\"op\": \"suggest\", \"wakeup_event_id\"}) "
+            "to ask what the wake implies -- it returns advisory target ids (e.g. "
+            "thread_id, lead_id) drawn from the wake, never blocks, and stays reachable "
+            "even when writes are disabled. Its answer is a suggestion only: an agent "
+            "may pass any target id it likes to execute, including ones that disagree "
+            "with suggest."
         ),
         structured_output=True,
     )

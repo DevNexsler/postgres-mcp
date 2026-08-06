@@ -203,6 +203,59 @@ def test_focused_server_tool_description_mentions_tenantcloud():
     assert "TenantCloud" in (tools[0].description or "")
 
 
+def test_focused_server_tool_description_mentions_suggest():
+    service = AsyncMock()
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    tools = [tool for tool in mcp._tool_manager.list_tools() if tool.name == "outbound_action"]
+
+    assert tools, "outbound_action tool must be registered"
+    assert "suggest" in (tools[0].description or "")
+
+
+@pytest.mark.asyncio
+async def test_suggest_returns_ids_the_wake_implies():
+    service = AsyncMock()
+    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(
+        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+    )
+
+    assert result["wakeup_event_id"] == 1
+    assert result["suggestions"] == {"lead_id": "2405115", "thread_id": "2002331"}
+    service.suggest_targets.assert_awaited_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_suggest_returns_empty_for_a_wake_with_no_hints():
+    service = AsyncMock()
+    service.suggest_targets.return_value = {}
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(
+        service, policy, {"op": "suggest", "wakeup_event_id": 2},
+    )
+
+    assert result["suggestions"] == {}
+
+
+@pytest.mark.asyncio
+async def test_suggest_never_writes_and_ignores_the_kill_switch():
+    """Advisory reads stay available even when writes are disabled."""
+    service = AsyncMock()
+    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
+    policy = FeaturePolicy(writes_enabled=False, kill_switch=True)
+
+    result = await handle_outbound_action(
+        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+    )
+
+    assert "suggestions" in result
+    service.execute.assert_not_called()
+
+
 # -- TenantCloud runtime assembly ------------------------------------------------
 
 

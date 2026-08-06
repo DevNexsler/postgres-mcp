@@ -351,7 +351,14 @@ class StatusRequest(StrictModel):
     action_id: UUID
 
 
-OutboundRequest: TypeAlias = Annotated[ExecuteRequest | StatusRequest, Field(discriminator="op")]
+class SuggestRequest(StrictModel):
+    op: Literal["suggest"]
+    wakeup_event_id: PositiveBigInt
+
+
+OutboundRequest: TypeAlias = Annotated[
+    ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")
+]
 _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 

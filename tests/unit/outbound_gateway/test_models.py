@@ -11,6 +11,7 @@ from postgres_mcp.outbound_gateway.models import EmptyArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import StatusRequest
+from postgres_mcp.outbound_gateway.models import SuggestRequest
 from postgres_mcp.outbound_gateway.models import TextArguments
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 
@@ -166,6 +167,16 @@ def test_status_accepts_only_op_and_uuid_action_id():
         parse_outbound_request({"op": "status", "action_id": "bad"})
     with pytest.raises(ValidationError, match="extra"):
         parse_outbound_request({"op": "status", "action_id": action_id, "wake": 1})
+
+
+def test_suggest_accepts_only_op_and_wakeup_event_id():
+    request = parse_outbound_request({"op": "suggest", "wakeup_event_id": 1})
+    assert isinstance(request, SuggestRequest)
+    assert request.wakeup_event_id == 1
+    with pytest.raises(ValidationError):
+        parse_outbound_request({"op": "suggest", "wakeup_event_id": -1})
+    with pytest.raises(ValidationError, match="extra"):
+        parse_outbound_request({"op": "suggest", "wakeup_event_id": 1, "lead_id": "123"})
 
 
 @pytest.mark.parametrize(
