@@ -11,6 +11,7 @@ from postgres_mcp.outbound_gateway.models import EmptyArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import StatusRequest
+from postgres_mcp.outbound_gateway.models import SuggestRequest
 from postgres_mcp.outbound_gateway.models import TextArguments
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 
@@ -168,6 +169,16 @@ def test_status_accepts_only_op_and_uuid_action_id():
         parse_outbound_request({"op": "status", "action_id": action_id, "wake": 1})
 
 
+def test_suggest_accepts_only_op_and_wakeup_event_id():
+    request = parse_outbound_request({"op": "suggest", "wakeup_event_id": 1})
+    assert isinstance(request, SuggestRequest)
+    assert request.wakeup_event_id == 1
+    with pytest.raises(ValidationError):
+        parse_outbound_request({"op": "suggest", "wakeup_event_id": -1})
+    with pytest.raises(ValidationError, match="extra"):
+        parse_outbound_request({"op": "suggest", "wakeup_event_id": 1, "lead_id": "123"})
+
+
 @pytest.mark.parametrize(
     ("operation", "role", "intent", "arguments", "argument_type"),
     [
@@ -175,14 +186,14 @@ def test_status_accepts_only_op_and_uuid_action_id():
             "tenantcloud.message.send",
             "prospect_reply",
             "inquiry_reply",
-            {"text": "Reply"},
-            "TextArguments",
+            {"thread_id": 8001, "text": "Reply"},
+            "TenantCloudMessageArguments",
         ),
         (
             "tenantcloud.lead.status.update",
             "provider_mutation",
             "tenantcloud_lead_status",
-            {"status": "working"},
+            {"lead_id": 6001, "status": "working"},
             "LeadStatusArguments",
         ),
         (
@@ -190,6 +201,8 @@ def test_status_accepts_only_op_and_uuid_action_id():
             "provider_mutation",
             "tenantcloud_maintenance_create",
             {
+                "property_id": 12,
+                "unit_id": 34,
                 "category_id": 57,
                 "title": "Kitchen leak",
                 "priority": "normal",
@@ -204,7 +217,7 @@ def test_status_accepts_only_op_and_uuid_action_id():
             "tenantcloud.maintenance.status.update",
             "provider_mutation",
             "tenantcloud_maintenance_status",
-            {"status": 3},
+            {"request_id": 81, "status": 3},
             "MaintenanceStatusArguments",
         ),
     ],
@@ -260,8 +273,41 @@ def test_tenantcloud_role_operation_intent_matrix_fails_closed(overrides):
         parse_outbound_request(execute_payload(appointment_slot=None, **overrides))
 
 
-@pytest.mark.parametrize("field", ["thread_id", "lead_id", "request_id", "property_id", "unit_id"])
-def test_tenantcloud_arguments_reject_agent_supplied_provider_ids(field):
+def test_tenantcloud_arguments_carry_agent_supplied_targets():
+    msg = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "prospect_reply",
+        "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+        "appointment_slot": None,
+        "arguments": {"thread_id": 2002331, "text": "Thanks"},
+    })
+    assert msg.arguments.thread_id == 2002331
+
+    lead = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
+        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
+        "appointment_slot": None,
+        "arguments": {"lead_id": 2405115, "status": "working"},
+    })
+    assert lead.arguments.lead_id == 2405115
+
+
+@pytest.mark.parametrize("bad", [0, -1, "12", 1.5, None, True])
+def test_tenantcloud_target_ids_reject_non_positive_integers(bad):
+    with pytest.raises(ValueError):
+        parse_outbound_request({
+            "op": "execute", "wakeup_event_id": 1, "action_role": "prospect_reply",
+            "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+            "appointment_slot": None,
+            "arguments": {"thread_id": bad, "text": "Thanks"},
+        })
+
+
+@pytest.mark.parametrize("field", ["thread_id", "request_id", "property_id", "unit_id"])
+def test_tenantcloud_arguments_reject_cross_operation_target_smuggling(field):
+    """lead_id is now legitimate on LeadStatusArguments (it's the agent-
+    supplied target), but the *other* three operations' target-id field
+    names must still be rejected as extra -- an agent can't smuggle a
+    maintenance/message target onto a lead status update."""
     with pytest.raises(ValidationError, match="extra"):
         parse_outbound_request(
             execute_payload(
@@ -269,7 +315,7 @@ def test_tenantcloud_arguments_reject_agent_supplied_provider_ids(field):
                 action_role="provider_mutation",
                 intent_kind="tenantcloud_lead_status",
                 appointment_slot=None,
-                arguments={"status": "working", field: 7},
+                arguments={"lead_id": 6001, "status": "working", field: 7},
             )
         )
 
@@ -304,6 +350,8 @@ def test_tenantcloud_maintenance_status_is_strict(status):
 
 def maintenance_create_arguments(**overrides):
     arguments = {
+        "property_id": 12,
+        "unit_id": 34,
         "category_id": 57,
         "title": "Kitchen leak",
         "priority": "normal",

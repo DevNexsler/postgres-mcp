@@ -481,7 +481,7 @@ def tenantcloud_context(**overrides):
         operation=Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
         intent_kind=IntentKind.TENANTCLOUD_LEAD_STATUS,
         appointment_slot=None,
-        arguments=MappingProxyType({"status": "working"}),
+        arguments=MappingProxyType({"lead_id": 6001, "status": "working"}),
         source="tenantcloud",
         source_message_id=700,
         source_message_key="tenantcloud_api:700",
@@ -515,7 +515,7 @@ def tenantcloud_row(state=ActionState.RECEIVED, **overrides):
         operation=Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
         intent_kind=IntentKind.TENANTCLOUD_LEAD_STATUS,
         appointment_slot=None,
-        arguments={"status": "working"},
+        arguments={"lead_id": 6001, "status": "working"},
         state=state,
         action_uid=ACTION_UID if state is not ActionState.RECEIVED else None,
         provider_request_ref=None,
@@ -573,9 +573,11 @@ def tenantcloud_context_for(operation, **overrides):
     }[operation]
     role = ActionRole.PROSPECT_REPLY if operation is Operation.TENANTCLOUD_MESSAGE_SEND else ActionRole.PROVIDER_MUTATION
     arguments = {
-        Operation.TENANTCLOUD_MESSAGE_SEND: {"text": "Friday at 10:30 works. — Nigel"},
-        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"status": "working"},
+        Operation.TENANTCLOUD_MESSAGE_SEND: {"thread_id": 555, "text": "Friday at 10:30 works. — Nigel"},
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"lead_id": 6001, "status": "working"},
         Operation.TENANTCLOUD_MAINTENANCE_CREATE: {
+            "property_id": 12,
+            "unit_id": 34,
             "category_id": 57,
             "title": "Kitchen leak",
             "priority": "normal",
@@ -584,7 +586,7 @@ def tenantcloud_context_for(operation, **overrides):
             "entry_allowed": False,
             "available_on": None,
         },
-        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"status": 2},
+        Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"request_id": 81, "status": 2},
     }[operation]
     canonical_context = {
         "identity_version": "v1",

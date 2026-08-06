@@ -153,11 +153,24 @@ def parse_iso_date(value: Any, *, field: str) -> date:
     return parsed
 
 
+class TenantCloudMessageArguments(StrictModel):
+    thread_id: PositiveBigInt
+    text: str
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        return normalize_tenantcloud_text(value, field="text", maximum=10_000)
+
+
 class LeadStatusArguments(StrictModel):
+    lead_id: PositiveBigInt
     status: Literal["working"]
 
 
 class MaintenanceCreateArguments(StrictModel):
+    property_id: PositiveBigInt
+    unit_id: PositiveBigInt
     category_id: PositiveBigInt
     title: str
     priority: Literal["normal"]
@@ -185,6 +198,7 @@ class MaintenanceCreateArguments(StrictModel):
 
 
 class MaintenanceStatusArguments(StrictModel):
+    request_id: PositiveBigInt
     status: Literal[1, 2, 3]
 
     @field_validator("status", mode="before")
@@ -196,7 +210,13 @@ class MaintenanceStatusArguments(StrictModel):
 
 
 ArgumentModel: TypeAlias = (
-    TextArguments | CalendarDescriptionArguments | EmptyArguments | LeadStatusArguments | MaintenanceCreateArguments | MaintenanceStatusArguments
+    TextArguments
+    | CalendarDescriptionArguments
+    | EmptyArguments
+    | TenantCloudMessageArguments
+    | LeadStatusArguments
+    | MaintenanceCreateArguments
+    | MaintenanceStatusArguments
 )
 
 
@@ -208,7 +228,7 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
     Operation.CALENDAR_CREATE: CalendarDescriptionArguments,
     Operation.CALENDAR_UPDATE: CalendarDescriptionArguments,
     Operation.CALENDAR_DELETE: EmptyArguments,
-    Operation.TENANTCLOUD_MESSAGE_SEND: TextArguments,
+    Operation.TENANTCLOUD_MESSAGE_SEND: TenantCloudMessageArguments,
     Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: LeadStatusArguments,
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: MaintenanceCreateArguments,
     Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: MaintenanceStatusArguments,
@@ -331,7 +351,14 @@ class StatusRequest(StrictModel):
     action_id: UUID
 
 
-OutboundRequest: TypeAlias = Annotated[ExecuteRequest | StatusRequest, Field(discriminator="op")]
+class SuggestRequest(StrictModel):
+    op: Literal["suggest"]
+    wakeup_event_id: PositiveBigInt
+
+
+OutboundRequest: TypeAlias = Annotated[
+    ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")
+]
 _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 
