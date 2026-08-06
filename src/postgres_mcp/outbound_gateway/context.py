@@ -750,16 +750,29 @@ class ActionContextLoader:
 
     def _wake_tenantcloud_hints(self, record: WakeEventRecord) -> dict[str, str]:
         """Best-effort provider ids implied by a wake's TenantCloud claim
-        linkage. Advisory only -- never raises; returns {} on anything
-        missing or inconsistent instead of rejecting the wake."""
+        linkage. Advisory only -- never raises, and unlike the retired
+        execute-blocking gate this does NOT require the claim to be
+        tenantcloud_api-owned, claimed/running, or event-source/message-
+        source/channel-consistent: a read-only hint is exactly as safe to
+        offer for a legacy-owned or completed claim as for an active one
+        (in production 120 of 142 real claims are legacy-owned or
+        inactive). It still refuses to emit an id it cannot parse, or one
+        that might belong to the wrong claim/family."""
+        provider_ids: dict[str, str] = {}
+        provider_ids.update(self._tenantcloud_entity_ids_hint(record))
+        provider_ids.update(self._tenantcloud_entity_scope_key_hint(record))
+        return provider_ids
+
+    @staticmethod
+    def _tenantcloud_entity_ids_hint(record: WakeEventRecord) -> dict[str, str]:
+        """Belt-and-braces reading of the claim's own entity_ids, kept for
+        any claim that happens to carry them (0 of 142 real claims do --
+        see _tenantcloud_entity_scope_key_hint for where ids actually
+        live). Claim-identity and family agreement are id-*correctness*
+        checks, not ownership gating, so they still apply: entity_ids that
+        can't be tied to this exact claim, or whose keys don't belong to
+        the claim's own family, are not trustworthy enough to hint from."""
         envelope = _mapping(record.envelope)
-        message = _mapping(envelope.get("message"))
-        raw = _mapping(record.raw_payload)
-        provider = self._provider(record, raw, message)
-        if record.event_source not in {"tenantcloud_api", "tenantcloud_claim"}:
-            return {}
-        if provider != "tenantcloud" or record.message_source != "tenantcloud_api":
-            return {}
         trusted = _mapping(envelope.get("tenantcloud"))
         row_claim_id = record.tenantcloud_claim_id
         envelope_claim_id = trusted.get("claim_id")
@@ -770,12 +783,6 @@ class ActionContextLoader:
             or type(envelope_claim_id) is not int
             or envelope_claim_id != row_claim_id
         ):
-            return {}
-        row_state = record.tenantcloud_claim_state
-        if row_state not in {"claimed", "running"} or trusted.get("claim_state") != row_state:
-            return {}
-        row_owner = record.tenantcloud_action_owner
-        if row_owner != "tenantcloud_api" or trusted.get("action_owner") != row_owner:
             return {}
         family = record.tenantcloud_claim_family
         if family not in {"lead", "maintenance"} or trusted.get("event_family") != family:
@@ -801,17 +808,35 @@ class ActionContextLoader:
             if parsed > 9_223_372_036_854_775_807:
                 return {}
             provider_ids[key] = str(parsed)
-
-        thread_id = provider_ids.get("thread_id")
-        if thread_id is not None:
-            expected_channel = f"tenantcloud:{family}-thread:{thread_id}"
-            if record.source_channel_id != expected_channel:
-                return {}
-        if record.channel_type != f"tenantcloud_{family}":
-            return {}
-        if not _nonblank(record.source_event_id):
-            return {}
         return provider_ids
+
+    @staticmethod
+    def _tenantcloud_entity_scope_key_hint(record: WakeEventRecord) -> dict[str, str]:
+        """Parse tenantcloud_event_claims.entity_scope_key's `prefix:id`
+        shape -- this is where production ids actually live (FIX 1(b): 0 of
+        142 real claims carry entity_ids). The scope key is read straight
+        off the claim row joined by the wake's own tenantcloud_claim_id, so
+        (unlike entity_ids, which arrives via the envelope) there is no
+        separate claim-identity to agree with. Only a prefix that names a
+        lead or a maintenance request contributes an id; a property-address
+        slug or a phone number contributes nothing even when its tail is
+        numeric."""
+        scope_key = _nonblank(getattr(record, "tenantcloud_entity_scope_key", None))
+        if not scope_key:
+            return {}
+        *prefix_parts, tail = scope_key.split(":")
+        if not prefix_parts or not _TENANTCLOUD_ID.fullmatch(tail):
+            return {}
+        if int(tail) > 9_223_372_036_854_775_807:
+            return {}
+        prefix = "-".join(prefix_parts).casefold()
+        is_lead = "lead" in prefix or "prospect" in prefix
+        is_maintenance = "maintenance" in prefix and "request" in prefix
+        if is_lead and not is_maintenance:
+            return {"lead_id": tail}
+        if is_maintenance and not is_lead:
+            return {"request_id": tail}
+        return {}
 
     @staticmethod
     def _scope(

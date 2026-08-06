@@ -935,6 +935,68 @@ async def test_explicit_non_acceptance_is_only_path_to_retry_ready():
 
 
 @pytest.mark.asyncio
+async def test_retryable_pre_dispatch_failure_retries_then_completes_with_one_provider_effect():
+    """FIX 2, service-level half of the proof (the adapter-level half is
+    tests/unit/outbound_gateway/test_adapters.py::
+    test_tenantcloud_reconciliation_auth_unavailable_on_a_create_is_retryable_not_ambiguous,
+    which shows the reconcile-time auth failure performs zero writes).
+    test_explicit_non_acceptance_is_only_path_to_retry_ready above already
+    proves _finish_observation promotes a retryable DEFINITIVE_NON_ACCEPTANCE
+    straight to RETRY_READY for a single attempt; this extends that to a
+    full two-attempt lifecycle matching the live incident's shape: the
+    first, provably pre-dispatch failure retries (no manual_review, no
+    reconcile detour), and once the retry is due, the very next attempt
+    dispatches for real and completes -- exactly two invoke() calls, the
+    first of which is the retried rejection with no provider effect."""
+    store = FakeStore()
+    clock_box = [NOW]
+    loader = AsyncMock()
+    loader.load.return_value = context()
+    preflight = AsyncMock()
+    preflight.load.return_value = evidence()
+    retryable_rejection = ProviderObservation(
+        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+        "tenantcloud_auth_rejected_before_dispatch",
+        category="provider_authentication",
+        retryable=True,
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=NOW,
+        evidence={"kind": "provider_message_id"},
+    )
+    adapter = FakeAdapter(retryable_rejection, accepted)
+    svc = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: clock_box[0],
+        lease_owner="gateway-test",
+        response_budget_seconds=1,
+        sleep=AsyncMock(),
+    )
+
+    first = await svc.execute(request())
+
+    assert first.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.RETRY_READY
+    assert not any(call[0] == "transition" and call[2] in {ActionState.UNKNOWN, ActionState.RECONCILING} for call in store.calls)
+    assert adapter.calls.count(("invoke",)) == 1
+
+    clock_box[0] = NOW + timedelta(hours=1)
+    second = await svc.execute(request())
+
+    assert second.status is PublicStatus.SENT
+    assert store.current.state is ActionState.COMPLETED
+    assert adapter.calls.count(("invoke",)) == 2
+
+
+@pytest.mark.asyncio
 async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch():
     store = FakeStore(
         row(

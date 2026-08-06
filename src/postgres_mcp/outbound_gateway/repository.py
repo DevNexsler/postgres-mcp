@@ -39,6 +39,7 @@ class WakeEventRecord:
     tenantcloud_claim_family: str | None = None
     tenantcloud_claim_state: str | None = None
     tenantcloud_action_owner: str | None = None
+    tenantcloud_entity_scope_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,7 +104,8 @@ class OutboundGatewayRepository:
                 event_row.tenantcloud_claim_id,
                 claim_row.event_family AS tenantcloud_claim_family,
                 claim_row.claim_state AS tenantcloud_claim_state,
-                claim_row.action_owner AS tenantcloud_action_owner
+                claim_row.action_owner AS tenantcloud_action_owner,
+                claim_row.entity_scope_key AS tenantcloud_entity_scope_key
             FROM hermes_wakeup_events AS event_row
             JOIN messages AS message_row ON message_row.id = event_row.message_id
             JOIN channels AS channel_row ON channel_row.id = message_row.channel_id

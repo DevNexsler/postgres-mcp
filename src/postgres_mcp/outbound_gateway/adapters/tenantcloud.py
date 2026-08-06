@@ -400,13 +400,32 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code=accepted_detail,
             )
-        if disposition_value == "definitive_non_acceptance" and definitive_absence_detail is not None:
-            return ProviderObservation(
-                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-                definitive_absence_detail,
-                category="provider_state_not_yet_applied",
-                retryable=True,
-            )
+        if disposition_value == "definitive_non_acceptance":
+            if result.error_code == "authentication_unavailable":
+                # The reconciliation read itself could not authenticate --
+                # exactly the signal _from_execution already trusts as
+                # provably pre-dispatch (nothing could have been written by
+                # a request that requires the same or greater authentication
+                # than this read just failed to obtain). Retryable on every
+                # operation kind, including the two "create" operations
+                # (message send, maintenance create) whose
+                # definitive_absence_detail is None below -- without this
+                # branch, those two fell through to the generic ambiguous
+                # case and escalated toward reconcile/manual_review instead
+                # of retrying.
+                return ProviderObservation(
+                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                    "tenantcloud_auth_rejected_before_dispatch",
+                    category="provider_authentication",
+                    retryable=True,
+                )
+            if definitive_absence_detail is not None:
+                return ProviderObservation(
+                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                    definitive_absence_detail,
+                    category="provider_state_not_yet_applied",
+                    retryable=True,
+                )
         return ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
             f"tenantcloud_reconciliation_{result.error_code or 'inconclusive'}",
