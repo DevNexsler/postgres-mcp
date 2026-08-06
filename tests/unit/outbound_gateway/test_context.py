@@ -17,6 +17,7 @@ from postgres_mcp.outbound_gateway.repository import AliasResolution
 from postgres_mcp.outbound_gateway.repository import ConversationSnapshot
 from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
 from postgres_mcp.outbound_gateway.repository import WakeEventRecord
+from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_idempotency_key
 
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 
@@ -268,6 +269,65 @@ async def test_suggest_targets_is_advisory_and_never_raises():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record_overrides",
+    [
+        {"event_source": "zoho_mail"},  # source
+        {"event_source": "tenantcloud"},  # source
+        {"raw_payload": {"provider": "zillow"}},  # provider
+        {"message_source": "zoho_mail"},  # provider
+        {"tenantcloud_claim_id": None},  # claim
+        {"tenantcloud_claim_id": True},  # claim
+        {"tenantcloud_claim_id": 302},  # claim (disagrees with envelope's 301)
+        {"tenantcloud_claim_state": "pending"},  # state
+        {"tenantcloud_action_owner": "legacy"},  # owner
+        {"tenantcloud_claim_family": "maintenance"},  # family (disagrees with envelope's "lead")
+        {"source_channel_id": "tenantcloud:lead-thread:9999"},  # thread vs. entity_ids conflict
+    ],
+)
+async def test_suggest_targets_is_empty_for_untrusted_claim_and_channel_shapes(record_overrides):
+    """These are the same self-consistency checks the old, execute-blocking
+    _tenantcloud_identity() used to raise on -- demoted to advisory, they
+    now yield {} instead. None of them depend on which operation the agent
+    is calling, so unlike the old test this doesn't need to vary operation
+    at all: suggest_targets() takes only a wakeup_event_id."""
+    event = tenantcloud_record(**record_overrides)
+
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+
+    assert hints == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("family", "entity_ids"),
+    [
+        ("lead", {"lead_id": True, "thread_id": "8001"}),
+        ("lead", {"lead_id": "0", "thread_id": "8001"}),
+        ("lead", {"lead_id": "6001 or 6002", "thread_id": "8001"}),
+        ("lead", {"lead_id": "9223372036854775808", "thread_id": "8001"}),
+        ("lead", {"lead_id": "6001", "leadId": "6002", "thread_id": "8001"}),
+        ("lead", {"request_id": "81", "thread_id": "8001"}),  # request_id is a maintenance-only key
+    ],
+)
+async def test_suggest_targets_is_empty_for_malformed_or_cross_family_entity_ids(family, entity_ids):
+    """Type/format/overflow/alias-conflict checks on the claim's own
+    entity_ids -- unlike the deleted per-operation "required ids for this
+    operation" checks (suggest_targets doesn't know the operation), these
+    are wake-shape self-consistency checks and still hold."""
+    event = tenantcloud_record(
+        family=family,
+        entity_ids=entity_ids,
+        source_channel_id=f"tenantcloud:{family}-thread:{entity_ids.get('thread_id', '8001')}",
+        channel_type=f"tenantcloud_{family}",
+    )
+
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+
+    assert hints == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("event_source", ["tenantcloud_api", "tenantcloud_claim"])
 async def test_tenantcloud_context_accepts_production_wake_sources(event_source):
     event = tenantcloud_record(event_source=event_source)
@@ -278,6 +338,71 @@ async def test_tenantcloud_context_accepts_production_wake_sources(event_source)
 
     assert context.provider_account == "tenantcloud"
     assert context.canonical_context["tenantcloud_claim_id"] == 301
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape():
+    """The provider used to gate enabled_operations_by_provider must be the
+    operation's own provider ("tenantcloud" -- it's right there in the
+    operation name), not whatever _provider() infers from the wake's
+    message shape. Otherwise a TenantCloud execute on a non-TenantCloud-
+    shaped wake (e.g. an ordinary email wake) gets rejected by the
+    allowlist gate -- the exact wake-shape coupling this task removes,
+    surviving one layer up."""
+    restricted = replace(
+        policy(),
+        enabled_operations_by_provider={"tenantcloud": frozenset({"tenantcloud.lead.status.update"})},
+    )
+    event = record(  # ordinary zoho_mail / email_thread wake -- no TenantCloud shape at all
+        wakeup_event_id=1,
+        event_source="zoho_mail",
+        message_source="zoho_mail",
+        channel_type="email_thread",
+        raw_payload={},
+        envelope={
+            "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
+            "message": {"direct_email": "tenant@example.com"},
+        },
+    )
+    exec_request = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
+        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
+        "appointment_slot": None,
+        "arguments": {"lead_id": 2405115, "status": "working"},
+    })
+
+    context = await ActionContextLoader(FakeRepository(event), restricted).load(exec_request)
+
+    assert context.target.target_id == "2405115"
+    assert context.provider_account == "tenantcloud"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_claim_bookkeeping_never_bakes_the_literal_string_none():
+    """A claim-less TenantCloud wake must not leave a Python `None` baked
+    into canonical_context/canonical_scope's tenantcloud_claim_id: those
+    values get f-string-interpolated into persisted, immutable identity
+    strings (store.py's lock_intent, tenantcloud_shared's idempotency key),
+    where a literal "None" substring would be baked in forever."""
+    event = record(  # ordinary wake, no TenantCloud claim linkage at all
+        wakeup_event_id=1,
+        event_source="tenantcloud_claim",
+        message_source="zoho_mail",
+        channel_type="email_thread",
+    )
+    request = parse_outbound_request({
+        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
+        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
+        "appointment_slot": None,
+        "arguments": {"lead_id": 2405115, "status": "working"},
+    })
+    assert event.tenantcloud_claim_id is None
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
+
+    assert context.canonical_context["tenantcloud_claim_id"] == ""
+    assert context.canonical_scope["tenantcloud_claim_id"] == ""
+    assert "None" not in tenantcloud_idempotency_key(context)
 
 
 @pytest.mark.asyncio

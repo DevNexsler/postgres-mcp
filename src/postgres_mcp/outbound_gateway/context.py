@@ -210,7 +210,13 @@ class ActionContextLoader:
         envelope = _mapping(record.envelope)
         message = _mapping(envelope.get("message"))
         raw = _mapping(record.raw_payload)
-        provider = self._provider(record, raw, message)
+        # The operation names its own provider ("tenantcloud.*" is always
+        # provider "tenantcloud") -- for these four operations the wake's
+        # message shape must not override that, or an execute against a
+        # non-TenantCloud-shaped wake gets rejected by the allowlist gate
+        # below, reintroducing exactly the wake-shape coupling this task
+        # removes one layer up.
+        provider = "tenantcloud" if request.operation in _TENANTCLOUD_OPERATIONS else self._provider(record, raw, message)
         if self._policy.enabled_operations_by_provider:
             allowed_operations = self._policy.enabled_operations_by_provider.get(
                 provider,
@@ -322,7 +328,7 @@ class ActionContextLoader:
             desired_state_hash = canonical_payload_hash(dict(arguments))
             canonical_scope = {
                 "version": "v1",
-                "tenantcloud_claim_id": record.tenantcloud_claim_id,
+                "tenantcloud_claim_id": record.tenantcloud_claim_id or "",
                 "source_event_id": record.source_event_id,
                 "operation": request.operation.value,
                 "target_id": target.target_id,
@@ -367,7 +373,7 @@ class ActionContextLoader:
         }
         if request.operation in _TENANTCLOUD_OPERATIONS:
             canonical_context_data.update(
-                tenantcloud_claim_id=record.tenantcloud_claim_id,
+                tenantcloud_claim_id=record.tenantcloud_claim_id or "",
                 tenantcloud_claim_family=record.tenantcloud_claim_family,
                 source_event_id=record.source_event_id,
                 operation_target={"kind": target.kind, "target_id": target.target_id},

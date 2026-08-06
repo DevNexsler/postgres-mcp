@@ -291,6 +291,24 @@ def test_tenantcloud_target_ids_reject_non_positive_integers(bad):
         })
 
 
+@pytest.mark.parametrize("field", ["thread_id", "request_id", "property_id", "unit_id"])
+def test_tenantcloud_arguments_reject_cross_operation_target_smuggling(field):
+    """lead_id is now legitimate on LeadStatusArguments (it's the agent-
+    supplied target), but the *other* three operations' target-id field
+    names must still be rejected as extra -- an agent can't smuggle a
+    maintenance/message target onto a lead status update."""
+    with pytest.raises(ValidationError, match="extra"):
+        parse_outbound_request(
+            execute_payload(
+                operation="tenantcloud.lead.status.update",
+                action_role="provider_mutation",
+                intent_kind="tenantcloud_lead_status",
+                appointment_slot=None,
+                arguments={"lead_id": 6001, "status": "working", field: 7},
+            )
+        )
+
+
 @pytest.mark.parametrize("status", ["new", "closed", "WORKING", 1, True])
 def test_tenantcloud_lead_status_is_exact(status):
     with pytest.raises(ValidationError):

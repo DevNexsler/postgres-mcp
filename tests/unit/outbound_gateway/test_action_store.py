@@ -253,6 +253,26 @@ async def test_provider_status_lock_has_versioned_claim_source_target_and_desire
 
 
 @pytest.mark.asyncio
+async def test_provider_status_lock_omits_claim_segment_without_a_literal_none_when_claim_is_absent():
+    """context.py stores "" (not None) for tenantcloud_claim_id when a wake
+    has no TenantCloud claim linkage -- confirm prepare() consumes that
+    shape without baking the literal string "None" into the persisted,
+    immutable lock_intent identity string."""
+    subject = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "6001", True),
+        claim_id="",
+        source_event_id="tenantcloud:claim:unset",
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert "None" not in lock_intent
+    assert lock_intent == ("v1:claim::source:tenantcloud:claim:unset:op:tenantcloud.lead.status.update:target:6001:state:" + "d" * 64)
+
+
+@pytest.mark.asyncio
 async def test_maintenance_create_lock_uses_explicit_boundaries_and_hashes_text():
     text = "Café\nPipe"
     subject = provider_context(
