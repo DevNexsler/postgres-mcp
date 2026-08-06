@@ -129,7 +129,7 @@ def request(**overrides) -> ExecuteRequest:
     return parsed
 
 
-def tenantcloud_record(*, family="lead", entity_ids=None, **overrides):
+def tenantcloud_record(*, family="lead", entity_ids=None, entity_scope_key=None, **overrides):
     values = {
         **record().__dict__,
         "event_source": "tenantcloud_claim",
@@ -143,6 +143,7 @@ def tenantcloud_record(*, family="lead", entity_ids=None, **overrides):
         "tenantcloud_claim_family": family,
         "tenantcloud_claim_state": "claimed",
         "tenantcloud_action_owner": "tenantcloud_api",
+        "tenantcloud_entity_scope_key": entity_scope_key,
         "envelope": {
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
             "message": {"direct_email": "tenant@example.com"},
@@ -258,6 +259,40 @@ async def test_suggest_targets_returns_claim_linked_provider_ids(family, entity_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_scope_key", "expected"),
+    [
+        ("tenantcloud:lead:1574439", {"lead_id": "1574439"}),
+        ("tenantcloud:maintenance-request:1322814", {"request_id": "1322814"}),
+        ("lead:2398947", {"lead_id": "2398947"}),
+        ("tc-lead:2399346", {"lead_id": "2399346"}),
+        ("tc:christy-moreno-317-s-main-apt-4", {}),
+        ("tenantcloud-prospect:2398368", {"lead_id": "2398368"}),
+        ("tenantcloud-lead:2398947", {"lead_id": "2398947"}),
+        ("phone:17328017005", {}),
+    ],
+)
+async def test_suggest_targets_parses_real_production_entity_scope_key_prefixes(entity_scope_key, expected):
+    """FIX 1(b): tenantcloud_event_claims.entity_ids is populated for 0 of
+    142 real production claims -- the ids actually live in
+    entity_scope_key's `prefix:id` shape. These 8 cases are the real
+    production entity_scope_key distribution verbatim: a lead or
+    maintenance-request prefix (however it's spelled: bare, "tc-"
+    abbreviated, "tenantcloud-" hyphenated, or "prospect" as a lead
+    synonym) parses its numeric tail; a property-address slug or a phone
+    number contributes nothing, even though the phone case's tail happens
+    to be all-digits -- the prefix has to actually name a lead or
+    maintenance request. entity_ids is deliberately left empty here (an
+    unrelated key that fails the allowed-keys check) so the asserted value
+    is entity_scope_key's contribution alone, not a merge artifact."""
+    event = tenantcloud_record(entity_scope_key=entity_scope_key, entity_ids={"unrelated_key": "1"})
+
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+
+    assert hints == expected
+
+
+@pytest.mark.asyncio
 async def test_suggest_targets_is_advisory_and_never_raises():
     """A wake with no TenantCloud claim linkage at all yields {}, not an
     error -- suggest_targets() must never reject."""
@@ -272,30 +307,65 @@ async def test_suggest_targets_is_advisory_and_never_raises():
 @pytest.mark.parametrize(
     "record_overrides",
     [
-        {"event_source": "zoho_mail"},  # source
-        {"event_source": "tenantcloud"},  # source
-        {"raw_payload": {"provider": "zillow"}},  # provider
-        {"message_source": "zoho_mail"},  # provider
-        {"tenantcloud_claim_id": None},  # claim
-        {"tenantcloud_claim_id": True},  # claim
-        {"tenantcloud_claim_id": 302},  # claim (disagrees with envelope's 301)
-        {"tenantcloud_claim_state": "pending"},  # state
-        {"tenantcloud_action_owner": "legacy"},  # owner
+        {"tenantcloud_claim_id": None},  # claim identity missing
+        {"tenantcloud_claim_id": True},  # claim identity wrong type
+        {"tenantcloud_claim_id": 302},  # claim identity disagrees with envelope's 301
         {"tenantcloud_claim_family": "maintenance"},  # family (disagrees with envelope's "lead")
-        {"source_channel_id": "tenantcloud:lead-thread:9999"},  # thread vs. entity_ids conflict
     ],
 )
 async def test_suggest_targets_is_empty_for_untrusted_claim_and_channel_shapes(record_overrides):
-    """These are the same self-consistency checks the old, execute-blocking
-    _tenantcloud_identity() used to raise on -- demoted to advisory, they
-    now yield {} instead. None of them depend on which operation the agent
-    is calling, so unlike the old test this doesn't need to vary operation
-    at all: suggest_targets() takes only a wakeup_event_id."""
+    """FIX 1(a) removed the owner/state/source/channel gating (see the
+    ignores-ownership-state-source-and-channel test below), but these four
+    remain {} because they are id-*correctness* checks, not ownership
+    checks: a missing/malformed claim id, or a claim id that disagrees with
+    the envelope's own claim linkage, means the entity_ids we'd be reading
+    might not even belong to this claim -- and a family mismatch means
+    entity_ids' keys (lead_id/listing_id) don't belong to the claim's own
+    family's allowed key set. Emitting an id here would risk emitting the
+    *wrong* id, which suggest_targets() must never do even though it's
+    advisory."""
     event = tenantcloud_record(**record_overrides)
 
     hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
 
     assert hints == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record_overrides",
+    [
+        {"event_source": "zoho_mail"},  # source
+        {"event_source": "tenantcloud"},  # source
+        {"raw_payload": {"provider": "zillow"}},  # provider
+        {"message_source": "zoho_mail"},  # provider
+        {"tenantcloud_claim_state": "pending"},  # state
+        {"tenantcloud_action_owner": "legacy"},  # owner
+        {"source_channel_id": "tenantcloud:lead-thread:9999"},  # thread vs. entity_ids "conflict"
+    ],
+)
+async def test_suggest_targets_ignores_ownership_state_source_and_channel_shape(record_overrides):
+    """FIX 1(a): these 7 shapes used to all yield {} under the retired
+    execute-blocking gate (see the CHANGED test below -- this is what those
+    same 7 cases were split out of). suggest_targets() is read-only and
+    advisory, so a legacy-owned, non-active, differently-sourced, or
+    differently-channeled claim is just as safe to hint from as a live
+    tenantcloud_api-owned one -- in production 120 of 142 real claims are
+    legacy-owned or inactive and were getting silently swallowed to {} by
+    this exact gating. None of these touch claim identity or family, so the
+    full claim-linked entity_ids dict is still returned.
+
+    CHANGED: split out of test_suggest_targets_is_empty_for_untrusted_claim_and_channel_shapes,
+    which previously asserted {} for all 11 of these cases combined. 7 of the
+    11 (all of these) are now legitimately parseable once the ownership/
+    state/source/channel gating is gone, so they assert the parsed value
+    instead of {}; the remaining 4 (claim identity/family) keep asserting {}
+    under the original test name just above."""
+    event = tenantcloud_record(**record_overrides)
+
+    hints = await ActionContextLoader(FakeRepository(event), policy()).suggest_targets(event.wakeup_event_id)
+
+    assert hints == {"lead_id": "6001", "listing_id": "5001", "thread_id": "8001"}
 
 
 @pytest.mark.asyncio
