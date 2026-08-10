@@ -6,8 +6,9 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from postgres_mcp.outbound_gateway.models import CalendarCreateArguments
 from postgres_mcp.outbound_gateway.models import CalendarDeleteArguments
-from postgres_mcp.outbound_gateway.models import CalendarDescriptionArguments
+from postgres_mcp.outbound_gateway.models import CalendarUpdateArguments
 from postgres_mcp.outbound_gateway.models import CliqArguments
 from postgres_mcp.outbound_gateway.models import EmailArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
@@ -96,17 +97,32 @@ def test_execute_rejects_unknown_fields_and_non_positive_or_non_integer_wake_ids
             "showing_create",
             "2026-07-17T14:30:00Z",
             {"calendar_id": "nigel", "description": "Tour"},
-            CalendarDescriptionArguments,
+            CalendarCreateArguments,
         ),
         (
             "calendar.update",
             "calendar_mutation",
             "showing_update",
             "2026-07-17T14:30:00Z",
-            {"calendar_id": "nigel"},
-            CalendarDescriptionArguments,
+            {
+                "calendar_id": "nigel",
+                "event_url": "https://calendar.zoho.com/caldav/acct/events/3b34ed2d-e2e0-443b-b20a-097c98aebfc3.ics",
+                "etag": '"etag-1"',
+            },
+            CalendarUpdateArguments,
         ),
-        ("calendar.delete", "calendar_mutation", "showing_delete", None, {"calendar_id": "nigel"}, CalendarDeleteArguments),
+        (
+            "calendar.delete",
+            "calendar_mutation",
+            "showing_delete",
+            None,
+            {
+                "calendar_id": "nigel",
+                "event_url": "https://calendar.zoho.com/caldav/acct/events/3b34ed2d-e2e0-443b-b20a-097c98aebfc3.ics",
+                "etag": '"etag-1"',
+            },
+            CalendarDeleteArguments,
+        ),
     ],
 )
 def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(operation, role, intent, slot, arguments, argument_type):
@@ -562,4 +578,124 @@ def test_calendar_id_rejects_empty_or_wrong_type(operation, bad):
     with pytest.raises(ValidationError):
         parse_outbound_request(
             execute_payload(operation=operation, action_role=role, intent_kind=intent, appointment_slot=slot, arguments={"calendar_id": bad})
+        )
+
+
+# --- calendar.update / calendar.delete take event identity from the agent --
+
+
+_CALENDAR_UPDATE_DELETE = [
+    ("calendar.update", "showing_update", "2026-07-17T14:30:00Z"),
+    ("calendar.delete", "showing_delete", None),
+]
+_EXAMPLE_EVENT_URL = "https://calendar.zoho.com/caldav/acct/events/3b34ed2d-e2e0-443b-b20a-097c98aebfc3.ics"
+
+
+@pytest.mark.parametrize(("operation", "intent", "slot"), _CALENDAR_UPDATE_DELETE)
+def test_calendar_update_and_delete_carry_the_agent_supplied_event_target(operation, intent, slot):
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation=operation,
+            action_role="calendar_mutation",
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+        )
+    )
+    assert parsed.arguments.calendar_id == "nigel"
+    assert parsed.arguments.event_url == _EXAMPLE_EVENT_URL
+    assert parsed.arguments.etag == '"etag-1"'
+    assert parsed.arguments.event_uid is None
+
+
+@pytest.mark.parametrize(("operation", "intent", "slot"), _CALENDAR_UPDATE_DELETE)
+def test_calendar_update_and_delete_allow_the_event_target_to_be_omitted_for_the_wake_fallback(operation, intent, slot):
+    """event_url/etag/event_uid are optional on the model itself -- context
+    derivation (not the model) decides whether an omitted value can fall
+    back to the wake, or must fail closed."""
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation=operation,
+            action_role="calendar_mutation",
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={"calendar_id": "nigel"},
+        )
+    )
+    assert parsed.arguments.event_url is None
+    assert parsed.arguments.etag is None
+    assert parsed.arguments.event_uid is None
+
+
+@pytest.mark.parametrize(("operation", "intent", "slot"), _CALENDAR_UPDATE_DELETE)
+def test_calendar_update_and_delete_explicit_event_uid_overrides_the_url_derived_one(operation, intent, slot):
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation=operation,
+            action_role="calendar_mutation",
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={
+                "calendar_id": "nigel",
+                "event_url": _EXAMPLE_EVENT_URL,
+                "etag": '"etag-1"',
+                "event_uid": "explicit-uid-override",
+            },
+        )
+    )
+    assert parsed.arguments.event_uid == "explicit-uid-override"
+
+
+@pytest.mark.parametrize(("operation", "intent", "slot"), _CALENDAR_UPDATE_DELETE)
+@pytest.mark.parametrize("bad_url", ["", "   ", "not-a-url"])
+def test_calendar_update_and_delete_reject_a_malformed_event_url(operation, intent, slot, bad_url):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation=operation,
+                action_role="calendar_mutation",
+                intent_kind=intent,
+                appointment_slot=slot,
+                arguments={"calendar_id": "nigel", "event_url": bad_url, "etag": '"etag-1"'},
+            )
+        )
+
+
+@pytest.mark.parametrize(("operation", "intent", "slot"), _CALENDAR_UPDATE_DELETE)
+@pytest.mark.parametrize("bad_etag", ["", "   "])
+def test_calendar_update_and_delete_reject_an_empty_etag(operation, intent, slot, bad_etag):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            execute_payload(
+                operation=operation,
+                action_role="calendar_mutation",
+                intent_kind=intent,
+                appointment_slot=slot,
+                arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": bad_etag},
+            )
+        )
+
+
+def test_calendar_create_still_works_without_event_fields_and_rejects_them_as_extra():
+    parsed = parse_outbound_request(
+        execute_payload(
+            operation="calendar.create",
+            action_role="calendar_mutation",
+            intent_kind="showing_create",
+            appointment_slot="2026-07-17T14:30:00Z",
+            arguments={"calendar_id": "nigel", "description": "Tour"},
+        )
+    )
+    assert isinstance(parsed.arguments, CalendarCreateArguments)
+    assert parsed.arguments.calendar_id == "nigel"
+
+    with pytest.raises(ValidationError, match="extra"):
+        parse_outbound_request(
+            execute_payload(
+                operation="calendar.create",
+                action_role="calendar_mutation",
+                intent_kind="showing_create",
+                appointment_slot="2026-07-17T14:30:00Z",
+                arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+            )
         )
