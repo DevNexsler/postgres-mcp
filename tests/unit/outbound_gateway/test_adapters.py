@@ -130,6 +130,38 @@ def completed(tool, content):
     )
 
 
+def calendar_request_status_envelope(event):
+    """The verified real `request_status` shape for a completed async job.
+
+    Agent Email's queue wraps the terminal tool result in an envelope with
+    its own status/timing metadata, and the inner tool result carries the
+    event object under `data.event` (not `data.content`).
+    """
+    return McpCallResult(
+        structured_content={
+            "call_id": "req-1",
+            "request_id": "req-1",
+            "tool_name": "calendar_create_event",
+            "account_id": "nigel-zoho",
+            "status": "completed",
+            "queued_at": "2026-07-16T01:00:00Z",
+            "started_at": "2026-07-16T01:00:01Z",
+            "completed_at": "2026-07-16T01:00:02Z",
+            "duration_ms": 850,
+            "category": None,
+            "retryable": False,
+            "message": "completed",
+            "result": {
+                "tool_name": "calendar_create_event",
+                "structured_content": {
+                    "status": "success",
+                    "data": {"event": event} if event is not None else {},
+                },
+            },
+        }
+    )
+
+
 def test_auth_rejection_is_retryable_definitive_non_acceptance():
     observation = transport_observation(
         McpCallResult(
@@ -409,6 +441,84 @@ async def test_calendar_adapter_parses_agent_email_request_status_result(
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.message_id == provider_id
     assert observation.provider_request_ref == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_accepts_structured_event_object_from_async_job_result():
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_CREATE)
+    event = {
+        "id": "created-event",
+        "uid": "7ea7586e-64d1-4c7b-9c1a-2b6a6f9d6a11",
+        "summary": "Tour — Amanda Snyder",
+        "start": "2026-07-17T14:30:00Z",
+        "end": "2026-07-17T15:00:00Z",
+        "all_day": False,
+        "recurring": False,
+        "calendar": "nigel",
+        "description": "Tour",
+        "location": "138 Bullman St #144-A",
+        "event_url": "https://calendar.local/events/created-event.ics",
+        "etag": "",
+        "sequence": 0,
+    }
+    client = FakeClient(pending(), calendar_request_status_envelope(event))
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    assert observation.disposition is ProviderDisposition.PENDING
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == event["uid"]
+    assert observation.provider_request_ref == "req-1"
+    assert observation.evidence == {
+        "kind": "calendar_uid",
+        "calendar_event_uid": event["uid"],
+        "event_url": event["event_url"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_stays_ambiguous_when_structured_payload_has_no_event_object():
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_CREATE)
+    client = FakeClient(pending(), calendar_request_status_envelope(None))
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "malformed_provider_success"
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_accepts_plain_text_fallback_with_real_newlines():
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_CREATE)
+    client = FakeClient(
+        pending(),
+        completed(
+            "calendar_create_event",
+            {
+                "status": "success",
+                "data": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "**Event Created**\nUID: created-event\nURL: https://calendar.local/events/created-event.ics",
+                        }
+                    ]
+                },
+            },
+        ),
+    )
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "created-event"
+    assert observation.evidence["event_url"] == "https://calendar.local/events/created-event.ics"
 
 
 @pytest.mark.asyncio
