@@ -1570,3 +1570,127 @@ async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contamina
     assert chat_context.target.target_id == "nigel-direct-chat"
     # Neither execute fell back to the old static per-intent config value.
     assert "tenant-leads" not in {channel_context.target.target_id, chat_context.target.target_id}
+
+
+# --- calendar.update / calendar.delete take event identity from the agent --
+
+_EXAMPLE_EVENT_URL = "https://calendar.zoho.com/caldav/acct/events/3b34ed2d-e2e0-443b-b20a-097c98aebfc3.ics"
+_EXAMPLE_EVENT_UID = "3b34ed2d-e2e0-443b-b20a-097c98aebfc3"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "intent", "slot"),
+    [
+        ("calendar.update", "showing_update", "2026-07-17T14:30:00Z"),
+        ("calendar.delete", "showing_delete", None),
+    ],
+)
+async def test_calendar_update_and_delete_take_event_target_from_agent_on_a_wake_with_no_calendar_payload(operation, intent, slot):
+    """calendar.update and calendar.delete were the last two operations
+    still deriving their event identity solely from the wake payload --
+    verified against production that zero raw_events rows ever carry
+    calendar_event_url, so that path was permanently dead. The agent now
+    names the exact event directly; this wake carries no calendar_event_uid/
+    url/etag at all, and the action must still resolve. The uid is derived
+    from the CalDAV URL's basename (confirmed from a real create response)."""
+    event = record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"})
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation=operation,
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+        )
+    )
+    assert context.calendar_event_url == _EXAMPLE_EVENT_URL
+    assert context.calendar_event_etag == '"etag-1"'
+    assert context.calendar_event_uid == _EXAMPLE_EVENT_UID
+    assert context.target.kind == "calendar"
+    assert context.target.target_id == "nigel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "intent", "slot"),
+    [
+        ("calendar.update", "showing_update", "2026-07-17T14:30:00Z"),
+        ("calendar.delete", "showing_delete", None),
+    ],
+)
+async def test_calendar_update_and_delete_explicit_event_uid_overrides_the_url_derived_one(operation, intent, slot):
+    event = record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"})
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation=operation,
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={
+                "calendar_id": "nigel",
+                "event_url": _EXAMPLE_EVENT_URL,
+                "etag": '"etag-1"',
+                "event_uid": "explicit-uid-override",
+            },
+        )
+    )
+    assert context.calendar_event_uid == "explicit-uid-override"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "intent", "slot"),
+    [
+        ("calendar.update", "showing_update", "2026-07-17T14:30:00Z"),
+        ("calendar.delete", "showing_delete", None),
+    ],
+)
+async def test_calendar_update_and_delete_fall_back_to_the_wake_derived_event_when_arguments_omit_it(operation, intent, slot):
+    """The wake path stays as a fallback -- unreachable against today's real
+    production data (verified zero raw_events rows carry
+    calendar_event_url) but not deleted, for any caller that still routes
+    event identity through the wake the way the pre-agent-targets code did."""
+    event = record(
+        raw_payload={
+            "provider": "zillow",
+            "thread_id": "zrm-thread-44",
+            "calendar_event_uid": "wake-derived-uid",
+            "calendar_event_url": "https://calendar.local/events/wake-derived-uid.ics",
+            "calendar_event_etag": '"wake-etag"',
+        }
+    )
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation=operation,
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={"calendar_id": "nigel"},
+        )
+    )
+    assert context.calendar_event_uid == "wake-derived-uid"
+    assert context.calendar_event_url == "https://calendar.local/events/wake-derived-uid.ics"
+    assert context.calendar_event_etag == '"wake-etag"'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "intent", "slot"),
+    [
+        ("calendar.update", "showing_update", "2026-07-17T14:30:00Z"),
+        ("calendar.delete", "showing_delete", None),
+    ],
+)
+async def test_calendar_update_and_delete_still_fail_closed_when_neither_agent_nor_wake_supplies_the_event(operation, intent, slot):
+    event = record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"})
+    with pytest.raises(ContextDerivationError, match="calendar event"):
+        await ActionContextLoader(FakeRepository(event), policy()).load(
+            request(
+                action_role="calendar_mutation",
+                operation=operation,
+                intent_kind=intent,
+                appointment_slot=slot,
+                arguments={"calendar_id": "nigel"},
+            )
+        )

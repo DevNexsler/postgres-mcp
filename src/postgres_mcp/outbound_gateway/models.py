@@ -144,6 +144,33 @@ def normalize_target_id(value: Any, *, field: str) -> str:
     return candidate
 
 
+def normalize_optional_target_id(value: Any, *, field: str) -> str | None:
+    """Same format-only check as normalize_target_id, but None means the
+    agent omitted the field entirely (a caller-side fallback may still
+    apply) rather than supplying a blank value."""
+    if value is None:
+        return None
+    return normalize_target_id(value, field=field)
+
+
+_ABSOLUTE_HTTP_URL = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def normalize_event_url(value: Any, *, field: str) -> str | None:
+    """Format-only check that the value is a plausible absolute http(s)
+    URL. Never verifies the event exists or belongs to any wake, prospect,
+    or calendar -- the agent asserts the event, this only rejects garbage.
+    None means the field was omitted (a caller-side fallback may apply)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    candidate = normalize("NFC", value).strip()
+    if not _ABSOLUTE_HTTP_URL.fullmatch(candidate):
+        raise ValueError(f"{field} must be an absolute http(s) URL")
+    return candidate
+
+
 class EmailArguments(StrictModel):
     to_address: str
     text: str
@@ -189,7 +216,7 @@ class CliqArguments(StrictModel):
         return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
 
 
-class CalendarDescriptionArguments(StrictModel):
+class CalendarCreateArguments(StrictModel):
     calendar_id: str
     description: str | None = None
 
@@ -206,13 +233,66 @@ class CalendarDescriptionArguments(StrictModel):
         return normalize_public_text(value, field="description", minimum=0, maximum=10_000)
 
 
-class CalendarDeleteArguments(StrictModel):
+class CalendarUpdateArguments(StrictModel):
     calendar_id: str
+    event_url: str | None = None
+    etag: str | None = None
+    event_uid: str | None = None
+    description: str | None = None
 
     @field_validator("calendar_id", mode="before")
     @classmethod
     def normalize_calendar_id(cls, value: Any) -> str:
         return normalize_target_id(value, field="calendar_id")
+
+    @field_validator("event_url", mode="before")
+    @classmethod
+    def normalize_event_url_field(cls, value: Any) -> str | None:
+        return normalize_event_url(value, field="event_url")
+
+    @field_validator("etag", mode="before")
+    @classmethod
+    def normalize_etag_field(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="etag")
+
+    @field_validator("event_uid", mode="before")
+    @classmethod
+    def normalize_event_uid_field(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="event_uid")
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return normalize_public_text(value, field="description", minimum=0, maximum=10_000)
+
+
+class CalendarDeleteArguments(StrictModel):
+    calendar_id: str
+    event_url: str | None = None
+    etag: str | None = None
+    event_uid: str | None = None
+
+    @field_validator("calendar_id", mode="before")
+    @classmethod
+    def normalize_calendar_id(cls, value: Any) -> str:
+        return normalize_target_id(value, field="calendar_id")
+
+    @field_validator("event_url", mode="before")
+    @classmethod
+    def normalize_event_url_field(cls, value: Any) -> str | None:
+        return normalize_event_url(value, field="event_url")
+
+    @field_validator("etag", mode="before")
+    @classmethod
+    def normalize_etag_field(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="etag")
+
+    @field_validator("event_uid", mode="before")
+    @classmethod
+    def normalize_event_uid_field(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="event_uid")
 
 
 PositiveBigInt = Annotated[int, Field(strict=True, gt=0, le=9_223_372_036_854_775_807)]
@@ -299,7 +379,8 @@ ArgumentModel: TypeAlias = (
     EmailArguments
     | QuoSmsArguments
     | CliqArguments
-    | CalendarDescriptionArguments
+    | CalendarCreateArguments
+    | CalendarUpdateArguments
     | CalendarDeleteArguments
     | TenantCloudMessageArguments
     | LeadStatusArguments
@@ -313,8 +394,8 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
     Operation.QUO_SMS_SEND: QuoSmsArguments,
     Operation.CLIQ_CHANNEL_POST: CliqArguments,
     Operation.CLIQ_CHAT_POST: CliqArguments,
-    Operation.CALENDAR_CREATE: CalendarDescriptionArguments,
-    Operation.CALENDAR_UPDATE: CalendarDescriptionArguments,
+    Operation.CALENDAR_CREATE: CalendarCreateArguments,
+    Operation.CALENDAR_UPDATE: CalendarUpdateArguments,
     Operation.CALENDAR_DELETE: CalendarDeleteArguments,
     Operation.TENANTCLOUD_MESSAGE_SEND: TenantCloudMessageArguments,
     Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: LeadStatusArguments,

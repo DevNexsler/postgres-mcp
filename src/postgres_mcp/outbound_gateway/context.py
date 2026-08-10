@@ -17,8 +17,9 @@ from uuid import UUID
 from uuid import uuid5
 
 from .models import ActionRole
+from .models import CalendarCreateArguments
 from .models import CalendarDeleteArguments
-from .models import CalendarDescriptionArguments
+from .models import CalendarUpdateArguments
 from .models import CliqArguments
 from .models import EmailArguments
 from .models import ExecuteRequest
@@ -179,6 +180,19 @@ def _nonblank(value: Any) -> str | None:
     return result or None
 
 
+def _calendar_event_uid_from_url(event_url: str | None) -> str | None:
+    """The CalDAV event URL's basename IS the event uid, e.g.
+    https://calendar.zoho.com/caldav/<acct>/events/<uid>.ics -> <uid>
+    (verified from a real create response). Format-only: does not fetch or
+    otherwise verify the URL."""
+    if not event_url:
+        return None
+    basename = event_url.rstrip("/").rsplit("/", 1)[-1]
+    if basename.lower().endswith(".ics"):
+        basename = basename[: -len(".ics")]
+    return _nonblank(basename)
+
+
 def _canonicalize(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _canonicalize(value[key]) for key in sorted(value, key=str)}
@@ -302,11 +316,25 @@ class ActionContextLoader:
         showing_lifecycle_id = (
             _nonblank(raw.get("showing_lifecycle_id")) or _nonblank(raw.get("booking_id")) or f"showing:wake:{request.wakeup_event_id}"
         )
-        calendar_event_uid = _nonblank(raw.get("calendar_event_uid")) or _nonblank(_mapping(raw.get("booking")).get("calendar_event_uid"))
         booking = _mapping(raw.get("booking"))
+        calendar_event_uid = _nonblank(raw.get("calendar_event_uid")) or _nonblank(booking.get("calendar_event_uid"))
         calendar_event_url = _nonblank(raw.get("calendar_event_url")) or _nonblank(booking.get("calendar_event_url"))
         calendar_event_etag = _nonblank(raw.get("calendar_event_etag")) or _nonblank(booking.get("calendar_event_etag"))
         if request.operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE}:
+            # The agent names the exact event it means to mutate. The wake
+            # payload -- verified against production to never carry
+            # calendar_event_url on a single raw_events row -- is kept only
+            # as a fallback for callers that still route event identity
+            # through the wake, same as before this operation took agent-
+            # supplied arguments.
+            assert isinstance(request.arguments, (CalendarUpdateArguments, CalendarDeleteArguments))
+            calendar_event_url = request.arguments.event_url or calendar_event_url
+            calendar_event_etag = request.arguments.etag or calendar_event_etag
+            calendar_event_uid = (
+                request.arguments.event_uid
+                or _calendar_event_uid_from_url(calendar_event_url)
+                or calendar_event_uid
+            )
             if not calendar_event_uid:
                 raise ContextDerivationError("canonical calendar event UID is required")
             if not calendar_event_url or not calendar_event_etag:
@@ -782,7 +810,7 @@ class ActionContextLoader:
             assert isinstance(request.arguments, CliqArguments)
             kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
             return DerivedTarget(kind, request.arguments.channel_or_chat_id, True), request.arguments.channel_or_chat_id
-        assert isinstance(request.arguments, (CalendarDescriptionArguments, CalendarDeleteArguments))
+        assert isinstance(request.arguments, (CalendarCreateArguments, CalendarUpdateArguments, CalendarDeleteArguments))
         profile = "appointment-setter"
         configured_calendar = self._policy.calendar_by_profile.get(profile, "")
         account = self._policy.calendar_account_by_profile.get(profile, configured_calendar)
