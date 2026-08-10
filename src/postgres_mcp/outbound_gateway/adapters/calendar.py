@@ -143,6 +143,29 @@ class CalendarAdapter:
             if isinstance(etag, str) and etag.strip():
                 evidence["calendar_event_etag"] = etag.strip()
             return accepted_observation(request_ref_value=ref, message_id=event_uid, evidence=evidence)
+        # calendar_delete_event's payload has no event object and no `uid` --
+        # only a deletion receipt (verified live: {"deleted": true, "event_url": ...}).
+        # Derive the uid from the URL basename, the same CalDAV convention used
+        # elsewhere (.../events/<uid>.ics -> <uid>).
+        if isinstance(payload, Mapping):
+            data = payload.get("data")
+            if isinstance(data, Mapping) and data.get("deleted") is True:
+                event_url = data.get("event_url")
+                if isinstance(event_url, str) and event_url.strip():
+                    event_url = event_url.strip()
+                    basename = event_url.rstrip("/").rsplit("/", 1)[-1]
+                    if basename.lower().endswith(".ics"):
+                        basename = basename[: -len(".ics")]
+                    if basename:
+                        return accepted_observation(
+                            request_ref_value=ref,
+                            message_id=basename,
+                            evidence={
+                                "kind": "calendar_uid",
+                                "calendar_event_uid": basename,
+                                "event_url": event_url,
+                            },
+                        )
         text = result.text or ""
         if payload:
             data = payload.get("data")

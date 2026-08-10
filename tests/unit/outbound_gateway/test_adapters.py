@@ -522,6 +522,79 @@ async def test_calendar_adapter_accepts_plain_text_fallback_with_real_newlines()
 
 
 @pytest.mark.asyncio
+async def test_calendar_adapter_accepts_delete_receipt_without_uid_object():
+    """Verified live: `calendar_delete_event` returns `data.deleted` + `data.event_url`
+    with no `uid` field at all, so the uid-seeking walk in _parse finds nothing.
+    The adapter must still accept, deriving the uid from the URL basename."""
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_DELETE)
+    event_url = "https://calendar.zoho.com/caldav/a0c35cb9ee5f4192a18ebbc05adfe4fa/events/3685a803-4c37-608c-a344-139060123c48.ics"
+    client = FakeClient(
+        pending(),
+        completed(
+            "calendar_delete_event",
+            {"status": "success", "data": {"deleted": True, "event_url": event_url}},
+        ),
+    )
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    assert observation.disposition is ProviderDisposition.PENDING
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.message_id == "3685a803-4c37-608c-a344-139060123c48"
+    assert observation.evidence == {
+        "kind": "calendar_uid",
+        "calendar_event_uid": "3685a803-4c37-608c-a344-139060123c48",
+        "event_url": event_url,
+    }
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_stays_ambiguous_when_delete_receipt_reports_not_deleted():
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_DELETE)
+    client = FakeClient(
+        pending(),
+        completed(
+            "calendar_delete_event",
+            {
+                "status": "success",
+                "data": {
+                    "deleted": False,
+                    "event_url": "https://calendar.zoho.com/caldav/a0c35cb9ee5f4192a18ebbc05adfe4fa/events/3685a803-4c37-608c-a344-139060123c48.ics",
+                },
+            },
+        ),
+    )
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "malformed_provider_success"
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_stays_ambiguous_when_delete_receipt_has_no_event_url():
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    ctx = context(Operation.CALENDAR_DELETE)
+    client = FakeClient(
+        pending(),
+        completed(
+            "calendar_delete_event",
+            {"status": "success", "data": {"deleted": True, "event_url": ""}},
+        ),
+    )
+
+    observation = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    observation = await adapter.poll(client, observation)
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "malformed_provider_success"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("result", "expected", "detail"),
     [
