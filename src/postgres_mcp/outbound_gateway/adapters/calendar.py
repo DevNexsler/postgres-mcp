@@ -17,6 +17,7 @@ from .base import ProviderReceipt
 from .base import ProviderRequest
 from .base import accepted_observation
 from .base import initial_observation
+from .base import json_objects
 from .base import receipt_from_observation
 from .base import request_ref
 from .base import terminal_content
@@ -124,6 +125,24 @@ class CalendarAdapter:
             return common
         payload = terminal_content(result.structured_content)
         ref = request_ref(result.structured_content) or prior_ref
+        # Agent Email's async queue surfaces the created/updated event as a
+        # structured object (data.event), not as formatted text. Prefer
+        # reading the event fields directly out of the payload -- walking
+        # nested objects the way CliqAdapter does -- before falling back to
+        # regexing the human-formatted status text below.
+        for item in json_objects(payload):
+            event_uid = item.get("uid")
+            if not isinstance(event_uid, str) or not event_uid.strip():
+                continue
+            event_uid = event_uid.strip()
+            evidence = {"kind": "calendar_uid", "calendar_event_uid": event_uid}
+            event_url = item.get("event_url")
+            if isinstance(event_url, str) and event_url.strip():
+                evidence["event_url"] = event_url.strip()
+            etag = item.get("etag")
+            if isinstance(etag, str) and etag.strip():
+                evidence["calendar_event_etag"] = etag.strip()
+            return accepted_observation(request_ref_value=ref, message_id=event_uid, evidence=evidence)
         text = result.text or ""
         if payload:
             data = payload.get("data")
