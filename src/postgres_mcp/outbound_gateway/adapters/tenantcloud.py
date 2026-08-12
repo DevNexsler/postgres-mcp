@@ -32,6 +32,7 @@ are kept separate.
 from __future__ import annotations
 
 from typing import Any
+from typing import Callable
 from typing import Mapping
 from typing import Protocol
 from uuid import UUID
@@ -79,8 +80,33 @@ class TenantCloudMutationsProtocol(Protocol):
 
 
 class TenantCloudAdapter:
-    def __init__(self, *, mutations: TenantCloudMutationsProtocol):
-        self._mutations = mutations
+    """Adapter over the Comm-Data-Store TenantCloud facade.
+
+    ``mutations_factory`` exists because the facade's AuthRefreshBudget is
+    SCAN-LOCAL by design (see the 2026-07-21 inactive-runner-refresh spec):
+    it permits one token refresh and then caches that token for the budget's
+    lifetime. That is correct for a short batch and wrong for a daemon -- the
+    gateway used to build one facade in build_runtime() and reuse it for the
+    container's whole life, so the first refresh cached a token that was then
+    served forever. One Firefox lapse latched TenantCloud writes dead until
+    someone restarted the container (2026-08-10, three leads stranded).
+
+    Building a facade per operation restores the lifetime the budget assumes.
+    A single operation still shares one facade, so the pre-write readback and
+    the write itself remain in the same scan and the anti-storm one-refresh
+    reservation still holds within a dispatch.
+    """
+
+    def __init__(self, *, mutations_factory: Callable[[], TenantCloudMutationsProtocol]):
+        # Factory only, deliberately. Accepting a ready-made facade would let a
+        # caller hand in a long-lived one and silently re-create the 2026-08-10
+        # latch; the API should not permit the bug it was written to fix.
+        # Tests that want a fixed double pass ``mutations_factory=lambda: double``.
+        self._mutations_factory = mutations_factory
+
+    def _facade(self) -> TenantCloudMutationsProtocol:
+        """One facade -- and so one auth budget -- per gateway operation."""
+        return self._mutations_factory()
 
     def validate(self, context: ActionContext) -> None:
         if context.operation not in TENANTCLOUD_OPERATIONS:
@@ -128,13 +154,14 @@ class TenantCloudAdapter:
         arguments = request.arguments
         operation_value = request.tool
         target_reference = arguments["target_reference"]
+        mutations = self._facade()
         if operation_value == Operation.TENANTCLOUD_MESSAGE_SEND.value:
-            return self._invoke_message(arguments, operation_value, target_reference)
+            return self._invoke_message(mutations, arguments, operation_value, target_reference)
         if operation_value == Operation.TENANTCLOUD_LEAD_STATUS_UPDATE.value:
-            return self._invoke_lead_status(arguments, operation_value, target_reference)
+            return self._invoke_lead_status(mutations, arguments, operation_value, target_reference)
         if operation_value == Operation.TENANTCLOUD_MAINTENANCE_CREATE.value:
-            return self._invoke_maintenance_create(arguments, operation_value, target_reference)
-        return self._invoke_maintenance_status(arguments, operation_value, target_reference)
+            return self._invoke_maintenance_create(mutations, arguments, operation_value, target_reference)
+        return self._invoke_maintenance_status(mutations, arguments, operation_value, target_reference)
 
     async def poll(self, client: Any, observation: ProviderObservation) -> ProviderObservation:
         # The facade's writes and readbacks are synchronous and always
@@ -157,8 +184,9 @@ class TenantCloudAdapter:
         operation = context.operation
         operation_value = operation.value
         target_reference = tenantcloud_target_reference(context)
+        mutations = self._facade()
         if operation is Operation.TENANTCLOUD_MESSAGE_SEND:
-            result = self._mutations.reconcile_message(
+            result = mutations.reconcile_message(
                 context.target.target_id,
                 str(context.arguments["text"]),
                 source_turn_at=context.source_sent_at,
@@ -171,7 +199,7 @@ class TenantCloudAdapter:
                 accepted_detail="tenantcloud_message_reconciled",
             )
         if operation is Operation.TENANTCLOUD_LEAD_STATUS_UPDATE:
-            result = self._mutations.reconcile_lead_status(context.target.target_id)
+            result = mutations.reconcile_lead_status(context.target.target_id)
             return self._from_reconciliation(
                 result,
                 kind="lead",
@@ -187,7 +215,7 @@ class TenantCloudAdapter:
                 "unit_id": provider_ids["unit_id"],
                 **{field: context.arguments[field] for field in _MAINTENANCE_CREATE_FIELDS},
             }
-            result = self._mutations.reconcile_maintenance_create(dispatched_after=context.source_sent_at, **kwargs)
+            result = mutations.reconcile_maintenance_create(dispatched_after=context.source_sent_at, **kwargs)
             return self._from_reconciliation(
                 result,
                 kind="maintenance",
@@ -195,7 +223,7 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 accepted_detail="tenantcloud_maintenance_create_reconciled",
             )
-        result = self._mutations.reconcile_maintenance_status(context.target.target_id, context.arguments["status"])
+        result = mutations.reconcile_maintenance_status(context.target.target_id, context.arguments["status"])
         return self._from_reconciliation(
             result,
             kind="maintenance",
@@ -212,10 +240,10 @@ class TenantCloudAdapter:
     # provider round trip per dispatch attempt; that is the deliberate,
     # paranoid trade this codebase already makes for post-write readback.
 
-    def _invoke_message(self, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_message(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
         thread_id = arguments["thread_id"]
         body = arguments["body"]
-        pre = self._mutations.reconcile_message(thread_id, body, source_turn_at=arguments["source_sent_at"])
+        pre = mutations.reconcile_message(thread_id, body, source_turn_at=arguments["source_sent_at"])
         if pre.disposition.value == "accepted":
             return self._accepted_from_observation(
                 pre.observation,
@@ -224,7 +252,7 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code="tenantcloud_message_already_present",
             )
-        execution = self._mutations.send_message(thread_id, body)
+        execution = mutations.send_message(thread_id, body)
         return self._from_execution(
             execution,
             kind="message",
@@ -233,9 +261,9 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_message_accepted",
         )
 
-    def _invoke_lead_status(self, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_lead_status(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
         lead_id = arguments["lead_id"]
-        pre = self._mutations.reconcile_lead_status(lead_id)
+        pre = mutations.reconcile_lead_status(lead_id)
         if pre.disposition.value == "accepted":
             return self._accepted_from_observation(
                 pre.observation,
@@ -244,7 +272,7 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code="tenantcloud_lead_status_already_present",
             )
-        execution = self._mutations.mark_lead_working(lead_id)
+        execution = mutations.mark_lead_working(lead_id)
         return self._from_execution(
             execution,
             kind="lead",
@@ -253,13 +281,13 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_lead_status_accepted",
         )
 
-    def _invoke_maintenance_create(self, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_maintenance_create(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
         kwargs = {
             "property_id": arguments["property_id"],
             "unit_id": arguments["unit_id"],
             **{field: arguments[field] for field in _MAINTENANCE_CREATE_FIELDS},
         }
-        pre = self._mutations.reconcile_maintenance_create(dispatched_after=arguments["source_sent_at"], **kwargs)
+        pre = mutations.reconcile_maintenance_create(dispatched_after=arguments["source_sent_at"], **kwargs)
         if pre.disposition.value == "accepted":
             return self._accepted_from_observation(
                 pre.observation,
@@ -268,7 +296,7 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code="tenantcloud_maintenance_already_present",
             )
-        execution = self._mutations.create_maintenance_request(**kwargs)
+        execution = mutations.create_maintenance_request(**kwargs)
         return self._from_execution(
             execution,
             kind="maintenance",
@@ -277,10 +305,10 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_maintenance_create_accepted",
         )
 
-    def _invoke_maintenance_status(self, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_maintenance_status(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
         request_id = arguments["request_id"]
         status = arguments["status"]
-        pre = self._mutations.reconcile_maintenance_status(request_id, status)
+        pre = mutations.reconcile_maintenance_status(request_id, status)
         if pre.disposition.value == "accepted":
             return self._accepted_from_observation(
                 pre.observation,
@@ -289,7 +317,7 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code="tenantcloud_maintenance_status_already_present",
             )
-        execution = self._mutations.update_maintenance_status(request_id, status)
+        execution = mutations.update_maintenance_status(request_id, status)
         return self._from_execution(
             execution,
             kind="maintenance",

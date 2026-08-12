@@ -412,9 +412,18 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
     # any request is made -- see scripts/tenantcloud_auth.py in Comm-Data-Store.
     control = auth_module.HttpRunnerControl(control_url, bearer_file, next_bearer_file)
     auth = auth_module.TenantCloudAuth("tenantcloud-runner", control=control, profile_access=False)
-    client = client_module.TenantCloudClient(auth, base_url=TENANTCLOUD_ORIGIN)
-    mutations = mutations_module.TenantCloudMutations(client)
-    return TenantCloudAdapter(mutations=mutations)
+
+    # The control and auth objects are stateless with respect to token
+    # lifetime and are safe to share. The CLIENT is not: it owns the
+    # AuthRefreshBudget, which permits one refresh and then caches that token
+    # for the budget's lifetime. That budget is scan-local by design, so it
+    # must not outlive a single gateway operation -- see TenantCloudAdapter's
+    # docstring for the 2026-08-10 incident this prevents.
+    def build_mutations():
+        client = client_module.TenantCloudClient(auth, base_url=TENANTCLOUD_ORIGIN)
+        return mutations_module.TenantCloudMutations(client)
+
+    return TenantCloudAdapter(mutations_factory=build_mutations)
 
 
 def _run_coroutine_sync(coro: Coroutine[Any, Any, Any]) -> Any:

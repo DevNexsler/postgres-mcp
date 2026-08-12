@@ -825,7 +825,7 @@ async def test_tenantcloud_message_send_performs_one_write_and_verified_readback
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
     request = adapter.build_request(ctx, ACTION_UID)
 
@@ -864,7 +864,7 @@ async def test_tenantcloud_message_send_already_present_skips_post():
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -886,7 +886,7 @@ async def test_tenantcloud_lead_status_already_working_skips_patch():
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -908,7 +908,7 @@ async def test_tenantcloud_lead_status_writes_when_not_yet_applied():
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -930,7 +930,7 @@ async def test_tenantcloud_maintenance_create_already_present_skips_post():
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -959,7 +959,7 @@ async def test_tenantcloud_maintenance_create_evidence_target_reference_is_stabl
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -980,7 +980,7 @@ async def test_tenantcloud_maintenance_status_update_writes_and_verifies():
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -998,7 +998,7 @@ async def test_tenantcloud_auth_rejection_before_dispatch_is_retryable_non_accep
         None,
         "authentication_unavailable",
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -1019,7 +1019,7 @@ async def test_tenantcloud_auth_rejection_before_dispatch_is_retryable_non_accep
 async def test_tenantcloud_auth_rejection_timeout_or_connection_loss_after_dispatch_is_ambiguous(mutation_result):
     facade = FakeTenantCloudMutations()
     facade.mark_lead_working_result = FakeMutationExecution(mutation_result, None, mutation_result.audit.error_code)
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -1036,7 +1036,7 @@ async def test_tenantcloud_accepted_write_without_verified_readback_stays_ambigu
         None,
         "readback_mismatch",
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -1057,7 +1057,7 @@ async def test_tenantcloud_message_reconciliation_uses_bounded_exact_tuple_searc
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
 
@@ -1083,7 +1083,7 @@ async def test_tenantcloud_maintenance_create_reconciliation_uses_bounded_full_t
         ),
         None,
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MAINTENANCE_CREATE)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
 
@@ -1104,7 +1104,7 @@ async def test_tenantcloud_maintenance_create_reconciliation_uses_bounded_full_t
 async def test_tenantcloud_reconciliation_with_zero_or_multiple_matches_remains_unknown(error_code):
     facade = FakeTenantCloudMutations()
     facade.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, error_code)
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
 
@@ -1120,7 +1120,7 @@ async def test_tenantcloud_status_reconciliation_retries_patch_only_after_author
     facade.reconcile_lead_status_result = FakeReconciliationResult(
         TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence"
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
 
@@ -1164,7 +1164,7 @@ async def test_tenantcloud_provider_rejected_non_acceptance_is_not_retryable():
         None,
         "validation_rejected",
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
@@ -1195,7 +1195,7 @@ async def test_tenantcloud_reconciliation_auth_unavailable_on_a_create_is_retrya
         reconcile_method,
         FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authentication_unavailable"),
     )
-    adapter = TenantCloudAdapter(mutations=facade)
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(operation)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")
 
