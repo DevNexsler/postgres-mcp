@@ -1044,6 +1044,39 @@ async def test_quo_inbound_uses_observed_receiving_line_over_default_route():
 
 
 @pytest.mark.asyncio
+async def test_maintenance_line_reply_uses_receiving_quo_account():
+    event = record(
+        event_source="quo",
+        message_source="quo",
+        source_channel_id="PNvHh9Fq2k",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550199",
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "maintenance-thread-1",
+                    "phoneNumberId": "PNvHh9Fq2k",
+                    "direction": "incoming",
+                    "from": "+19085550199",
+                }
+            }
+        },
+    )
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            operation="quo.sms.send",
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"to_phone": "+19085550199", "text": "Thanks"},
+        )
+    )
+
+    assert context.provider_account == "PNvHh9Fq2k"
+    assert context.recipient_phone == "+19085550199"
+
+
+@pytest.mark.asyncio
 async def test_quo_route_allows_inquiry_reply_but_not_propertyless_showing_offer():
     """This used to be
     test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing_offer,
