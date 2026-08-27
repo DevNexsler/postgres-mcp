@@ -167,6 +167,25 @@ _CLAIMABLE_STATES = {
 }
 
 
+class InvalidDefinitiveFailStateError(RuntimeError):
+    """Mirrors definitively_fail_outbound_action's 'invalid outbound
+    definitive failure state' (Comm-Data-Store migrations/
+    067_outbound_action_gateway.sql:898-902), raised when
+    outbound_action_transition_allowed(expected_state, 'definitive_failed')
+    is false."""
+
+
+# outbound_action_transition_allowed()'s full table (067:346-389) has these
+# and only these edges into 'definitive_failed' -- notably no
+# ('dependency_wait', 'definitive_failed') or ('received', 'definitive_failed').
+_DEFINITIVE_FAIL_ALLOWED_FROM = {
+    ActionState.PREPARED,
+    ActionState.DISPATCHING,
+    ActionState.RETRY_READY,
+    ActionState.MANUAL_REVIEW,
+}
+
+
 class FakeStore:
     def __init__(self, initial=None, *, remediation_successor_id=None, remediation_error=None):
         self.current = initial
@@ -226,6 +245,12 @@ class FakeStore:
 
     async def definitive_fail(self, action_id, expected_state, lease_owner, observation):
         self.calls.append(("definitive_fail", observation.detail_code, observation))
+        if expected_state not in _DEFINITIVE_FAIL_ALLOWED_FROM:
+            raise InvalidDefinitiveFailStateError(
+                f"invalid outbound definitive failure state: no transition from "
+                f"{expected_state.value!r} to 'definitive_failed' "
+                "(migrations/067_outbound_action_gateway.sql:346-389)"
+            )
         self.current = replace(
             self.current,
             state=ActionState.DEFINITIVE_FAILED,
@@ -1647,4 +1672,85 @@ async def test_override_resend_without_operator_remediation_stays_blocked():
     assert resent.action_id == ACTION_ID
     assert resent.detail is not None
     assert "operator" in resent.detail
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_of_terminalizing():
+    """Residual Critical from re-review: outbound_action_transition_allowed()
+    has no ('dependency_wait', 'definitive_failed') edge (Comm-Data-Store
+    migrations/067_outbound_action_gateway.sql:346-389). A fresh RECEIVED row
+    whose prepare() hits a contended intent lock lands in DEPENDENCY_WAIT
+    (067:556-564) -- claim()+definitive_fail() on that state would raise the
+    DB's unhandled 'invalid outbound definitive failure state'. The gate must
+    defer (leave the row in DEPENDENCY_WAIT, return a PENDING blocked result)
+    instead, exactly like _preflight()'s READY branch already does for the
+    same lock-contention outcome."""
+    store = FakeStore()
+    adapter = FakeAdapter()
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+
+    async def contended_prepare(ctx, expected_state):
+        store.calls.append(("prepare", expected_state))
+        store.current = replace(
+            store.current,
+            state=ActionState.DEPENDENCY_WAIT,
+            detail_code="intent_lock_contended",
+            next_attempt_at=NOW + timedelta(seconds=5),
+        )
+        return store.current
+
+    store.prepare = contended_prepare
+
+    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code == "stale_context"
+    assert result.detail is not None
+    assert "override" in result.detail
+    assert store.current.state is ActionState.DEPENDENCY_WAIT
+    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_enforce_defers_dependency_wait_instead_of_terminalizing():
+    """Same residual Critical, second reachable path: worker.py routes an
+    already-dependency_wait action straight to resume(), never through
+    execute()'s prepare() at all -- the gate must defer here too."""
+    store = FakeStore(
+        row(
+            ActionState.DEPENDENCY_WAIT,
+            action_uid=ACTION_UID,
+            detail_code="intent_lock_contended",
+        )
+    )
+    adapter = FakeAdapter()
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+
+    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code == "stale_context"
+    assert result.detail is not None
+    assert store.current.state is ActionState.DEPENDENCY_WAIT
+    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
     assert adapter.calls == []

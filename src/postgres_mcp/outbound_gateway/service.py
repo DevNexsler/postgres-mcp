@@ -305,15 +305,26 @@ class OutboundActionService:
         granted to the gateway's runtime role in migrations/120_outbound_action_terminal_wake_boundary.sql:550-551)
         rather than inventing a new one. That function's own precondition --
         an evidence-resolved `outbound_action_resolutions` row for this
-        action (067:1221-1228) -- can only be written by
-        resolve_outbound_action_from_evidence, which stays operator-only
-        (never granted to the gateway role). So an override resend can only
-        succeed once an operator has resolved the block; until then this
-        returns None and the caller stays on the original terminal result
-        instead of crashing on the unhandled precondition-violation
+        action (067:1221-1228) -- is written by resolve_outbound_action_from_evidence,
+        which IS granted to the gateway's runtime role (migrations/
+        079_runtime_tenantcloud_privilege_boundary.sql:427,459-475), so this
+        is not a privilege wall. The real blocker is a lifecycle/evidence
+        mismatch: resolve_outbound_action_from_evidence only accepts a row
+        already in 'manual_review' (067:1160-1163) and requires real
+        provider-side non-acceptance evidence (a 64-hex hash, a non-empty
+        reference, evidence_kind='authoritative_non_acceptance', 067:1164-1173)
+        -- neither of which a traffic-control block has: it goes straight to
+        'definitive_failed' from a live/pending state, never through
+        'manual_review', and there is no provider disposition to attest to,
+        only an internal recipient-safety policy decision. So an override
+        resend can only succeed once an operator has independently routed
+        this action through manual_review and evidence-resolved it; until
+        then this returns None and the caller stays on the original terminal
+        result instead of crashing on the unhandled precondition-violation
         exception. Closing that gap for a fully autonomous, zero-operator
-        unblock needs a new Comm-Data-Store migration -- out of scope for
-        this worktree.
+        unblock needs a new Comm-Data-Store migration (e.g. a successor path
+        keyed on error_category='traffic_blocked' instead of an evidence
+        resolution) -- out of scope for this worktree.
 
         The successor's context is the SAME `context` already loaded for
         this call (not re-derived via `_verified_context`): the successor
@@ -377,6 +388,24 @@ class OutboundActionService:
                     claimable = await self._store.prepare(context, action.state)
                     if claimable.state is ActionState.COMPLETED:
                         return self._result(claimable, repeated=True)
+                if claimable.state is ActionState.DEPENDENCY_WAIT:
+                    # outbound_action_transition_allowed() has no
+                    # dependency_wait -> definitive_failed edge (Comm-Data-Store
+                    # migrations/067_outbound_action_gateway.sql:346-389) --
+                    # forcing a terminal here would raise the DB's 'invalid
+                    # outbound definitive failure state' uncaught. Two ways to
+                    # land here: a fresh RECEIVED row whose prepare() above hit
+                    # a contended intent lock (067:556-564), or resume() being
+                    # called on an already-dependency_wait row. Same pattern
+                    # _preflight()'s READY branch already uses for lock
+                    # contention (~line 643): defer instead of terminalizing.
+                    # Semantically this is fine -- a deferred block is still a
+                    # block (do-not-dispatch-now), and the row stays legally
+                    # re-drivable: the worker's next resume() re-runs this same
+                    # gate, so either the lock contention clearing or an
+                    # override resend un-defers it on its own, with no manual
+                    # intervention needed.
+                    return self._result(claimable, detail_code=verdict.reason, detail=verdict.detail)
                 claimed = await self._store.claim(
                     claimable.action_id,
                     claimable.state,
@@ -1028,13 +1057,14 @@ class OutboundActionService:
         *,
         repeated: bool = False,
         detail: str | None = None,
+        detail_code: str | None = None,
     ) -> PublicResult:
         return public_result(
             state=action.state,
             action_id=action.action_id,
             action_uid=action.action_uid,
             provider_request_ref=action.provider_request_ref,
-            detail_code=action.detail_code,
+            detail_code=detail_code or action.detail_code,
             completion_kind=action.completion_kind,
             repeated_execute=repeated,
             detail=detail,
