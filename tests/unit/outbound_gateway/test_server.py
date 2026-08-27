@@ -161,6 +161,48 @@ async def test_execute_and_status_delegate_only_after_strict_json_validation():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("payload", "path", "accepted", "secrets"),
+    [
+        ({"operation": "attacker-operation"}, "operation", "email.send", ("attacker-operation",)),
+        ({"intent_kind": "private-intent"}, "intent_kind", "inquiry_reply", ("private-intent",)),
+        ({"action_role": "secret-role"}, "action_role", "prospect_reply", ("secret-role",)),
+        (
+            {"arguments": {"to_address": "prospect@example.com"}},
+            "arguments.text",
+            "to_address",
+            ("prospect@example.com",),
+        ),
+        (
+            {
+                "arguments": {
+                    "to_address": "prospect@example.com",
+                    "text": "message secret",
+                    "private_argument": "credential secret",
+                }
+            },
+            "arguments",
+            "to_address",
+            ("prospect@example.com", "message secret", "credential secret", "private_argument"),
+        ),
+    ],
+)
+async def test_validation_errors_expose_only_safe_schema_guidance(payload, path, accepted, secrets):
+    with pytest.raises(ValueError) as raised:
+        await handle_outbound_action(
+            AsyncMock(),
+            FeaturePolicy(writes_enabled=True, kill_switch=False),
+            {**execute_payload(), **payload},
+        )
+
+    message = str(raised.value)
+    assert path in message
+    assert accepted in message
+    assert all(secret not in message for secret in secrets)
+    assert "invalid outbound action request" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("policy", "detail"),
     [
         (FeaturePolicy(writes_enabled=False, kill_switch=False), "writes_disabled"),
@@ -216,40 +258,95 @@ def test_focused_server_tool_description_mentions_suggest():
 @pytest.mark.asyncio
 async def test_suggest_returns_ids_the_wake_implies():
     service = AsyncMock()
-    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
-    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+    service.suggest.return_value = {
+        "provider": "tenantcloud",
+        "suggestions": {"lead_id": "2405115", "thread_id": "2002331"},
+        "enabled_operations": ["email.send", "tenantcloud.lead.status.update"],
+        "enabled_intents": ["inquiry_reply", "tenantcloud_lead_status"],
+    }
+    policy = FeaturePolicy(
+        writes_enabled=True,
+        kill_switch=False,
+        enabled_operations=frozenset({Operation.EMAIL_SEND, Operation.TENANTCLOUD_LEAD_STATUS_UPDATE}),
+    )
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert result["wakeup_event_id"] == 1
     assert result["suggestions"] == {"lead_id": "2405115", "thread_id": "2002331"}
-    service.suggest_targets.assert_awaited_once_with(1)
+    assert result["provider"] == "tenantcloud"
+    assert result["enabled_operations"] == ["email.send", "tenantcloud.lead.status.update"]
+    assert result["enabled_intents"] == ["inquiry_reply", "tenantcloud_lead_status"]
+    service.suggest.assert_awaited_once_with(1)
 
 
 @pytest.mark.asyncio
 async def test_suggest_returns_empty_for_a_wake_with_no_hints():
     service = AsyncMock()
-    service.suggest_targets.return_value = {}
+    service.suggest.return_value = {
+        "provider": None,
+        "suggestions": {},
+        "enabled_operations": [],
+        "enabled_intents": [],
+    }
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 2},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 2},
     )
 
-    assert result["suggestions"] == {}
+    assert result == {
+        "wakeup_event_id": 2,
+        "provider": None,
+        "suggestions": {},
+        "enabled_operations": [],
+        "enabled_intents": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_suggest_excludes_globally_disabled_operations():
+    service = AsyncMock()
+    service.suggest.return_value = {
+        "provider": "tenantcloud",
+        "suggestions": {},
+        "enabled_operations": ["email.send", "tenantcloud.lead.status.update"],
+        "enabled_intents": ["inquiry_reply", "tenantcloud_lead_status"],
+    }
+    policy = FeaturePolicy(
+        writes_enabled=True,
+        kill_switch=False,
+        enabled_operations=frozenset({Operation.EMAIL_SEND}),
+    )
+
+    result = await handle_outbound_action(service, policy, {"op": "suggest", "wakeup_event_id": 2})
+
+    assert result["enabled_operations"] == ["email.send"]
+    assert result["enabled_intents"] == ["inquiry_reply", "tenantcloud_lead_status"]
 
 
 @pytest.mark.asyncio
 async def test_suggest_never_writes_and_ignores_the_kill_switch():
     """Advisory reads stay available even when writes are disabled."""
     service = AsyncMock()
-    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
+    service.suggest.return_value = {
+        "provider": "tenantcloud",
+        "suggestions": {"lead_id": "2405115", "thread_id": "2002331"},
+        "enabled_operations": ["tenantcloud.lead.status.update"],
+        "enabled_intents": ["tenantcloud_lead_status"],
+    }
     policy = FeaturePolicy(writes_enabled=False, kill_switch=True)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert "suggestions" in result
@@ -448,9 +545,7 @@ def test_reject_tenantcloud_origin_overrides_is_a_noop_without_any_override_env(
     ],
 )
 def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_path, monkeypatch, bad_url):
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
@@ -475,9 +570,7 @@ def test_tenantcloud_import_resolves_under_container_shaped_web_usage_mount(tmp_
     shape -- not merely when the developer's full host workspace happens to
     already sit at /home/danpark/workspace. Reproduces the container
     ModuleNotFoundError crash-loop reported in review."""
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 

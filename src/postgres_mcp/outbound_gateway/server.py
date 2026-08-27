@@ -37,6 +37,8 @@ from .context import RoutingPolicy
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
+from .models import ARGUMENT_MODELS
+from .models import ActionRole
 from .models import ExecuteRequest
 from .models import IntentKind
 from .models import Operation
@@ -112,6 +114,47 @@ class GatewayRuntime:
     observability: GatewayObservability
 
 
+_REQUEST_OPERATIONS = tuple(sorted(operation.value for operation in Operation))
+_REQUEST_INTENTS = tuple(sorted(intent.value for intent in IntentKind))
+_REQUEST_ROLES = tuple(sorted(role.value for role in ActionRole))
+_REQUEST_ARGUMENT_KEYS = tuple(sorted({key for model in ARGUMENT_MODELS.values() for key in model.model_fields}))
+_REQUEST_TOP_LEVEL_KEYS = ("action_id", "action_role", "appointment_slot", "arguments", "intent_kind", "op", "operation", "wakeup_event_id")
+_REQUEST_ENUM_VALUES = {
+    "operation": _REQUEST_OPERATIONS,
+    "intent_kind": _REQUEST_INTENTS,
+    "action_role": _REQUEST_ROLES,
+}
+
+
+def _safe_validation_message(error: ValidationError) -> str:
+    """Render trusted schema metadata without rendering request/error data."""
+    guidance: list[str] = []
+    for detail in error.errors(include_input=False):
+        location = detail.get("loc", ())
+        error_type = detail.get("type")
+        known_enum = next((part for part in location if part in _REQUEST_ENUM_VALUES), None)
+        if known_enum is not None:
+            values = ", ".join(_REQUEST_ENUM_VALUES[known_enum])
+            guidance.append(f"{known_enum}: accepted values: {values}")
+            continue
+        known_argument = next((part for part in location if part in _REQUEST_ARGUMENT_KEYS), None)
+        if known_argument is not None and error_type == "missing":
+            guidance.append(f"arguments.{known_argument}: accepted keys: {', '.join(_REQUEST_ARGUMENT_KEYS)}")
+            continue
+        if error_type == "extra_forbidden":
+            guidance.append(f"arguments: accepted keys: {', '.join(_REQUEST_ARGUMENT_KEYS)}")
+            continue
+        if error_type == "union_tag_invalid":
+            guidance.append("op: accepted values: execute, status, suggest")
+            continue
+        if error_type == "missing":
+            guidance.append(f"request: accepted keys: {', '.join(_REQUEST_TOP_LEVEL_KEYS)}")
+    unique_guidance = list(dict.fromkeys(guidance))
+    if not unique_guidance:
+        return "invalid outbound action request"
+    return f"invalid outbound action request: {'; '.join(unique_guidance)}"
+
+
 async def handle_outbound_action(
     service: OutboundActionService,
     policy: FeaturePolicy,
@@ -120,11 +163,18 @@ async def handle_outbound_action(
     try:
         parsed = parse_outbound_request(request)
     except ValidationError as exc:
-        raise ValueError("invalid outbound action request") from exc
+        raise ValueError(_safe_validation_message(exc)) from exc
     if isinstance(parsed, SuggestRequest):
+        suggestion = await service.suggest(parsed.wakeup_event_id)
+        enabled_operations = sorted(
+            operation for operation in suggestion["enabled_operations"] if operation in {enabled.value for enabled in policy.enabled_operations}
+        )
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
-            "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
+            "provider": suggestion["provider"],
+            "suggestions": suggestion["suggestions"],
+            "enabled_operations": enabled_operations,
+            "enabled_intents": sorted(suggestion["enabled_intents"]),
         }
     if isinstance(parsed, StatusRequest):
         result = await service.status(parsed.action_id)
@@ -184,7 +234,7 @@ def create_server(
             "TenantCloud action. You choose the target id (to_address, to_phone, "
             "channel_or_chat_id, calendar_id, thread_id, lead_id, etc.) as part of "
             "arguments -- it is never derived from wakeup_event_id for you. Use suggest "
-            "({\"op\": \"suggest\", \"wakeup_event_id\"}) to ask what the wake implies "
+            '({"op": "suggest", "wakeup_event_id"}) to ask what the wake implies '
             "-- it returns advisory target ids drawn from the wake, never blocks, and "
             "stays reachable even when writes are disabled. Its answer is a suggestion "
             "only: you may pass any target id you like to execute, including ones that "
@@ -338,8 +388,7 @@ def _reject_tenantcloud_origin_overrides() -> None:
     present = sorted(name for name in _TENANTCLOUD_ORIGIN_OVERRIDE_ENV_VARS if os.environ.get(name))
     if present:
         raise ValueError(
-            "TenantCloud API origin is a fixed literal (" + TENANTCLOUD_ORIGIN + "); "
-            "unsupported override variable(s) set: " + ", ".join(present)
+            "TenantCloud API origin is a fixed literal (" + TENANTCLOUD_ORIGIN + "); unsupported override variable(s) set: " + ", ".join(present)
         )
 
 

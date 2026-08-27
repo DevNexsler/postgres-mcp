@@ -23,6 +23,7 @@ from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
 from .context import ContextDerivationError
+from .context import SuggestionData
 from .context import canonical_payload_hash
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
@@ -250,6 +251,9 @@ class OutboundActionService:
 
     async def suggest_targets(self, wakeup_event_id: int) -> dict[str, str]:
         return await self._context_loader.suggest_targets(wakeup_event_id)
+
+    async def suggest(self, wakeup_event_id: int) -> SuggestionData:
+        return await self._context_loader.suggest(wakeup_event_id)
 
     async def resume(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)

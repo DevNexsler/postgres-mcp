@@ -12,6 +12,7 @@ from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
 from typing import Mapping
+from typing import TypedDict
 from unicodedata import normalize
 from uuid import UUID
 from uuid import uuid5
@@ -91,6 +92,13 @@ class RoutingPolicy:
     enabled_operations_by_provider: Mapping[str, frozenset[str]] = dataclass_field(default_factory=dict)
     enabled_intents: frozenset[str] = frozenset()
     enabled_intents_by_provider: Mapping[str, frozenset[str]] = dataclass_field(default_factory=dict)
+
+
+class SuggestionData(TypedDict):
+    provider: str | None
+    suggestions: dict[str, str]
+    enabled_operations: list[str]
+    enabled_intents: list[str]
 
 
 @dataclass(frozen=True)
@@ -262,11 +270,7 @@ class ActionContextLoader:
             property_id = str(request.arguments.property_id)
 
         aliases = self._aliases(record, envelope, message, raw)
-        if (
-            not aliases
-            and request.action_role is not ActionRole.INTERNAL_NOTIFICATION
-            and request.operation not in _TENANTCLOUD_OPERATIONS
-        ):
+        if not aliases and request.action_role is not ActionRole.INTERNAL_NOTIFICATION and request.operation not in _TENANTCLOUD_OPERATIONS:
             raise ContextDerivationError("no stable prospect aliases")
         if aliases:
             resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
@@ -274,11 +278,7 @@ class ActionContextLoader:
                 raise ContextDerivationError("prospect aliases are ambiguous")
             prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
         else:
-            prospect_id = (
-                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
-                if record.tenantcloud_claim_id is not None
-                else "internal:none"
-            )
+            prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}" if record.tenantcloud_claim_id is not None else "internal:none"
 
         thread_identity = self._thread_identity(record, raw, message, provider)
         conversation_provider = "zillow" if provider in _ZILLOW_PROVIDER_FAMILY else provider
@@ -330,11 +330,7 @@ class ActionContextLoader:
             assert isinstance(request.arguments, (CalendarUpdateArguments, CalendarDeleteArguments))
             calendar_event_url = request.arguments.event_url or calendar_event_url
             calendar_event_etag = request.arguments.etag or calendar_event_etag
-            calendar_event_uid = (
-                request.arguments.event_uid
-                or _calendar_event_uid_from_url(calendar_event_url)
-                or calendar_event_uid
-            )
+            calendar_event_uid = request.arguments.event_uid or _calendar_event_uid_from_url(calendar_event_url) or calendar_event_uid
             if not calendar_event_uid:
                 raise ContextDerivationError("canonical calendar event UID is required")
             if not calendar_event_url or not calendar_event_etag:
@@ -480,9 +476,52 @@ class ActionContextLoader:
         record = await self._repository.load_wake_event(wakeup_event_id)
         if record is None:
             return {}
+        return self._suggest_targets(record)
+
+    async def suggest(self, wakeup_event_id: int) -> SuggestionData:
+        """Return advisory target hints and static routing capabilities."""
+        record = await self._repository.load_wake_event(wakeup_event_id)
+        if record is None:
+            return self._empty_suggestion()
+        envelope = _mapping(record.envelope)
+        message = _mapping(envelope.get("message"))
+        raw = _mapping(record.raw_payload)
+        provider = self._provider(record, raw, message)
+        if not provider:
+            return self._empty_suggestion()
+        return {
+            "provider": provider,
+            "suggestions": self._suggest_targets(record),
+            "enabled_operations": self._enabled_operations_for_provider(provider),
+            "enabled_intents": self._enabled_intents_for_provider(provider),
+        }
+
+    @staticmethod
+    def _empty_suggestion() -> SuggestionData:
+        return {
+            "provider": None,
+            "suggestions": {},
+            "enabled_operations": [],
+            "enabled_intents": [],
+        }
+
+    def _suggest_targets(self, record: WakeEventRecord) -> dict[str, str]:
         hints = dict(self._wake_tenantcloud_hints(record))
         hints.update(self._wake_recipient_hints(record))
         return hints
+
+    def _enabled_operations_for_provider(self, provider: str) -> list[str]:
+        if self._policy.enabled_operations_by_provider:
+            operations = self._policy.enabled_operations_by_provider.get(provider, frozenset())
+        else:
+            operations = frozenset(operation.value for operation in Operation)
+        return sorted(operations)
+
+    def _enabled_intents_for_provider(self, provider: str) -> list[str]:
+        intents = self._policy.enabled_intents or frozenset(intent.value for intent in IntentKind)
+        if self._policy.enabled_intents_by_provider:
+            intents = intents & self._policy.enabled_intents_by_provider.get(provider, frozenset())
+        return sorted(intents)
 
     def _wake_recipient_hints(self, record: WakeEventRecord) -> dict[str, str]:
         """Best-effort email/phone recipient a wake implies -- the same
@@ -579,12 +618,7 @@ class ActionContextLoader:
             return ()
         if parsed_sent_at.tzinfo is None:
             return ()
-        delta_seconds = abs(
-            (
-                parsed_sent_at.astimezone(timezone.utc)
-                - record.message_sent_at.astimezone(timezone.utc)
-            ).total_seconds()
-        )
+        delta_seconds = abs((parsed_sent_at.astimezone(timezone.utc) - record.message_sent_at.astimezone(timezone.utc)).total_seconds())
         if delta_seconds > _CROSS_CHANNEL_DUPLICATE_MAX_SECONDS:
             return ()
         return (duplicate_id,)
@@ -634,11 +668,7 @@ class ActionContextLoader:
             or _nonblank(message.get("zillow_proxy_email"))
             or _nonblank(raw.get("proxy_email"))
             or _nonblank(raw.get("zillow_proxy_email"))
-            or (
-                record.participant_key
-                if record.participant_type in _EMAIL_PARTICIPANT_TYPES
-                else None
-            ),
+            or (record.participant_key if record.participant_type in _EMAIL_PARTICIPANT_TYPES else None),
             require_zillow_proxy=True,
         )
         nearby_messages = _mapping(envelope.get("conversation_context")).get(
@@ -649,8 +679,7 @@ class ActionContextLoader:
             for nearby_value in nearby_messages:
                 nearby = _mapping(nearby_value)
                 nearby_proxy = replyable_email(
-                    _nonblank(nearby.get("proxy_email"))
-                    or _nonblank(nearby.get("zillow_proxy_email")),
+                    _nonblank(nearby.get("proxy_email")) or _nonblank(nearby.get("zillow_proxy_email")),
                     require_zillow_proxy=True,
                 )
                 nearby_property = _nonblank(nearby.get("property"))
@@ -800,11 +829,7 @@ class ActionContextLoader:
             # account/line selection, not recipient identity -- the agent's
             # to_phone (above) is the only thing that decides who receives
             # the message.
-            account = (
-                observed_account
-                if provider == "quo" and observed_account and observed_inbound
-                else configured_account
-            )
+            account = observed_account if provider == "quo" and observed_account and observed_inbound else configured_account
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)
