@@ -203,6 +203,67 @@ async def test_validation_errors_expose_only_safe_schema_guidance(payload, path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {**execute_payload(), "arguments": {"to_address": "prospect@example.com"}},
+            "invalid outbound action request: arguments.text: accepted keys: text, to_address",
+        ),
+        (
+            {
+                **execute_payload(),
+                "action_role": "calendar_mutation",
+                "operation": "calendar.create",
+                "intent_kind": "showing_create",
+                "arguments": {"description": "appointment details"},
+            },
+            "invalid outbound action request: arguments.calendar_id: accepted keys: calendar_id, description",
+        ),
+        (
+            {
+                **execute_payload(),
+                "action_role": "provider_mutation",
+                "operation": "tenantcloud.maintenance.status.update",
+                "intent_kind": "tenantcloud_maintenance_status",
+                "appointment_slot": None,
+                "arguments": {"request_id": 81},
+            },
+            "invalid outbound action request: arguments.status: accepted keys: request_id, status",
+        ),
+        (
+            {
+                **execute_payload(),
+                "arguments": {
+                    "to_address": "prospect@example.com",
+                    "text": "safe message",
+                    "unknown_argument": "secret",
+                },
+            },
+            "invalid outbound action request: arguments: accepted keys: text, to_address",
+        ),
+        (
+            {"op": "status", "action_id": str(ACTION_ID), "unknown_root": "secret"},
+            "invalid outbound action request: status: accepted keys: action_id, op",
+        ),
+        (
+            {"op": "suggest", "wakeup_event_id": 1, "unknown_root": "secret"},
+            "invalid outbound action request: suggest: accepted keys: op, wakeup_event_id",
+        ),
+    ],
+)
+async def test_validation_guidance_uses_operation_fields_and_root_schema_areas(payload, expected):
+    with pytest.raises(ValueError) as raised:
+        await handle_outbound_action(
+            AsyncMock(),
+            FeaturePolicy(writes_enabled=True, kill_switch=False),
+            payload,
+        )
+
+    assert str(raised.value) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("policy", "detail"),
     [
         (FeaturePolicy(writes_enabled=False, kill_switch=False), "writes_disabled"),

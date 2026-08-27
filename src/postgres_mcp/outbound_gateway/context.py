@@ -270,7 +270,11 @@ class ActionContextLoader:
             property_id = str(request.arguments.property_id)
 
         aliases = self._aliases(record, envelope, message, raw)
-        if not aliases and request.action_role is not ActionRole.INTERNAL_NOTIFICATION and request.operation not in _TENANTCLOUD_OPERATIONS:
+        if (
+            not aliases
+            and request.action_role is not ActionRole.INTERNAL_NOTIFICATION
+            and request.operation not in _TENANTCLOUD_OPERATIONS
+        ):
             raise ContextDerivationError("no stable prospect aliases")
         if aliases:
             resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
@@ -278,7 +282,11 @@ class ActionContextLoader:
                 raise ContextDerivationError("prospect aliases are ambiguous")
             prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
         else:
-            prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}" if record.tenantcloud_claim_id is not None else "internal:none"
+            prospect_id = (
+                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
+                if record.tenantcloud_claim_id is not None
+                else "internal:none"
+            )
 
         thread_identity = self._thread_identity(record, raw, message, provider)
         conversation_provider = "zillow" if provider in _ZILLOW_PROVIDER_FAMILY else provider
@@ -330,7 +338,11 @@ class ActionContextLoader:
             assert isinstance(request.arguments, (CalendarUpdateArguments, CalendarDeleteArguments))
             calendar_event_url = request.arguments.event_url or calendar_event_url
             calendar_event_etag = request.arguments.etag or calendar_event_etag
-            calendar_event_uid = request.arguments.event_uid or _calendar_event_uid_from_url(calendar_event_url) or calendar_event_uid
+            calendar_event_uid = (
+                request.arguments.event_uid
+                or _calendar_event_uid_from_url(calendar_event_url)
+                or calendar_event_uid
+            )
             if not calendar_event_uid:
                 raise ContextDerivationError("canonical calendar event UID is required")
             if not calendar_event_url or not calendar_event_etag:
@@ -618,7 +630,12 @@ class ActionContextLoader:
             return ()
         if parsed_sent_at.tzinfo is None:
             return ()
-        delta_seconds = abs((parsed_sent_at.astimezone(timezone.utc) - record.message_sent_at.astimezone(timezone.utc)).total_seconds())
+        delta_seconds = abs(
+            (
+                parsed_sent_at.astimezone(timezone.utc)
+                - record.message_sent_at.astimezone(timezone.utc)
+            ).total_seconds()
+        )
         if delta_seconds > _CROSS_CHANNEL_DUPLICATE_MAX_SECONDS:
             return ()
         return (duplicate_id,)
@@ -668,7 +685,11 @@ class ActionContextLoader:
             or _nonblank(message.get("zillow_proxy_email"))
             or _nonblank(raw.get("proxy_email"))
             or _nonblank(raw.get("zillow_proxy_email"))
-            or (record.participant_key if record.participant_type in _EMAIL_PARTICIPANT_TYPES else None),
+            or (
+                record.participant_key
+                if record.participant_type in _EMAIL_PARTICIPANT_TYPES
+                else None
+            ),
             require_zillow_proxy=True,
         )
         nearby_messages = _mapping(envelope.get("conversation_context")).get(
@@ -679,7 +700,8 @@ class ActionContextLoader:
             for nearby_value in nearby_messages:
                 nearby = _mapping(nearby_value)
                 nearby_proxy = replyable_email(
-                    _nonblank(nearby.get("proxy_email")) or _nonblank(nearby.get("zillow_proxy_email")),
+                    _nonblank(nearby.get("proxy_email"))
+                    or _nonblank(nearby.get("zillow_proxy_email")),
                     require_zillow_proxy=True,
                 )
                 nearby_property = _nonblank(nearby.get("property"))
@@ -829,7 +851,11 @@ class ActionContextLoader:
             # account/line selection, not recipient identity -- the agent's
             # to_phone (above) is the only thing that decides who receives
             # the message.
-            account = observed_account if provider == "quo" and observed_account and observed_inbound else configured_account
+            account = (
+                observed_account
+                if provider == "quo" and observed_account and observed_inbound
+                else configured_account
+            )
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)
