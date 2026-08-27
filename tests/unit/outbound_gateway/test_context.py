@@ -796,6 +796,60 @@ async def test_rollout_policy_rejects_unapproved_intent():
 
 
 @pytest.mark.asyncio
+async def test_internal_notification_ignores_wake_provider_operation_and_intent_policy():
+    restricted = replace(
+        policy(),
+        enabled_operations_by_provider={"zillow": frozenset({"email.send"})},
+        enabled_intents=frozenset({"inquiry_reply", "lead_alert"}),
+        enabled_intents_by_provider={"zillow": frozenset({"inquiry_reply"})},
+    )
+    event = record(
+        raw_payload={},
+        envelope={"identity": {}, "message": {}},
+        participant_key="melody@example.com",
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), restricted).load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "tenant-leads", "text": "Review applicant"},
+        )
+    )
+
+    assert context.source == "zoho_mail"
+    assert context.target.kind == "cliq_channel"
+    assert context.target.target_id == "tenant-leads"
+
+
+@pytest.mark.asyncio
+async def test_zillow_sender_from_zoho_mail_uses_zillow_policy_without_a_proxy_address():
+    restricted = replace(
+        policy(),
+        enabled_operations_by_provider={"zillow": frozenset({"email.send"})},
+        enabled_intents=frozenset({"inquiry_reply"}),
+        enabled_intents_by_provider={"zillow": frozenset({"inquiry_reply"})},
+    )
+    event = record(
+        raw_payload={},
+        envelope={"identity": {}, "message": {}},
+        participant_key="applications@alerts.zillow.com",
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), restricted).load(
+        request(
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"to_address": "leasing@example.com", "text": "Application received"},
+        )
+    )
+
+    assert context.source == "zillow"
+
+
+@pytest.mark.asyncio
 async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_suggest():
     """thread_identity/conversation_id bucketing is unrelated to target
     selection and stays wake-derived. The recipient itself now comes from

@@ -485,6 +485,13 @@ class ExecuteRequest(StrictModel):
         data["arguments"] = ARGUMENT_MODELS[operation].model_validate(raw.get("arguments"))
         return data
 
+    @field_validator("intent_kind", mode="before")
+    @classmethod
+    def normalize_intent_alias(cls, value: Any) -> Any:
+        if value == "escalation":
+            return IntentKind.MANUAL_REVIEW_ALERT.value
+        return value
+
     @field_validator("appointment_slot", mode="before")
     @classmethod
     def normalize_appointment_slot(cls, value: Any) -> datetime | None:

@@ -12,6 +12,7 @@ from postgres_mcp.outbound_gateway.models import CalendarUpdateArguments
 from postgres_mcp.outbound_gateway.models import CliqArguments
 from postgres_mcp.outbound_gateway.models import EmailArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
+from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import QuoSmsArguments
 from postgres_mcp.outbound_gateway.models import StatusRequest
@@ -153,6 +154,20 @@ def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(operatio
 def test_adapter_arguments_and_enums_reject_unknown_values(overrides):
     with pytest.raises(ValidationError):
         parse_outbound_request(execute_payload(**overrides))
+
+
+def test_escalation_intent_alias_normalizes_to_manual_review_alert():
+    request = parse_outbound_request(
+        execute_payload(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="escalation",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "tenant-leads", "text": "Review applicant"},
+        )
+    )
+
+    assert request.intent_kind is IntentKind.MANUAL_REVIEW_ALERT
 
 
 @pytest.mark.parametrize(

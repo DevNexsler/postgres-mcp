@@ -236,7 +236,7 @@ class ActionContextLoader:
         # below, reintroducing exactly the wake-shape coupling this task
         # removes one layer up.
         provider = "tenantcloud" if request.operation in _TENANTCLOUD_OPERATIONS else self._provider(record, raw, message)
-        if self._policy.enabled_operations_by_provider:
+        if request.action_role is not ActionRole.INTERNAL_NOTIFICATION and self._policy.enabled_operations_by_provider:
             allowed_operations = self._policy.enabled_operations_by_provider.get(
                 provider,
                 frozenset(),
@@ -245,7 +245,7 @@ class ActionContextLoader:
                 raise ContextDerivationError("provider operation is disabled")
         if self._policy.enabled_intents and request.intent_kind.value not in self._policy.enabled_intents:
             raise ContextDerivationError("intent is disabled")
-        if self._policy.enabled_intents_by_provider:
+        if request.action_role is not ActionRole.INTERNAL_NOTIFICATION and self._policy.enabled_intents_by_provider:
             provider_intents = self._policy.enabled_intents_by_provider.get(
                 provider,
                 frozenset(),
@@ -617,6 +617,13 @@ class ActionContextLoader:
             return "cliq"
         if record.message_source == "tenantcloud_api":
             return "tenantcloud"
+        sender = _nonblank(
+            record.participant_key if record.participant_type in _EMAIL_PARTICIPANT_TYPES else None
+        )
+        if sender and _EMAIL.fullmatch(sender):
+            domain = sender.rsplit("@", 1)[1].casefold()
+            if domain == "zillow.com" or domain.endswith(".zillow.com"):
+                return "zillow"
         return record.message_source.casefold()
 
     @staticmethod
