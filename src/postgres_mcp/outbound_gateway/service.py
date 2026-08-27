@@ -300,7 +300,7 @@ class OutboundActionService:
                         evidence={"detail": verdict.detail},
                     ),
                 )
-                return self._result(failed)
+                return self._result(failed, detail=verdict.detail)
             logger.warning(
                 "traffic control shadow would-block: %s %s wake=%s recipient=%s",
                 verdict.reason,
@@ -920,7 +920,12 @@ class OutboundActionService:
         return True
 
     @staticmethod
-    def _result(action: OutboundActionRecord, *, repeated: bool = False) -> PublicResult:
+    def _result(
+        action: OutboundActionRecord,
+        *,
+        repeated: bool = False,
+        detail: str | None = None,
+    ) -> PublicResult:
         return public_result(
             state=action.state,
             action_id=action.action_id,
@@ -929,4 +934,5 @@ class OutboundActionService:
             detail_code=action.detail_code,
             completion_kind=action.completion_kind,
             repeated_execute=repeated,
+            detail=detail,
         )

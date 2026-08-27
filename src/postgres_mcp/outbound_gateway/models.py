@@ -513,3 +513,10 @@ class PublicResult(StrictModel):
     provider_request_ref: str | None
     retryable: Literal[False] = False
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
+    # Human-readable elaboration of detail_code. None everywhere except traffic-control
+    # blocks: that is the one path where the calling agent must read *why* (which
+    # in-flight action or newer message) to decide skip vs. resend with override=true --
+    # detail_code alone ("lease_held"/"stale_context") does not carry that. Left unset
+    # (None) for every other result so existing consumers see no new key on the wire
+    # (server.py omits it from the response payload when None).
+    detail: str | None = None

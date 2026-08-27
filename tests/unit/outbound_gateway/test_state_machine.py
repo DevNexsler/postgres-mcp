@@ -111,6 +111,7 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
     )
     assert result.status == expected
     assert result.retryable is False
+    assert result.detail is None
     assert set(result.model_dump()) == {
         "status",
         "action_id",
@@ -118,6 +119,7 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
         "provider_request_ref",
         "retryable",
         "detail_code",
+        "detail",
     }
     with pytest.raises(ValidationError):
         type(result)(**result.model_dump(), raw_provider_payload={"secret": "x"})
@@ -132,3 +134,15 @@ def test_completed_state_requires_completion_kind():
             provider_request_ref="request-1",
             detail_code="stable_code",
         )
+
+
+def test_public_result_carries_optional_detail_text_through_unmodified():
+    result = public_result(
+        state=ActionState.DEFINITIVE_FAILED,
+        action_id=UUID("8f8f1a45-13a7-4bd3-a15a-f8d265bbc567"),
+        action_uid=None,
+        provider_request_ref=None,
+        detail_code="stale_context",
+        detail="resend with override=true if it is still needed",
+    )
+    assert result.detail == "resend with override=true if it is still needed"

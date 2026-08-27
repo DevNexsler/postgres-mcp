@@ -159,7 +159,14 @@ async def handle_outbound_action(
             )
         else:
             result = await service.execute(parsed)
-    return result.model_dump(mode="json")
+    payload = result.model_dump(mode="json")
+    if result.detail is None:
+        # Every result except a traffic-control block leaves detail unset --
+        # omit the key entirely so existing consumers see no new field on
+        # the wire, instead of a `detail: null` that would still be a shape
+        # change for strict clients.
+        payload.pop("detail", None)
+    return payload
 
 
 def create_server(

@@ -1315,6 +1315,8 @@ async def test_traffic_control_enforce_blocks_on_lease_held():
 
     assert result.status is PublicStatus.FAILED
     assert result.detail_code == "lease_held"
+    assert result.detail is not None
+    assert "Friday works for us too." in result.detail
     assert [call[0] for call in store.calls] == ["create", "claim", "definitive_fail"]
     assert adapter.calls == []
 
@@ -1338,6 +1340,9 @@ async def test_traffic_control_enforce_blocks_on_stale_context():
 
     assert result.status is PublicStatus.FAILED
     assert result.detail_code == "stale_context"
+    assert result.detail is not None
+    assert "Are you still available Friday?" in result.detail
+    assert "override" in result.detail
     assert adapter.calls == []
     definitive_calls = [call for call in store.calls if call[0] == "definitive_fail"]
     assert len(definitive_calls) == 1
