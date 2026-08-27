@@ -16,7 +16,6 @@ from .context import ActionContext
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
-from .models import IntentKind
 from .models import Operation
 from .service import OutboundActionRecord
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
@@ -415,7 +414,7 @@ class PostgresActionStore:
             wakeup_event_id=int(cells["wakeup_event_id"]),
             action_role=ActionRole(str(cells["action_role"])),
             operation=Operation(str(cells["operation"])),
-            intent_kind=IntentKind(str(cells["intent_kind"])),
+            intent_kind=str(cells["intent_kind"]),
             appointment_slot=cells.get("appointment_slot"),
             arguments=dict(cells.get("arguments") or {}),
             state=ActionState(str(cells["state"])),

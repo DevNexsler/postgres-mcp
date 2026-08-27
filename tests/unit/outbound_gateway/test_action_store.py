@@ -158,6 +158,28 @@ async def test_store_uses_database_functions_and_sanitized_observations():
 
 
 @pytest.mark.asyncio
+async def test_free_form_intent_reconstructs_from_a_persisted_row_without_raising():
+    """A row persisted with a free-form (non-IntentKind) intent_kind -- e.g.
+    "escalation", the string that burned wake 25789 -- must reconstruct into
+    an OutboundActionRecord, not raise. Reconcile/resume rebuild the record
+    straight off this row on every crash-recovery pass, so intent_kind here
+    has to carry any string the request model now accepts, not just the
+    known IntentKind vocabulary."""
+
+    async def execute(_driver, query, params):
+        return [Row({**action_row(), "intent_kind": "escalation"})]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        created = await store.create_or_load(context())
+
+    assert created.intent_kind == "escalation"
+
+
+@pytest.mark.asyncio
 async def test_store_work_query_includes_expired_dispatch_without_unlocking_it():
     calls = []
 

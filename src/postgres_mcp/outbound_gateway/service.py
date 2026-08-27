@@ -30,7 +30,6 @@ from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
 from .models import ExecuteRequest
-from .models import IntentKind
 from .models import Operation
 from .models import PublicResult
 from .preflight import PreflightDecision
@@ -52,7 +51,7 @@ class OutboundActionRecord:
     wakeup_event_id: int
     action_role: ActionRole
     operation: Operation
-    intent_kind: IntentKind
+    intent_kind: str
     appointment_slot: datetime | None
     arguments: dict[str, Any]
     state: ActionState
