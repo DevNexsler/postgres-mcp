@@ -264,6 +264,50 @@ async def test_validation_guidance_uses_operation_fields_and_root_schema_areas(p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                **execute_payload(),
+                "arguments": {
+                    "to_address": "prospect@example.com",
+                    "text": "safe message",
+                    "operation": "secret argument value",
+                },
+            },
+            "invalid outbound action request: arguments: accepted keys: text, to_address",
+        ),
+        (
+            {**execute_payload(), "text": "secret root value"},
+            (
+                "invalid outbound action request: execute: accepted keys: action_role, appointment_slot, "
+                "arguments, intent_kind, op, operation, wakeup_event_id"
+            ),
+        ),
+        (
+            {**execute_payload(), "to_address": "secret root value"},
+            (
+                "invalid outbound action request: execute: accepted keys: action_role, appointment_slot, "
+                "arguments, intent_kind, op, operation, wakeup_event_id"
+            ),
+        ),
+    ],
+)
+async def test_validation_guidance_classifies_colliding_extra_keys_by_schema_area(payload, expected):
+    with pytest.raises(ValueError) as raised:
+        await handle_outbound_action(
+            AsyncMock(),
+            FeaturePolicy(writes_enabled=True, kill_switch=False),
+            payload,
+        )
+
+    message = str(raised.value)
+    assert message == expected
+    assert "secret" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("policy", "detail"),
     [
         (FeaturePolicy(writes_enabled=False, kill_switch=False), "writes_disabled"),

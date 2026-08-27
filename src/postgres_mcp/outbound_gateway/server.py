@@ -134,6 +134,23 @@ _REQUEST_ENUM_VALUES = {
 }
 
 
+def _request_type_from_location(location: tuple[object, ...], fallback: str) -> str:
+    candidate = location[0] if location else None
+    if isinstance(candidate, str) and candidate in _REQUEST_TOP_LEVEL_KEYS:
+        return candidate
+    return fallback
+
+
+def _arguments_have_extra_fields(arguments: object, operation: Operation | None) -> bool:
+    if operation is None or not isinstance(arguments, Mapping):
+        return False
+    try:
+        ARGUMENT_MODELS[operation].model_validate(arguments)
+    except ValidationError as error:
+        return any(detail.get("type") == "extra_forbidden" for detail in error.errors(include_input=False))
+    return False
+
+
 def _safe_validation_message(error: ValidationError, request: Mapping[str, Any]) -> str:
     """Render trusted schema metadata without rendering request/error data."""
     raw_request_type = request.get("op")
@@ -145,6 +162,7 @@ def _safe_validation_message(error: ValidationError, request: Mapping[str, Any])
     try:
         operation = Operation(request.get("operation"))
     except (TypeError, ValueError):
+        operation = None
         argument_keys: tuple[str, ...] | None = None
     else:
         argument_keys = _REQUEST_ARGUMENT_KEYS_BY_OPERATION[operation]
@@ -153,6 +171,15 @@ def _safe_validation_message(error: ValidationError, request: Mapping[str, Any])
     for detail in error.errors(include_input=False):
         location = detail.get("loc", ())
         error_type = detail.get("type")
+        location_request_type = _request_type_from_location(location, request_type)
+        if error_type == "extra_forbidden":
+            if location_request_type == "execute" and _arguments_have_extra_fields(arguments, operation):
+                guidance.append(f"arguments: accepted keys: {', '.join(argument_keys or ())}")
+            else:
+                guidance.append(
+                    f"{location_request_type}: accepted keys: {', '.join(_REQUEST_TOP_LEVEL_KEYS[location_request_type])}"
+                )
+            continue
         known_enum = next((part for part in location if part in _REQUEST_ENUM_VALUES), None)
         if known_enum is not None:
             values = ", ".join(_REQUEST_ENUM_VALUES[known_enum])
@@ -161,13 +188,6 @@ def _safe_validation_message(error: ValidationError, request: Mapping[str, Any])
         known_argument = next((part for part in location if argument_keys is not None and part in argument_keys), None)
         if known_argument is not None and error_type == "missing" and argument_keys is not None:
             guidance.append(f"arguments.{known_argument}: accepted keys: {', '.join(argument_keys)}")
-            continue
-        if error_type == "extra_forbidden":
-            unknown_location = location[-1] if location else None
-            if request_type == "execute" and argument_keys is not None and isinstance(arguments, Mapping) and unknown_location in arguments:
-                guidance.append(f"arguments: accepted keys: {', '.join(argument_keys)}")
-            else:
-                guidance.append(f"{request_type}: accepted keys: {', '.join(_REQUEST_TOP_LEVEL_KEYS[request_type])}")
             continue
         if error_type == "union_tag_invalid":
             guidance.append("op: accepted values: execute, status, suggest")
