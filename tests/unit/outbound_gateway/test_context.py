@@ -1062,6 +1062,7 @@ async def test_maintenance_line_reply_uses_receiving_quo_account():
                 }
             }
         },
+        envelope={"identity": {}, "message": {"property": "16 N Main St #16"}},
     )
     context = await ActionContextLoader(FakeRepository(event), policy()).load(
         request(
