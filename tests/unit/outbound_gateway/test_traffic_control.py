@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from datetime import timezone
 from uuid import uuid4
 
 import pytest
 
-from postgres_mcp.outbound_gateway.traffic_control import (
-    InFlightAction,
-    NewerActivity,
-    TrafficVerdict,
-    check_traffic,
-)
+from postgres_mcp.outbound_gateway.traffic_control import InFlightAction
+from postgres_mcp.outbound_gateway.traffic_control import NewerActivity
+from postgres_mcp.outbound_gateway.traffic_control import TrafficVerdict
+from postgres_mcp.outbound_gateway.traffic_control import check_traffic
 
 NOW = datetime(2026, 8, 27, 12, 5, tzinfo=timezone.utc)
 WATERMARK = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)

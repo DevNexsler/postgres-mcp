@@ -39,7 +39,6 @@ from .metrics import GatewayObservability
 from .metrics import render_prometheus
 from .models import ActionRole
 from .models import ExecuteRequest
-from .models import IntentKind
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus

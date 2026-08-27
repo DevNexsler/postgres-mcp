@@ -13,66 +13,64 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from postgres_mcp.outbound_gateway.models import IntentKind
-    from postgres_mcp.outbound_gateway.models import Operation
-
+from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import IntentKind
+from postgres_mcp.outbound_gateway.models import Operation
 
 DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER = {
-    "hotpads": frozenset({"email.send"}),
-    "zillow": frozenset({"email.send"}),
+    "hotpads": frozenset({Operation.EMAIL_SEND.value}),
+    "zillow": frozenset({Operation.EMAIL_SEND.value}),
 }
-DEFAULT_ENABLED_INTENTS = frozenset({"inquiry_reply", "showing_offer"})
+DEFAULT_ENABLED_INTENTS = frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value})
 DEFAULT_ENABLED_INTENTS_BY_PROVIDER = {
-    "hotpads": frozenset({"inquiry_reply", "showing_offer"}),
-    "zillow": frozenset({"inquiry_reply", "showing_offer"}),
+    "hotpads": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
+    "zillow": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
 }
 
-ALLOWED_COMBINATIONS: frozenset[tuple[str, str, str]] = frozenset(
+ALLOWED_COMBINATIONS: frozenset[tuple[ActionRole, Operation, IntentKind]] = frozenset(
     {
         (role, operation, intent)
         for role, operations, intents in (
             (
-                "prospect_reply",
-                ("email.send", "quo.sms.send"),
+                ActionRole.PROSPECT_REPLY,
+                (Operation.EMAIL_SEND, Operation.QUO_SMS_SEND),
                 (
-                    "inquiry_reply",
-                    "showing_offer",
-                    "showing_confirmation",
-                    "showing_reschedule",
-                    "showing_cancellation",
+                    IntentKind.INQUIRY_REPLY,
+                    IntentKind.SHOWING_OFFER,
+                    IntentKind.SHOWING_CONFIRMATION,
+                    IntentKind.SHOWING_RESCHEDULE,
+                    IntentKind.SHOWING_CANCELLATION,
                 ),
             ),
             (
-                "internal_notification",
-                ("cliq.channel.post", "cliq.chat.post"),
-                ("lead_alert", "manual_review_alert"),
+                ActionRole.INTERNAL_NOTIFICATION,
+                (Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST),
+                (IntentKind.LEAD_ALERT, IntentKind.MANUAL_REVIEW_ALERT),
             ),
         )
         for operation in operations
         for intent in intents
     }
     | {
-        ("calendar_mutation", "calendar.create", "showing_create"),
-        ("calendar_mutation", "calendar.update", "showing_update"),
-        ("calendar_mutation", "calendar.delete", "showing_delete"),
-        ("prospect_reply", "tenantcloud.message.send", "inquiry_reply"),
+        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_CREATE, IntentKind.SHOWING_CREATE),
+        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_UPDATE, IntentKind.SHOWING_UPDATE),
+        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_DELETE, IntentKind.SHOWING_DELETE),
+        (ActionRole.PROSPECT_REPLY, Operation.TENANTCLOUD_MESSAGE_SEND, IntentKind.INQUIRY_REPLY),
         (
-            "provider_mutation",
-            "tenantcloud.lead.status.update",
-            "tenantcloud_lead_status",
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+            IntentKind.TENANTCLOUD_LEAD_STATUS,
         ),
         (
-            "provider_mutation",
-            "tenantcloud.maintenance.create",
-            "tenantcloud_maintenance_create",
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_MAINTENANCE_CREATE,
+            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
         ),
         (
-            "provider_mutation",
-            "tenantcloud.maintenance.status.update",
-            "tenantcloud_maintenance_status",
+            ActionRole.PROVIDER_MUTATION,
+            Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
+            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
         ),
     }
 )
@@ -96,8 +94,6 @@ def _enabled_operations_by_provider() -> dict[str, frozenset[str]]:
         ):
             raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON values must be non-empty string arrays")
         try:
-            # Import here to avoid circular dependency
-            from postgres_mcp.outbound_gateway.models import Operation
             parsed[provider.casefold()] = frozenset(Operation(item).value for item in operations)
         except ValueError as exc:
             raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON contains an unsupported operation") from exc
@@ -112,7 +108,6 @@ def _enabled_intents() -> frozenset[str]:
     if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
         raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON must be a non-empty string array")
     try:
-        from postgres_mcp.outbound_gateway.models import IntentKind
         return frozenset(IntentKind(item).value for item in value)
     except ValueError as exc:
         raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON contains an unsupported intent") from exc
@@ -136,7 +131,6 @@ def _enabled_intents_by_provider() -> dict[str, frozenset[str]]:
         ):
             raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON values must be non-empty string arrays")
         try:
-            from postgres_mcp.outbound_gateway.models import IntentKind
             parsed[provider.casefold()] = frozenset(IntentKind(item).value for item in intents)
         except ValueError as exc:
             raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON contains an unsupported intent") from exc
