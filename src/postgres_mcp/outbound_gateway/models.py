@@ -404,53 +404,6 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
 }
 
 
-ALLOWED_COMBINATIONS: frozenset[tuple[ActionRole, Operation, IntentKind]] = frozenset(
-    {
-        (role, operation, intent)
-        for role, operations, intents in (
-            (
-                ActionRole.PROSPECT_REPLY,
-                (Operation.EMAIL_SEND, Operation.QUO_SMS_SEND),
-                (
-                    IntentKind.INQUIRY_REPLY,
-                    IntentKind.SHOWING_OFFER,
-                    IntentKind.SHOWING_CONFIRMATION,
-                    IntentKind.SHOWING_RESCHEDULE,
-                    IntentKind.SHOWING_CANCELLATION,
-                ),
-            ),
-            (
-                ActionRole.INTERNAL_NOTIFICATION,
-                (Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST),
-                (IntentKind.LEAD_ALERT, IntentKind.MANUAL_REVIEW_ALERT),
-            ),
-        )
-        for operation in operations
-        for intent in intents
-    }
-    | {
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_CREATE, IntentKind.SHOWING_CREATE),
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_UPDATE, IntentKind.SHOWING_UPDATE),
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_DELETE, IntentKind.SHOWING_DELETE),
-        (ActionRole.PROSPECT_REPLY, Operation.TENANTCLOUD_MESSAGE_SEND, IntentKind.INQUIRY_REPLY),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
-            IntentKind.TENANTCLOUD_LEAD_STATUS,
-        ),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_MAINTENANCE_CREATE,
-            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
-        ),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
-            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
-        ),
-    }
-)
-
 SLOT_REQUIRED_INTENTS = frozenset(
     {
         IntentKind.SHOWING_OFFER,
