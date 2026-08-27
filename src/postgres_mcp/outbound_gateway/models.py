@@ -462,14 +462,18 @@ SLOT_REQUIRED_INTENTS = frozenset(
 )
 
 
+_KNOWN_INTENT_KINDS = frozenset(member.value for member in IntentKind)
+
+
 class ExecuteRequest(StrictModel):
     op: Literal["execute"]
     wakeup_event_id: PositiveBigInt
     action_role: ActionRole
     operation: Operation
-    intent_kind: IntentKind
+    intent_kind: str
     arguments: ArgumentModel
     appointment_slot: datetime | None = None
+    override: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -484,6 +488,18 @@ class ExecuteRequest(StrictModel):
         data = dict(raw)
         data["arguments"] = ARGUMENT_MODELS[operation].model_validate(raw.get("arguments"))
         return data
+
+    @field_validator("intent_kind", mode="before")
+    @classmethod
+    def normalize_intent_kind(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("intent_kind must be a string")
+        candidate = value.strip().casefold()
+        if not candidate:
+            raise ValueError("intent_kind must not be empty")
+        if len(candidate) > 64:
+            raise ValueError("intent_kind must be at most 64 characters")
+        return candidate
 
     @field_validator("appointment_slot", mode="before")
     @classmethod
@@ -505,12 +521,14 @@ class ExecuteRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_matrix(self) -> ExecuteRequest:
-        combination = (self.action_role, self.operation, self.intent_kind)
-        if combination not in ALLOWED_COMBINATIONS:
-            raise ValueError("unsupported action role, operation, and intent combination")
         if self.intent_kind in SLOT_REQUIRED_INTENTS and self.appointment_slot is None:
             raise ValueError("appointment_slot is required for this intent")
-        if self.intent_kind not in SLOT_REQUIRED_INTENTS and self.appointment_slot is not None:
+        known_intent = self.intent_kind in _KNOWN_INTENT_KINDS
+        if (
+            self.appointment_slot is not None
+            and self.intent_kind not in SLOT_REQUIRED_INTENTS
+            and known_intent
+        ):
             raise ValueError("appointment_slot is forbidden for this intent")
         return self
 

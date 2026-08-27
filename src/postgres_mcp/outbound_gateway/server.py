@@ -37,6 +37,7 @@ from .context import RoutingPolicy
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
+from .models import ActionRole
 from .models import ExecuteRequest
 from .models import IntentKind
 from .models import Operation
@@ -120,7 +121,16 @@ async def handle_outbound_action(
     try:
         parsed = parse_outbound_request(request)
     except ValidationError as exc:
-        raise ValueError("invalid outbound action request") from exc
+        first = exc.errors()[0]
+        location = ".".join(str(part) for part in first["loc"]) or "request"
+        hint = ""
+        if location.endswith("action_role"):
+            hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
+        elif location.endswith("operation"):
+            hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
+        raise ValueError(
+            f"invalid outbound action request: {location}: {first['msg']}{hint}"
+        ) from exc
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,

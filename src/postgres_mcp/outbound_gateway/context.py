@@ -99,7 +99,7 @@ class ActionContext:
     wakeup_event_id: int
     action_role: ActionRole
     operation: Operation
-    intent_kind: IntentKind
+    intent_kind: str
     appointment_slot: datetime | None
     arguments: Mapping[str, Any]
     source: str
@@ -243,14 +243,14 @@ class ActionContextLoader:
             )
             if request.operation.value not in allowed_operations:
                 raise ContextDerivationError("provider operation is disabled")
-        if self._policy.enabled_intents and request.intent_kind.value not in self._policy.enabled_intents:
+        if self._policy.enabled_intents and request.intent_kind not in self._policy.enabled_intents:
             raise ContextDerivationError("intent is disabled")
         if self._policy.enabled_intents_by_provider:
             provider_intents = self._policy.enabled_intents_by_provider.get(
                 provider,
                 frozenset(),
             )
-            if request.intent_kind.value not in provider_intents:
+            if request.intent_kind not in provider_intents:
                 raise ContextDerivationError("provider intent is disabled")
         property_label = self._property_label(record, envelope, raw, message)
         property_scope = normalize_property_key(property_label)
@@ -429,7 +429,7 @@ class ActionContextLoader:
             {
                 "action_role": request.action_role.value,
                 "operation": request.operation.value,
-                "intent_kind": request.intent_kind.value,
+                "intent_kind": request.intent_kind,
                 "appointment_slot": appointment_slot,
                 "arguments": arguments,
                 "canonical_context": canonical_context,
@@ -939,6 +939,6 @@ class ActionContextLoader:
             "version": "v1",
             "source_message_id": record.canonical_message_id or record.message_id,
             "target_id": target.target_id,
-            "intent_kind": request.intent_kind.value,
+            "intent_kind": request.intent_kind,
             "role": request.action_role.value,
         }

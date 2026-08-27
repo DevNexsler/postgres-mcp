@@ -125,7 +125,7 @@ class PostgresActionStore:
                 context.wakeup_event_id,
                 context.action_role.value,
                 context.operation.value,
-                context.intent_kind.value,
+                context.intent_kind,
                 context.appointment_slot,
                 context.payload_hash,
                 _json(context.canonical_context),
@@ -147,9 +147,9 @@ class PostgresActionStore:
     async def prepare(self, context: ActionContext, expected_state: ActionState) -> OutboundActionRecord:
         slot = context.appointment_slot.isoformat() if context.appointment_slot else ""
         if context.action_role is ActionRole.PROSPECT_REPLY:
-            lock_intent = f"{context.intent_kind.value}:turn:{context.source_message_id}"
+            lock_intent = f"{context.intent_kind}:turn:{context.source_message_id}"
         elif context.action_role is ActionRole.CALENDAR_MUTATION:
-            lock_intent = f"{context.intent_kind.value}:lifecycle:{context.showing_lifecycle_id}"
+            lock_intent = f"{context.intent_kind}:lifecycle:{context.showing_lifecycle_id}"
         elif context.action_role is ActionRole.PROVIDER_MUTATION:
             claim_id = context.canonical_context["tenantcloud_claim_id"]
             source_id = context.canonical_context["source_event_id"]
@@ -167,7 +167,7 @@ class PostgresActionStore:
             else:
                 lock_intent = f"{prefix}:state:{desired_hash}"
         else:
-            lock_intent = f"{context.intent_kind.value}:event:{context.wakeup_event_id}"
+            lock_intent = f"{context.intent_kind}:event:{context.wakeup_event_id}"
         return await self._one(
             """
             SELECT * FROM prepare_outbound_action_and_acquire_lock(

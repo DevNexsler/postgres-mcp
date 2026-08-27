@@ -771,7 +771,7 @@ class OutboundActionService:
             {
                 "action_role": context.action_role.value,
                 "operation": context.operation.value,
-                "intent_kind": context.intent_kind.value,
+                "intent_kind": context.intent_kind,
                 "appointment_slot": context.appointment_slot,
                 "arguments": context.arguments,
                 "canonical_context": normalized_context,

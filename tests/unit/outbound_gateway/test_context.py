@@ -1085,7 +1085,7 @@ async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing
             arguments={"to_phone": "+19085550199", "text": "Thanks"},
         )
     )
-    assert inquiry.intent_kind.value == "inquiry_reply"
+    assert inquiry.intent_kind == "inquiry_reply"
     with pytest.raises(ContextDerivationError, match="provider intent is disabled"):
         await ActionContextLoader(FakeRepository(event), restricted).load(
             request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})

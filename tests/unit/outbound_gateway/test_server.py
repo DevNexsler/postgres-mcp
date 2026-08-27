@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.metrics import MetricSample
+from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
@@ -157,6 +158,21 @@ async def test_execute_and_status_delegate_only_after_strict_json_validation():
     service.status.assert_awaited_once_with(ACTION_ID)
     with pytest.raises(ValueError, match="invalid outbound action request"):
         await handle_outbound_action(service, policy, {**execute_payload(), "recipient": "attacker@example.com"})
+
+
+@pytest.mark.asyncio
+async def test_validation_error_names_field_and_values():
+    service = AsyncMock()
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+    bad = {**execute_payload(), "action_role": "bogus_role"}
+
+    with pytest.raises(ValueError) as exc:
+        await handle_outbound_action(service, policy, bad)
+
+    msg = str(exc.value)
+    assert "action_role" in msg
+    for role in ActionRole:
+        assert role.value in msg
 
 
 @pytest.mark.asyncio

@@ -262,7 +262,7 @@ class DatabasePreflightEvidenceLoader:
                 provider_family,
                 provider_family,
                 provider_family,
-                context.intent_kind.value,
+                context.intent_kind,
                 context.wakeup_event_id,
                 context.wakeup_event_id,
                 context.source_sent_at,
