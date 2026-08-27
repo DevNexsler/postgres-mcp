@@ -340,6 +340,28 @@ class PostgresActionStore:
             ],
         )
 
+    async def remediate_traffic_block(
+        self,
+        action_id: UUID,
+        *,
+        operator_identity: str,
+        reason: str,
+    ) -> OutboundActionRecord:
+        """Successor-action path for an override=true resend of a
+        traffic-blocked DEFINITIVE_FAILED action. Calls the same
+        create_outbound_remediation_context() operator remediation uses
+        (Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267)
+        rather than a bespoke function -- it derives the next effect_ordinal,
+        mints the successor action_id, and sets retry_of_action_id itself.
+        That function requires an evidence-resolved outbound_action_resolutions
+        row for action_id (067:1221-1228); if none exists yet it raises, and
+        this method does not catch that -- the caller (service.py's
+        _remediate_traffic_block) decides how to degrade gracefully."""
+        return await self._one(
+            "SELECT * FROM create_outbound_remediation_context({}, {}, {})",
+            [action_id, operator_identity, reason],
+        )
+
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -436,4 +458,5 @@ class PostgresActionStore:
             provider_evidence_reference=cells.get("evidence_reference"),
             provider_evidence_hash=cells.get("evidence_hash"),
             provider_readback_evidence=dict(readback_evidence) if readback_evidence else {},
+            error_category=cells.get("error_category"),
         )

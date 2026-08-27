@@ -144,11 +144,36 @@ def row(state=ActionState.RECEIVED, **overrides):
     return OutboundActionRecord(**values)
 
 
+class LeaseUnavailableError(RuntimeError):
+    """Mirrors claim_outbound_action's 55P03 'outbound action lease
+    unavailable' -- raised by the real SQL function (Comm-Data-Store
+    migrations/068_outbound_gateway_observability.sql:156-167) when the
+    expected_state isn't in its live whitelist."""
+
+
+# The exact live whitelist claim_outbound_action enforces today
+# (migrations/068_outbound_gateway_observability.sql:156-159) -- 'received'
+# is deliberately excluded: a fresh row must go through
+# prepare_outbound_action_and_acquire_lock first.
+_CLAIMABLE_STATES = {
+    ActionState.DEPENDENCY_WAIT,
+    ActionState.PREPARED,
+    ActionState.DISPATCHING,
+    ActionState.PROVIDER_ACCEPTED,
+    ActionState.UNKNOWN,
+    ActionState.RECONCILING,
+    ActionState.RETRY_READY,
+    ActionState.DEAD_LETTER,
+}
+
+
 class FakeStore:
-    def __init__(self, initial=None):
+    def __init__(self, initial=None, *, remediation_successor_id=None, remediation_error=None):
         self.current = initial
         self.calls = []
         self.last_receipt = None
+        self.remediation_successor_id = remediation_successor_id
+        self.remediation_error = remediation_error
 
     async def create_or_load(self, ctx):
         self.calls.append(("create", ctx.action_id))
@@ -163,6 +188,11 @@ class FakeStore:
 
     async def claim(self, action_id, expected_state, lease_owner, lease_seconds):
         self.calls.append(("claim", expected_state, lease_owner))
+        if expected_state not in _CLAIMABLE_STATES:
+            raise LeaseUnavailableError(
+                f"outbound action lease unavailable: state {expected_state.value!r} is not "
+                "claimable (migrations/068_outbound_gateway_observability.sql:156-159)"
+            )
         return self.current
 
     async def record_provider_request(self, action_id, lease_owner, observation):
@@ -196,7 +226,37 @@ class FakeStore:
 
     async def definitive_fail(self, action_id, expected_state, lease_owner, observation):
         self.calls.append(("definitive_fail", observation.detail_code, observation))
-        self.current = replace(self.current, state=ActionState.DEFINITIVE_FAILED, detail_code=observation.detail_code)
+        self.current = replace(
+            self.current,
+            state=ActionState.DEFINITIVE_FAILED,
+            detail_code=observation.detail_code,
+            error_category=observation.category,
+        )
+        return self.current
+
+    async def remediate_traffic_block(self, action_id, *, operator_identity, reason):
+        self.calls.append(("remediate", action_id, operator_identity, reason))
+        if self.remediation_error is not None:
+            raise self.remediation_error
+        parent = self.current
+        successor_id = self.remediation_successor_id or uuid4()
+        self.current = row(
+            ActionState.RECEIVED,
+            action_id=successor_id,
+            wakeup_event_id=parent.wakeup_event_id,
+            action_role=parent.action_role,
+            operation=parent.operation,
+            intent_kind=parent.intent_kind,
+            appointment_slot=parent.appointment_slot,
+            arguments=dict(parent.arguments),
+            detail_code="operator_remediation_created",
+            payload_hash=parent.payload_hash,
+            canonical_context=dict(parent.canonical_context),
+            canonical_scope=dict(parent.canonical_scope),
+            recipient_scope=dict(parent.recipient_scope),
+            provider_account=parent.provider_account,
+            routing_policy_version=parent.routing_policy_version,
+        )
         return self.current
 
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code):
@@ -1297,6 +1357,12 @@ def _accepted_observation() -> ProviderObservation:
 
 @pytest.mark.asyncio
 async def test_traffic_control_enforce_blocks_on_lease_held():
+    """FakeStore() with no initial row means create_or_load() lands on a
+    fresh RECEIVED row (row()'s default state) -- claim_outbound_action's
+    live whitelist excludes 'received' (migrations/
+    068_outbound_gateway_observability.sql:156-159), so this exercises the
+    RECEIVED regression directly: the gate must move the row through
+    prepare() (as _preflight()'s READY branch does) before it is claimable."""
     store = FakeStore()
     adapter = FakeAdapter()
     probe = FakeProbe(
@@ -1317,7 +1383,7 @@ async def test_traffic_control_enforce_blocks_on_lease_held():
     assert result.detail_code == "lease_held"
     assert result.detail is not None
     assert "Friday works for us too." in result.detail
-    assert [call[0] for call in store.calls] == ["create", "claim", "definitive_fail"]
+    assert [call[0] for call in store.calls] == ["create", "prepare", "claim", "definitive_fail"]
     assert adapter.calls == []
 
 
@@ -1440,3 +1506,145 @@ async def test_traffic_control_fails_open_and_dispatches_on_probe_error(caplog):
 def test_traffic_mode_rejects_unknown_value():
     with pytest.raises(ValueError):
         service(FakeStore(), FakeAdapter(), traffic_mode="paranoid")
+
+
+def test_traffic_mode_without_probe_warns_at_construction(caplog):
+    """mode in {shadow, enforce} with no probe silently behaves like 'off'
+    (the gate short-circuits on `traffic_probe is None` every call) -- that
+    is exactly the wiring bug (env var set, probe forgotten in
+    build_runtime()) that must be loud, not invisible."""
+    with caplog.at_level(logging.WARNING):
+        service(FakeStore(), FakeAdapter(), traffic_mode="shadow", traffic_probe=None)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("traffic_probe" in message for message in messages)
+
+
+def test_traffic_mode_off_without_probe_does_not_warn(caplog):
+    with caplog.at_level(logging.WARNING):
+        service(FakeStore(), FakeAdapter(), traffic_mode="off", traffic_probe=None)
+
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_resume_runs_traffic_gate_with_override_forced_false(caplog):
+    """The IMPORTANT gap: worker.py's list_work routes dependency_wait/
+    prepared/retry_ready actions through resume(), never execute() -- the
+    highest-staleness-risk case (longest wait) must not skip the gate.
+    resume() has no ExecuteRequest, so override is unavailable and must be
+    treated as False, not True."""
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter()
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+
+    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.FAILED
+    assert result.detail_code == "stale_context"
+    assert adapter.calls == []
+    assert any(call[0] == "definitive_fail" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_resume_shadow_mode_logs_would_block_and_dispatches(caplog):
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter(_accepted_observation())
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await service(store, adapter, traffic_mode="shadow", traffic_probe=probe).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("traffic control shadow" in message and "stale_context" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_override_resend_of_traffic_blocked_action_dispatches_a_successor():
+    """CRITICAL 2's red-green: block, then override-resend. The successor
+    action (next effect_ordinal, retry_of_action_id set -- via the same
+    create_outbound_remediation_context() operator remediation uses,
+    Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267)
+    must reach dispatch; the original blocked action_id is never reused
+    (it is permanently DEFINITIVE_FAILED and unclaimable)."""
+    successor_id = uuid4()
+    store = FakeStore(remediation_successor_id=successor_id)
+    adapter = FakeAdapter(_accepted_observation())
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
+
+    blocked = await svc.execute(request())
+    assert blocked.status is PublicStatus.FAILED
+    assert blocked.detail_code == "stale_context"
+    assert blocked.action_id == ACTION_ID
+
+    resent = await svc.execute(request(override=True))
+
+    assert resent.status is PublicStatus.SENT
+    assert resent.action_id == successor_id
+    assert resent.action_id != blocked.action_id
+    assert adapter.calls
+    assert any(call[0] == "remediate" and call[1] == ACTION_ID for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_override_resend_without_operator_remediation_stays_blocked():
+    """create_outbound_remediation_context requires an evidence-resolved
+    outbound_action_resolutions row (067:1221-1228), which only
+    resolve_outbound_action_from_evidence (operator-only, never granted to
+    the gateway role) can write. Until an operator resolves the block,
+    override must fail soft -- stay on the original terminal result -- not
+    raise the DB's unhandled precondition-violation exception."""
+    store = FakeStore(remediation_error=RuntimeError("remediation requires evidence-resolved definitive failure"))
+    adapter = FakeAdapter()
+    probe = FakeProbe(
+        newer=NewerActivity(
+            direction="inbound",
+            source="zillow",
+            occurred_at=NOW,
+            preview="Are you still available Friday?",
+            message_id=999,
+            action_id=None,
+        )
+    )
+    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
+
+    blocked = await svc.execute(request())
+    assert blocked.status is PublicStatus.FAILED
+
+    resent = await svc.execute(request(override=True))
+
+    assert resent.status is PublicStatus.FAILED
+    assert resent.action_id == ACTION_ID
+    assert resent.detail is not None
+    assert "operator" in resent.detail
+    assert adapter.calls == []
