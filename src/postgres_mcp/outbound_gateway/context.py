@@ -275,11 +275,24 @@ class ActionContextLoader:
             else:
                 prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
         elif request.action_role is ActionRole.INTERNAL_NOTIFICATION or request.operation in _TENANTCLOUD_OPERATIONS:
-            prospect_id = (
-                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
-                if record.tenantcloud_claim_id is not None
-                else "internal:none"
-            )
+            if record.tenantcloud_claim_id is not None:
+                prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}"
+            elif request.action_role is ActionRole.INTERNAL_NOTIFICATION:
+                # CRITICAL 2 fix: every internal notification without a
+                # TenantCloud claim used to share the single literal
+                # "internal:none" as its traffic-control subject/lease key --
+                # one lease and one staleness watermark for every escalation
+                # across every wake, so concurrent escalations to *different*
+                # Cliq channels cross-blocked each other. The spec's internal
+                # recipient key is the channel: key on the resolved Cliq
+                # channel/chat id (target.target_id for CLIQ_CHANNEL_POST/
+                # CLIQ_CHAT_POST already *is* arguments.channel_or_chat_id --
+                # see _target() -- the getattr fallback below only matters if
+                # that ever stops being true).
+                channel_or_chat_id = target.target_id or str(getattr(request.arguments, "channel_or_chat_id", "") or "none")
+                prospect_id = f"internal:{channel_or_chat_id}"
+            else:
+                prospect_id = "internal:none"
         else:
             # No stable alias anywhere on the wake. This used to hard-fail;
             # now fall back to the agent's own verified target address --

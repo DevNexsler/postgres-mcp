@@ -364,8 +364,8 @@ class FakeProbe:
             raise RuntimeError("probe boom")
         return self.in_flight
 
-    async def newest_activity_after(self, recipient_key, channel_id, watermark):
-        self.calls.append(("newest_activity", recipient_key, channel_id, watermark))
+    async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
+        self.calls.append(("newest_activity", recipient_key, channel_id, watermark, exclude_action_id))
         return self.newer
 
     async def context_watermark(self, wakeup_event_id):
@@ -1381,13 +1381,26 @@ def _accepted_observation() -> ProviderObservation:
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_blocks_on_lease_held():
-    """FakeStore() with no initial row means create_or_load() lands on a
+async def test_traffic_control_enforce_defers_lease_held_instead_of_terminalizing():
+    """Important 6: a lease block is inherently short-lived -- the other
+    in-flight action will reach a terminal state on its own -- unlike a
+    stale-context block, which needs a conscious agent decision. A
+    deterministic action_id plus a terminal DEFINITIVE_FAILED meant a
+    seconds-long lease overlap would brick that resend forever, since
+    override never bypasses a lease (only staleness). So enforce+lease_held
+    must defer: no claim()/definitive_fail() at all, the row stays exactly
+    where prepare() (the same call _preflight()'s READY branch uses) left
+    it -- non-terminal and worker-visible, so the worker's next resume()
+    (PREPARED is in worker.py's list_work -> resume() routing) re-runs this
+    same gate and self-heals once the lease clears.
+
+    FakeStore() with no initial row means create_or_load() lands on a
     fresh RECEIVED row (row()'s default state) -- claim_outbound_action's
     live whitelist excludes 'received' (migrations/
-    068_outbound_gateway_observability.sql:156-159), so this exercises the
-    RECEIVED regression directly: the gate must move the row through
-    prepare() (as _preflight()'s READY branch does) before it is claimable."""
+    068_outbound_gateway_observability.sql:156-159), so this also exercises
+    the RECEIVED regression: the gate still moves the row through
+    prepare() first (to reach a worker-visible state), it just never goes
+    on to claim()/definitive_fail() for a lease_held verdict."""
     store = FakeStore()
     adapter = FakeAdapter()
     probe = FakeProbe(
@@ -1404,11 +1417,42 @@ async def test_traffic_control_enforce_blocks_on_lease_held():
 
     result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
-    assert result.status is PublicStatus.FAILED
+    assert result.status is PublicStatus.PENDING
     assert result.detail_code == "lease_held"
     assert result.detail is not None
     assert "Friday works for us too." in result.detail
-    assert [call[0] for call in store.calls] == ["create", "prepare", "claim", "definitive_fail"]
+    assert [call[0] for call in store.calls] == ["create", "prepare"]
+    assert store.current.state is ActionState.PREPARED
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_enforce_defers_lease_held_on_an_already_prepared_action():
+    """Same Important 6 behavior, but from resume() on an action that was
+    already PREPARED (no RECEIVED->prepare() dance involved at all --
+    claimable is just the action as-is, so this proves the defer applies
+    independent of the RECEIVED special case)."""
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter()
+    probe = FakeProbe(
+        in_flight=[
+            InFlightAction(
+                action_id=uuid4(),
+                operation="email.send",
+                state="dispatching",
+                created_at=NOW,
+                preview="Friday works for us too.",
+            )
+        ]
+    )
+
+    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code == "lease_held"
+    assert result.detail is not None
+    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
+    assert store.current.state is ActionState.PREPARED
     assert adapter.calls == []
 
 
@@ -1754,3 +1798,69 @@ async def test_resume_enforce_defers_dependency_wait_instead_of_terminalizing():
     assert store.current.state is ActionState.DEPENDENCY_WAIT
     assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
     assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_swallows_post_dispatch_exception_and_returns_durable_row_state(caplog):
+    """A network timeout *after* the provider already accepted the HTTP
+    request (adapter.invoke() raises here, simulating that) must never
+    escape execute() as a raised error: FastMCP wraps any uncaught
+    exception as "Error executing tool outbound_action: ...", and the CDS
+    reconciler's rejection-prefix rule treats that wrapper as proof
+    nothing was sent. By the time invoke() runs, claim()+transition() to
+    DISPATCHING has already happened (service.py's _dispatch()), so the
+    row is durably recoverable -- the caller must get that durable state
+    back, not a raised exception, and an ERROR must be logged."""
+    store = FakeStore()
+    adapter = FakeAdapter()
+    adapter.invoke = AsyncMock(side_effect=RuntimeError("network timeout after accept"))
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, adapter).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert result.action_id == ACTION_ID
+    assert store.current.state is ActionState.DISPATCHING
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("post-dispatch exception" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_resume_swallows_post_dispatch_exception_and_returns_durable_row_state(caplog):
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter()
+    adapter.invoke = AsyncMock(side_effect=RuntimeError("network timeout after accept"))
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.DISPATCHING
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("post-dispatch exception" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_execute_still_raises_context_derivation_error_before_dispatch():
+    """Regression guard: context load/validation is deliberately NOT
+    covered by the post-dispatch except clause -- a true pre-dispatch
+    rejection must keep raising so the MCP error wrapper (and the
+    reconciler's rejection-prefix rule that depends on it) stays accurate
+    for genuine rejections."""
+    store = FakeStore()
+    adapter = FakeAdapter()
+    loader = AsyncMock()
+    loader.load.side_effect = ContextDerivationError("wakeup event does not exist")
+    preflight = AsyncMock()
+    svc = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    with pytest.raises(ContextDerivationError):
+        await svc.execute(request())

@@ -46,10 +46,16 @@ class TrafficProbe(Protocol):
     ) -> list[InFlightAction]: ...
 
     async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime
+        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
     ) -> NewerActivity | None: ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
+
+
+# Single source of truth for the three operating modes (service.py and
+# server.py both validate against this instead of each keeping their own
+# copy of the literal set).
+VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
 
 
 _PASS = TrafficVerdict(allowed=True, reason="pass", detail="", check_failed=False)
@@ -89,6 +95,32 @@ async def check_traffic(
             check_failed=False,
         )
     if override:
+        # IMPORTANT 4: override intentionally bypasses a staleness block,
+        # but that must still be auditable -- silently short-circuiting here
+        # (the old behavior) meant nothing was ever logged about *what* got
+        # overridden. Still fetch newest_activity_after purely for the audit
+        # trail; a probe failure here must not degrade the override itself
+        # (fail-open, log-only, no ledger schema change), so any exception
+        # is swallowed after logging.
+        try:
+            watermark = await probe.context_watermark(wakeup_event_id)
+            if watermark is not None:
+                newer = await probe.newest_activity_after(recipient_key, channel_id, watermark, action_id)
+                if newer is not None:
+                    ref = f"message {newer.message_id}" if newer.message_id else f"action {newer.action_id}"
+                    logger.warning(
+                        "override bypassed staleness: wake=%s, recipient=%s, overrode %s at %s",
+                        wakeup_event_id,
+                        recipient_key,
+                        ref,
+                        newer.occurred_at.isoformat(),
+                    )
+        except Exception:
+            logger.warning(
+                "traffic control check failed (staleness, override audit) for %s",
+                recipient_key,
+                exc_info=True,
+            )
         return _PASS
     try:
         watermark = await probe.context_watermark(wakeup_event_id)
@@ -97,7 +129,7 @@ async def check_traffic(
                 "traffic control check failed (no watermark) for wake %s", wakeup_event_id
             )
             return _FAIL_OPEN
-        newer = await probe.newest_activity_after(recipient_key, channel_id, watermark)
+        newer = await probe.newest_activity_after(recipient_key, channel_id, watermark, action_id)
     except Exception:
         logger.warning(
             "traffic control check failed (staleness) for %s", recipient_key, exc_info=True

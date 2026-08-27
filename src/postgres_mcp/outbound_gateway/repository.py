@@ -90,7 +90,7 @@ class ContextRepository(Protocol):
     ) -> list[InFlightAction]: ...
 
     async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime
+        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
     ) -> NewerActivity | None: ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
@@ -224,9 +224,7 @@ class OutboundGatewayRepository:
             for row in rows or []
         ]
 
-    async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime
-    ) -> NewerActivity | None:
+    async def newest_activity_after(self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID) -> NewerActivity | None:
         ledger_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -236,12 +234,13 @@ class OutboundGatewayRepository:
                 left(coalesce(arguments::text,''), 120) AS preview
             FROM outbound_actions
             WHERE subject_key = {}
+              AND action_id <> {}
               AND created_at > {}
-              AND state <> 'rejected'
+              AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            [recipient_key, watermark],
+            [recipient_key, exclude_action_id, watermark],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -276,7 +275,11 @@ class OutboundGatewayRepository:
             cells = message_rows[0].cells
             candidates.append(
                 NewerActivity(
-                    direction=str(cells.get("direction") or "inbound"),
+                    # NULL direction must not be silently reported as
+                    # "inbound" -- that would make the staleness detail text
+                    # claim inbound activity that was never actually
+                    # confirmed as such. "unknown" is the honest label.
+                    direction=str(cells.get("direction") or "unknown"),
                     source="messages",
                     occurred_at=cells["created_at"],
                     preview=str(cells.get("preview") or ""),

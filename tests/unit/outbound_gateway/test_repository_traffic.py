@@ -119,18 +119,26 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
         "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
         AsyncMock(side_effect=execute),
     ):
-        result = await repository.newest_activity_after(
-            "email:amanda@example.com", 44, watermark
-        )
+        result = await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
     assert len(calls) == 2
     ledger_query, ledger_params = calls[0]
     assert "outbound_actions" in ledger_query
     assert "subject_key" in ledger_query
-    assert "rejected" in ledger_query
+    assert "action_id" in ledger_query
+    # CRITICAL 1b: never-dispatched terminals (e.g. a traffic-blocked
+    # definitive_failed row) must not count as "outbound activity" and
+    # cascade false-stales -- only rows that plausibly reached a provider
+    # count. dispatch_started_at is set exactly at the prepared ->
+    # dispatching transition (Comm-Data-Store migrations/
+    # 067_outbound_action_gateway.sql:774-775), so "dispatch_started_at IS
+    # NOT NULL" is the live signal for that, with 'completed' covering the
+    # duplicate-completion path that never dispatches at all.
+    assert "dispatch_started_at" in ledger_query
+    assert "completed" in ledger_query
     assert "ORDER BY created_at DESC" in ledger_query
     assert "LIMIT 1" in ledger_query
-    assert ledger_params == ["email:amanda@example.com", watermark]
+    assert ledger_params == ["email:amanda@example.com", ACTION_ID, watermark]
 
     messages_query, messages_params = calls[1]
     assert "messages" in messages_query
@@ -178,9 +186,7 @@ async def test_newest_activity_after_picks_ledger_row_when_it_is_newer():
         "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
         AsyncMock(side_effect=execute),
     ):
-        result = await repository.newest_activity_after(
-            "email:amanda@example.com", 44, watermark
-        )
+        result = await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
     assert result == NewerActivity(
         direction="outbound",
@@ -193,7 +199,10 @@ async def test_newest_activity_after_picks_ledger_row_when_it_is_newer():
 
 
 @pytest.mark.asyncio
-async def test_newest_activity_after_defaults_message_direction_to_inbound_when_null():
+async def test_newest_activity_after_defaults_message_direction_to_unknown_when_null():
+    """MINOR (b): NULL direction must not be silently reported as
+    "inbound" -- that would make the staleness detail text claim inbound
+    activity that was never actually confirmed as such."""
     watermark = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc)
     message_row = Row(
         {
@@ -214,11 +223,35 @@ async def test_newest_activity_after_defaults_message_direction_to_inbound_when_
         "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
         AsyncMock(side_effect=execute),
     ):
-        result = await repository.newest_activity_after(
-            "email:amanda@example.com", 44, watermark
-        )
+        result = await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
-    assert result.direction == "inbound"
+    assert result.direction == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_newest_activity_after_excludes_the_calling_action_id_from_the_ledger_query():
+    """CRITICAL 1: execute() persists the action's own durable row before
+    the traffic gate runs (created_at=now(), definitely > any watermark) --
+    without excluding it by action_id, the ledger query would find that
+    row as "newer outbound activity" and self-block every real send. Fake-
+    driver assertion that the exclusion parameter actually reaches SQL."""
+    watermark = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc)
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return []
+
+    repository = OutboundGatewayRepository(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
+
+    ledger_query, ledger_params = calls[0]
+    assert "action_id <> {}" in ledger_query
+    assert ACTION_ID in ledger_params
 
 
 @pytest.mark.asyncio
@@ -233,9 +266,7 @@ async def test_newest_activity_after_returns_none_when_both_probes_are_empty():
         "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
         AsyncMock(side_effect=execute),
     ):
-        result = await repository.newest_activity_after(
-            "email:amanda@example.com", 44, watermark
-        )
+        result = await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
     assert result is None
 

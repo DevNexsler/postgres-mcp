@@ -51,6 +51,7 @@ from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from .traffic_control import VALID_TRAFFIC_MODES
 from .worker import OutboundWorker
 
 # TenantCloud's API origin is a fixed literal, never a runtime-configurable
@@ -273,13 +274,10 @@ def _enabled_operations() -> frozenset[Operation]:
 
 
 
-_VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
-
-
 def _traffic_mode() -> str:
     raw = os.environ.get("OUTBOUND_TRAFFIC_CONTROL", "shadow").casefold()
-    if raw not in _VALID_TRAFFIC_MODES:
-        raise ValueError(f"OUTBOUND_TRAFFIC_CONTROL must be one of {sorted(_VALID_TRAFFIC_MODES)}, got {raw!r}")
+    if raw not in VALID_TRAFFIC_MODES:
+        raise ValueError(f"OUTBOUND_TRAFFIC_CONTROL must be one of {sorted(VALID_TRAFFIC_MODES)}, got {raw!r}")
     return raw
 
 

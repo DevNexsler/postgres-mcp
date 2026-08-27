@@ -29,7 +29,7 @@ class FakeProbe:
             raise RuntimeError("db down")
         return self._in_flight
 
-    async def newest_activity_after(self, recipient_key, channel_id, watermark):
+    async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
         if self._raises == "staleness":
             raise RuntimeError("db down")
         return self._newer
@@ -116,3 +116,47 @@ async def test_probe_exception_fails_open(stage, caplog):
         verdict = await check_traffic(FakeProbe(raises=stage), **_kwargs())
     assert verdict.allowed and verdict.check_failed
     assert any("traffic control check failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_own_row_excluded_from_staleness_query():
+    """CRITICAL 1: execute() persists the action's own durable row (via
+    create_or_load) *before* the traffic gate runs, so with no exclusion
+    the ledger query would find that just-created row as "newer outbound
+    activity" and self-block every real send. exclude_action_id must reach
+    newest_activity_after, not just in_flight_actions."""
+    action_id = uuid4()
+    probe = FakeProbe()
+    seen = {}
+    orig = probe.newest_activity_after
+
+    async def spy(recipient_key, channel_id, watermark, exclude_action_id):
+        seen["exclude"] = exclude_action_id
+        return await orig(recipient_key, channel_id, watermark, exclude_action_id)
+
+    probe.newest_activity_after = spy
+    await check_traffic(probe, **_kwargs(action_id=action_id))
+    assert seen["exclude"] == action_id
+
+
+@pytest.mark.asyncio
+async def test_override_with_newer_activity_logs_audit_warning(caplog):
+    """IMPORTANT 4: override used to short-circuit before ever fetching
+    newer activity, so an overridden staleness block left nothing
+    auditable. Now it still fetches (for the audit trail only -- this
+    must remain log-only, no ledger schema change) and logs a WARNING
+    naming what got overridden."""
+    newer = NewerActivity("inbound", "zoho_mail", NOW, "Melody withdrew their application", 670826, None)
+    with caplog.at_level(logging.WARNING):
+        verdict = await check_traffic(FakeProbe(newer=newer), **_kwargs(override=True))
+    assert verdict.allowed
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("override bypassed staleness" in m and "message 670826" in m and "prospect:email:melody@example.com" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_override_without_newer_activity_logs_nothing(caplog):
+    with caplog.at_level(logging.WARNING):
+        verdict = await check_traffic(FakeProbe(), **_kwargs(override=True))
+    assert verdict.allowed
+    assert not caplog.records

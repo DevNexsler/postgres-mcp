@@ -1634,6 +1634,64 @@ async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contamina
     assert "tenant-leads" not in {channel_context.target.target_id, chat_context.target.target_id}
 
 
+@pytest.mark.asyncio
+async def test_internal_notification_prospect_id_keys_on_the_resolved_channel_not_a_shared_literal():
+    """CRITICAL 2: before this fix every internal_notification without a
+    TenantCloud claim shared the single literal prospect_id "internal:none"
+    -- one traffic-control lease and one staleness watermark for every
+    escalation across every wake, so concurrent escalations to *different*
+    Cliq channels cross-blocked each other. The spec's internal recipient
+    key is the channel: prospect_id must key on the resolved Cliq
+    channel/chat id, so two different channels get different keys and the
+    same channel gets the same key (payload_hash/subject_key changing is
+    fine pre-merge -- nothing is deployed yet)."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    channel_context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "team-leads-public-channel", "text": "New lead"},
+        )
+    )
+    other_channel_context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="manual_review_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "escalations-channel", "text": "Needs review"},
+        )
+    )
+    same_channel_again = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "team-leads-public-channel", "text": "Another lead"},
+        )
+    )
+
+    assert channel_context.prospect_id == "internal:team-leads-public-channel"
+    assert channel_context.prospect_id != "internal:none"
+    assert other_channel_context.prospect_id == "internal:escalations-channel"
+    assert channel_context.prospect_id != other_channel_context.prospect_id
+    assert channel_context.prospect_id == same_channel_again.prospect_id
+
+
 # --- calendar.update / calendar.delete take event identity from the agent --
 
 _EXAMPLE_EVENT_URL = "https://calendar.zoho.com/caldav/acct/events/3b34ed2d-e2e0-443b-b20a-097c98aebfc3.ics"
