@@ -37,8 +37,8 @@ from .context import RoutingPolicy
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
+from .models import ActionRole
 from .models import ExecuteRequest
-from .models import IntentKind
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
@@ -51,6 +51,7 @@ from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+from .traffic_control import VALID_TRAFFIC_MODES
 from .worker import OutboundWorker
 
 # TenantCloud's API origin is a fixed literal, never a runtime-configurable
@@ -85,15 +86,6 @@ DEFAULT_PROPERTY_ALIASES = {
     "16 north main street 16": "building:16-n-main",
 }
 DEFAULT_ENABLED_OPERATIONS = frozenset({Operation.EMAIL_SEND})
-DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER = {
-    "hotpads": frozenset({Operation.EMAIL_SEND.value}),
-    "zillow": frozenset({Operation.EMAIL_SEND.value}),
-}
-DEFAULT_ENABLED_INTENTS = frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value})
-DEFAULT_ENABLED_INTENTS_BY_PROVIDER = {
-    "hotpads": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
-    "zillow": frozenset({IntentKind.INQUIRY_REPLY.value, IntentKind.SHOWING_OFFER.value}),
-}
 
 
 @dataclass(frozen=True)
@@ -120,7 +112,16 @@ async def handle_outbound_action(
     try:
         parsed = parse_outbound_request(request)
     except ValidationError as exc:
-        raise ValueError("invalid outbound action request") from exc
+        first = exc.errors()[0]
+        location = ".".join(str(part) for part in first["loc"]) or "request"
+        hint = ""
+        if location.endswith("action_role"):
+            hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
+        elif location.endswith("operation"):
+            hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
+        raise ValueError(
+            f"invalid outbound action request: {location}: {first['msg']}{hint}"
+        ) from exc
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
@@ -159,7 +160,14 @@ async def handle_outbound_action(
             )
         else:
             result = await service.execute(parsed)
-    return result.model_dump(mode="json")
+    payload = result.model_dump(mode="json")
+    if result.detail is None:
+        # Every result except a traffic-control block leaves detail unset --
+        # omit the key entirely so existing consumers see no new field on
+        # the wire, instead of a `detail: null` that would still be a shape
+        # change for strict clients.
+        payload.pop("detail", None)
+    return payload
 
 
 def create_server(
@@ -264,65 +272,13 @@ def _enabled_operations() -> frozenset[Operation]:
         raise ValueError("OUTBOUND_ENABLED_OPERATIONS_JSON contains an unsupported operation") from exc
 
 
-def _enabled_operations_by_provider() -> dict[str, frozenset[str]]:
-    raw = os.environ.get("OUTBOUND_PROVIDER_OPERATIONS_JSON")
-    if raw is None:
-        return DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER
-    value = json.loads(raw)
-    if not isinstance(value, dict) or not value:
-        raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON must be a non-empty JSON object")
-    parsed: dict[str, frozenset[str]] = {}
-    for provider, operations in value.items():
-        if (
-            not isinstance(provider, str)
-            or not provider.strip()
-            or not isinstance(operations, list)
-            or not operations
-            or not all(isinstance(item, str) for item in operations)
-        ):
-            raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON values must be non-empty string arrays")
-        try:
-            parsed[provider.casefold()] = frozenset(Operation(item).value for item in operations)
-        except ValueError as exc:
-            raise ValueError("OUTBOUND_PROVIDER_OPERATIONS_JSON contains an unsupported operation") from exc
-    return parsed
 
 
-def _enabled_intents() -> frozenset[str]:
-    raw = os.environ.get("OUTBOUND_ENABLED_INTENTS_JSON")
-    if raw is None:
-        return DEFAULT_ENABLED_INTENTS
-    value = json.loads(raw)
-    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
-        raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON must be a non-empty string array")
-    try:
-        return frozenset(IntentKind(item).value for item in value)
-    except ValueError as exc:
-        raise ValueError("OUTBOUND_ENABLED_INTENTS_JSON contains an unsupported intent") from exc
-
-
-def _enabled_intents_by_provider() -> dict[str, frozenset[str]]:
-    raw = os.environ.get("OUTBOUND_PROVIDER_INTENTS_JSON")
-    if raw is None:
-        return DEFAULT_ENABLED_INTENTS_BY_PROVIDER
-    value = json.loads(raw)
-    if not isinstance(value, dict) or not value:
-        raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON must be a non-empty JSON object")
-    parsed: dict[str, frozenset[str]] = {}
-    for provider, intents in value.items():
-        if (
-            not isinstance(provider, str)
-            or not provider.strip()
-            or not isinstance(intents, list)
-            or not intents
-            or not all(isinstance(item, str) for item in intents)
-        ):
-            raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON values must be non-empty string arrays")
-        try:
-            parsed[provider.casefold()] = frozenset(IntentKind(item).value for item in intents)
-        except ValueError as exc:
-            raise ValueError("OUTBOUND_PROVIDER_INTENTS_JSON contains an unsupported intent") from exc
-    return parsed
+def _traffic_mode() -> str:
+    raw = os.environ.get("OUTBOUND_TRAFFIC_CONTROL", "shadow").casefold()
+    if raw not in VALID_TRAFFIC_MODES:
+        raise ValueError(f"OUTBOUND_TRAFFIC_CONTROL must be one of {sorted(VALID_TRAFFIC_MODES)}, got {raw!r}")
+    return raw
 
 
 def _bearer_headers(name: str) -> dict[str, str]:
@@ -528,9 +484,6 @@ async def build_runtime() -> GatewayRuntime:
             DEFAULT_PROPERTY_ALIASES,
         ),
         conversation_aliases=_json_mapping("OUTBOUND_CONVERSATION_ALIASES_JSON", {}),
-        enabled_operations_by_provider=_enabled_operations_by_provider(),
-        enabled_intents=_enabled_intents(),
-        enabled_intents_by_provider=_enabled_intents_by_provider(),
     )
     context_repository = OutboundGatewayRepository(driver)
     store = PostgresActionStore(driver)
@@ -610,6 +563,8 @@ async def build_runtime() -> GatewayRuntime:
         circuit_guard=observability,
         retry_base_seconds=int(os.environ.get("OUTBOUND_RETRY_BASE_SECONDS", "5")),
         retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
+        traffic_mode=_traffic_mode(),
+        traffic_probe=context_repository,
     )
     return GatewayRuntime(
         pool=pool,

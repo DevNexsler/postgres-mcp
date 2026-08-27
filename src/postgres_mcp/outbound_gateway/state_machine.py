@@ -143,6 +143,7 @@ def public_result(
     detail_code: str,
     completion_kind: CompletionKind | None = None,
     repeated_execute: bool = False,
+    detail: str | None = None,
 ) -> PublicResult:
     return PublicResult(
         status=public_status(
@@ -155,4 +156,5 @@ def public_result(
         provider_request_ref=provider_request_ref,
         retryable=False,
         detail_code=detail_code,
+        detail=detail,
     )

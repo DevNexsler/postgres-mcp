@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from hashlib import sha256
 from typing import Any
@@ -30,7 +32,6 @@ from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
 from .models import ExecuteRequest
-from .models import IntentKind
 from .models import Operation
 from .models import PublicResult
 from .preflight import PreflightDecision
@@ -42,6 +43,11 @@ from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
+from .traffic_control import VALID_TRAFFIC_MODES
+from .traffic_control import TrafficProbe
+from .traffic_control import check_traffic
+
+logger = logging.getLogger(__name__)
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -52,7 +58,7 @@ class OutboundActionRecord:
     wakeup_event_id: int
     action_role: ActionRole
     operation: Operation
-    intent_kind: IntentKind
+    intent_kind: str
     appointment_slot: datetime | None
     arguments: dict[str, Any]
     state: ActionState
@@ -74,6 +80,7 @@ class OutboundActionRecord:
     provider_evidence_reference: str | None = None
     provider_evidence_hash: str | None = None
     provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    error_category: str | None = None
 
     def execute_request(self) -> ExecuteRequest:
         # create_or_load() persists TenantCloud arguments enriched with
@@ -148,6 +155,14 @@ class ActionStore(Protocol):
         observation: ProviderObservation,
     ) -> OutboundActionRecord: ...
 
+    async def remediate_traffic_block(
+        self,
+        action_id: UUID,
+        *,
+        operator_identity: str,
+        reason: str,
+    ) -> OutboundActionRecord: ...
+
     async def get(self, action_id: UUID) -> OutboundActionRecord | None: ...
 
     async def schedule_next_attempt(
@@ -196,7 +211,21 @@ class OutboundActionService:
         circuit_guard: CircuitGuard | None = None,
         retry_base_seconds: int = 5,
         retry_max_seconds: int = 900,
+        traffic_mode: str = "shadow",
+        traffic_probe: TrafficProbe | None = None,
     ):
+        if traffic_mode not in VALID_TRAFFIC_MODES:
+            raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
+        if traffic_mode != "off" and traffic_probe is None:
+            # Not a hard failure -- off/shadow/enforce is a legitimate
+            # operational rollout switch and a missing probe must not crash
+            # the gateway -- but silently behaving like "off" is exactly the
+            # kind of wiring bug (env var set, probe forgotten in
+            # build_runtime()) that should be loud, not invisible.
+            logger.warning(
+                "traffic_mode=%r configured with no traffic_probe -- the gate will never run and this will silently behave like traffic_mode='off'",
+                traffic_mode,
+            )
         self._store = store
         self._context_loader = context_loader
         self._evidence_loader = evidence_loader
@@ -210,6 +239,8 @@ class OutboundActionService:
         self._circuit_guard = circuit_guard or ClosedCircuitGuard()
         self._retry_base_seconds = max(1, retry_base_seconds)
         self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
+        self._traffic_mode = traffic_mode
+        self._traffic_probe = traffic_probe
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         context = await self._context_loader.load(request)
@@ -227,7 +258,20 @@ class OutboundActionService:
             return self._result(action, repeated=True)
         if not self._is_due(action):
             return self._result(action)
-        if action.state in {
+        if action.state is ActionState.DEFINITIVE_FAILED and action.error_category == "traffic_blocked" and request.override:
+            remediated = await self._remediate_traffic_block(action, context)
+            if remediated is not None:
+                action, context = remediated
+            else:
+                return self._result(
+                    action,
+                    detail=(
+                        "override cannot resend this action yet: it is blocked by traffic "
+                        "control and has no evidence-resolved operator remediation on file. "
+                        "Escalate for manual review before retrying."
+                    ),
+                )
+        elif action.state in {
             ActionState.STALE,
             ActionState.REJECTED,
             ActionState.DEFINITIVE_FAILED,
@@ -239,11 +283,236 @@ class OutboundActionService:
             ActionState.PROVIDER_ACCEPTED,
         }:
             return self._result(action)
-        if action.state is ActionState.DEPENDENCY_WAIT:
-            return await self._resume_dependency(action, context)
-        if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
-            return await self._dispatch(action, context)
-        return await self._preflight(action, context)
+        blocked = await self._check_traffic(action, context, override=request.override)
+        if blocked is not None:
+            return blocked
+
+        async def _preflight_fallback() -> PublicResult:
+            return await self._preflight(action, context)
+
+        return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
+
+    async def _dispatch_stage(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        *,
+        otherwise: Callable[[], Awaitable[PublicResult]],
+    ) -> PublicResult:
+        """Routes to _resume_dependency/_dispatch for the states both
+        execute() and resume() share, falling back to `otherwise()` for
+        anything else -- execute()'s catch-all is _preflight() (a fresh
+        RECEIVED action); resume()'s is just returning the row's current
+        result unchanged (worker.py only ever calls resume() for
+        DEPENDENCY_WAIT/PREPARED/RETRY_READY, but resume() is a public
+        method with no such guarantee from other callers, so its historical
+        "return the row as-is" fallback for any other state must not
+        silently become _preflight()). All three routes -- including
+        `otherwise` -- can reach _dispatch()'s adapter.invoke()/
+        adapter.poll() provider I/O, so all three are covered by the same
+        try/except below.
+
+        A post-dispatch exception (e.g. a network timeout *after* the
+        provider already accepted the HTTP request -- the row is durably
+        DISPATCHING with a lease by the time adapter.invoke() runs, since
+        claim()+transition() to DISPATCHING happen before it) must never
+        escape to the MCP caller as a raised error: FastMCP wraps any
+        uncaught exception as "Error executing tool outbound_action: ...",
+        and the CDS reconciler's rejection-prefix rule treats that wrapper
+        as proof nothing was sent. If a real send's post-accept timeout
+        propagated that far, the reconciler would uncount a REAL send and
+        let the wake complete while the message was actually delivered --
+        exactly the false negative the prefix rule is only safe without.
+
+        So: catch broadly here, log at ERROR (wake + action id, for
+        operator visibility), and return whatever the row's durable state
+        already is -- DISPATCHING/RECONCILING with a lease, recovered by the
+        existing lease-expiry/reconcile/worker machinery, same as any other
+        expired-lease crash recovery. This restores the invariant that an
+        MCP error wrapper strictly implies "rejected before any provider
+        interaction": context load/validation (in execute(), everything
+        before this call) is deliberately NOT covered by this except clause
+        and still raises, so a true pre-dispatch rejection keeps the error
+        wrapper the reconciler depends on.
+        """
+        try:
+            if action.state is ActionState.DEPENDENCY_WAIT:
+                return await self._resume_dependency(action, context)
+            if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
+                return await self._dispatch(action, context)
+            return await otherwise()
+        except Exception:
+            logger.error(
+                "post-dispatch exception on wake %s action %s -- provider call outcome "
+                "unknown, returning durable row state for lease-expiry/reconcile recovery",
+                context.wakeup_event_id,
+                action.action_id,
+                exc_info=True,
+            )
+            return self._result(await self._require_action(action.action_id))
+
+    async def _remediate_traffic_block(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+    ) -> tuple[OutboundActionRecord, ActionContext] | None:
+        """override=true resend of a traffic-blocked DEFINITIVE_FAILED action.
+
+        Reuses the same successor-action machinery operator remediation uses
+        (create_outbound_remediation_context / retry_of_action_id / next
+        effect_ordinal -- Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267,
+        granted to the gateway's runtime role in migrations/120_outbound_action_terminal_wake_boundary.sql:550-551)
+        rather than inventing a new one. That function's own precondition --
+        an evidence-resolved `outbound_action_resolutions` row for this
+        action (067:1221-1228) -- is written by resolve_outbound_action_from_evidence,
+        which IS granted to the gateway's runtime role (migrations/
+        079_runtime_tenantcloud_privilege_boundary.sql:427,459-475), so this
+        is not a privilege wall. The real blocker is a lifecycle/evidence
+        mismatch: resolve_outbound_action_from_evidence only accepts a row
+        already in 'manual_review' (067:1160-1163) and requires real
+        provider-side non-acceptance evidence (a 64-hex hash, a non-empty
+        reference, evidence_kind='authoritative_non_acceptance', 067:1164-1173)
+        -- neither of which a traffic-control block has: it goes straight to
+        'definitive_failed' from a live/pending state, never through
+        'manual_review', and there is no provider disposition to attest to,
+        only an internal recipient-safety policy decision. So an override
+        resend can only succeed once an operator has independently routed
+        this action through manual_review and evidence-resolved it; until
+        then this returns None and the caller stays on the original terminal
+        result instead of crashing on the unhandled precondition-violation
+        exception. Closing that gap for a fully autonomous, zero-operator
+        unblock needs a new Comm-Data-Store migration (e.g. a successor path
+        keyed on error_category='traffic_blocked' instead of an evidence
+        resolution) -- out of scope for this worktree.
+
+        The successor's context is the SAME `context` already loaded for
+        this call (not re-derived via `_verified_context`): the successor
+        copies wakeup_event_id/action_role/canonical_scope/canonical_context/
+        recipient_scope/provider_account/routing_policy_version/operation/
+        intent_kind/appointment_slot/arguments/payload_hash verbatim from the
+        parent row (067:1247-1264), so nothing about the wake-derived context
+        actually changed -- only `action_id` (next effect_ordinal) did.
+        `_verified_context()` would be the wrong tool here: it re-derives
+        action_id from the wake via the client-side uid formula, which is
+        always ordinal 0 (context.py:299), so it would report every
+        successor as a context mismatch.
+        """
+        try:
+            successor = await self._store.remediate_traffic_block(
+                action.action_id,
+                operator_identity=self._lease_owner,
+                reason="traffic_control_override_resend",
+            )
+        except Exception:
+            logger.warning(
+                "traffic control override could not remediate blocked action %s (no evidence-resolved remediation on file yet)",
+                action.action_id,
+                exc_info=True,
+            )
+            return None
+        return successor, dataclass_replace(context, action_id=successor.action_id)
+
+    async def _check_traffic(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        *,
+        override: bool,
+    ) -> PublicResult | None:
+        """Per-recipient traffic gate. Returns a blocking PublicResult when
+        enforce mode must stop dispatch; returns None (proceed) otherwise --
+        including shadow mode (which only logs) and off mode (no probe call
+        at all)."""
+        if self._traffic_mode == "off" or self._traffic_probe is None:
+            return None
+        verdict = await check_traffic(
+            self._traffic_probe,
+            recipient_key=context.prospect_id,
+            channel_id=context.channel_id,
+            wakeup_event_id=context.wakeup_event_id,
+            action_id=context.action_id,
+            override=override,
+            logger=logger,
+        )
+        if not verdict.allowed:
+            if self._traffic_mode == "enforce":
+                claimable = action
+                if action.state is ActionState.RECEIVED:
+                    # claim_outbound_action's live whitelist (Comm-Data-Store
+                    # migrations/068_outbound_gateway_observability.sql:156-159) excludes
+                    # 'received' -- a fresh row must first move through
+                    # prepare_outbound_action_and_acquire_lock (067:524-528 only accepts
+                    # 'received'/'dependency_wait'), the same call the normal
+                    # _preflight() READY path uses, before it is claimable at all.
+                    claimable = await self._store.prepare(context, action.state)
+                    if claimable.state is ActionState.COMPLETED:
+                        return self._result(claimable, repeated=True)
+                if claimable.state is ActionState.DEPENDENCY_WAIT or verdict.reason == "lease_held":
+                    # Two independent reasons land here, both deferring
+                    # instead of terminalizing:
+                    #
+                    # 1. claimable.state is DEPENDENCY_WAIT: DB-forced, not a
+                    #    policy choice. outbound_action_transition_allowed()
+                    #    has no dependency_wait -> definitive_failed edge
+                    #    (Comm-Data-Store migrations/067_outbound_action_gateway.sql:346-389)
+                    #    -- forcing a terminal here would raise the DB's
+                    #    'invalid outbound definitive failure state'
+                    #    uncaught. Two ways to land here: a fresh RECEIVED row
+                    #    whose prepare() above hit a contended intent lock
+                    #    (067:556-564), or resume() being called on an
+                    #    already-dependency_wait row. Same pattern
+                    #    _preflight()'s READY branch already uses for lock
+                    #    contention (~line 643).
+                    #
+                    # 2. verdict.reason == "lease_held": a policy choice
+                    #    (Important 6), true regardless of claimable.state. A
+                    #    lease block is inherently short-lived -- the other
+                    #    in-flight action will reach a terminal state on its
+                    #    own -- unlike a stale-context block, which needs a
+                    #    conscious agent decision (skip or override) because
+                    #    nothing else is going to resolve it. Deterministic
+                    #    action_id + a terminal DEFINITIVE_FAILED meant a
+                    #    seconds-long lease overlap would brick that resend
+                    #    forever (override never bypasses a lease, by
+                    #    design -- only staleness).
+                    #
+                    # Both are still a block (do-not-dispatch-now), and the
+                    # row stays legally re-drivable: the worker's next
+                    # resume() (PREPARED/RETRY_READY/DEPENDENCY_WAIT are all
+                    # in worker.py's list_work -> resume() routing) re-runs
+                    # this same gate on its next poll, so the lease clearing,
+                    # the lock contention clearing, or an override resend all
+                    # self-heal it with no manual intervention needed.
+                    return self._result(claimable, detail_code=verdict.reason, detail=verdict.detail)
+                claimed = await self._store.claim(
+                    claimable.action_id,
+                    claimable.state,
+                    self._lease_owner,
+                    self._lease_seconds,
+                )
+                failed = await self._store.definitive_fail(
+                    claimed.action_id,
+                    claimed.state,
+                    self._lease_owner,
+                    ProviderObservation(
+                        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                        verdict.reason,
+                        category="traffic_blocked",
+                        retryable=False,
+                        evidence={"detail": verdict.detail},
+                    ),
+                )
+                return self._result(failed, detail=verdict.detail)
+            logger.warning(
+                "traffic control shadow would-block: %s %s wake=%s recipient=%s",
+                verdict.reason,
+                verdict.detail,
+                context.wakeup_event_id,
+                context.prospect_id,
+            )
+        elif verdict.check_failed:
+            logger.warning("traffic control fail-open on wake %s", context.wakeup_event_id)
+        return None
 
     async def status(self, action_id: UUID) -> PublicResult:
         return self._result(await self._require_action(action_id))
@@ -258,11 +527,19 @@ class OutboundActionService:
         context, context_detail = await self._verified_context(action)
         if context is None:
             return await self._manual_review(action, context_detail)
-        if action.state is ActionState.DEPENDENCY_WAIT:
-            return await self._resume_dependency(action, context)
-        if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
-            return await self._dispatch(action, context)
-        return self._result(action)
+        # Worker-driven resume (worker.py's list_work -> resume for
+        # dependency_wait/prepared/retry_ready) has no ExecuteRequest and
+        # therefore no caller-supplied override -- a long-waited action
+        # never gets to skip staleness just because nobody re-asked with
+        # override=true. Same off/shadow/enforce semantics as execute().
+        blocked = await self._check_traffic(action, context, override=False)
+        if blocked is not None:
+            return blocked
+
+        async def _unchanged_fallback() -> PublicResult:
+            return self._result(action)
+
+        return await self._dispatch_stage(action, context, otherwise=_unchanged_fallback)
 
     async def reconcile(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
@@ -771,7 +1048,7 @@ class OutboundActionService:
             {
                 "action_role": context.action_role.value,
                 "operation": context.operation.value,
-                "intent_kind": context.intent_kind.value,
+                "intent_kind": context.intent_kind,
                 "appointment_slot": context.appointment_slot,
                 "arguments": context.arguments,
                 "canonical_context": normalized_context,
@@ -853,13 +1130,20 @@ class OutboundActionService:
         return True
 
     @staticmethod
-    def _result(action: OutboundActionRecord, *, repeated: bool = False) -> PublicResult:
+    def _result(
+        action: OutboundActionRecord,
+        *,
+        repeated: bool = False,
+        detail: str | None = None,
+        detail_code: str | None = None,
+    ) -> PublicResult:
         return public_result(
             state=action.state,
             action_id=action.action_id,
             action_uid=action.action_uid,
             provider_request_ref=action.provider_request_ref,
-            detail_code=action.detail_code,
+            detail_code=detail_code or action.detail_code,
             completion_kind=action.completion_kind,
             repeated_execute=repeated,
+            detail=detail,
         )

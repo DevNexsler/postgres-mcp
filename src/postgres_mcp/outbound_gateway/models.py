@@ -404,53 +404,6 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
 }
 
 
-ALLOWED_COMBINATIONS: frozenset[tuple[ActionRole, Operation, IntentKind]] = frozenset(
-    {
-        (role, operation, intent)
-        for role, operations, intents in (
-            (
-                ActionRole.PROSPECT_REPLY,
-                (Operation.EMAIL_SEND, Operation.QUO_SMS_SEND),
-                (
-                    IntentKind.INQUIRY_REPLY,
-                    IntentKind.SHOWING_OFFER,
-                    IntentKind.SHOWING_CONFIRMATION,
-                    IntentKind.SHOWING_RESCHEDULE,
-                    IntentKind.SHOWING_CANCELLATION,
-                ),
-            ),
-            (
-                ActionRole.INTERNAL_NOTIFICATION,
-                (Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST),
-                (IntentKind.LEAD_ALERT, IntentKind.MANUAL_REVIEW_ALERT),
-            ),
-        )
-        for operation in operations
-        for intent in intents
-    }
-    | {
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_CREATE, IntentKind.SHOWING_CREATE),
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_UPDATE, IntentKind.SHOWING_UPDATE),
-        (ActionRole.CALENDAR_MUTATION, Operation.CALENDAR_DELETE, IntentKind.SHOWING_DELETE),
-        (ActionRole.PROSPECT_REPLY, Operation.TENANTCLOUD_MESSAGE_SEND, IntentKind.INQUIRY_REPLY),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
-            IntentKind.TENANTCLOUD_LEAD_STATUS,
-        ),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_MAINTENANCE_CREATE,
-            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
-        ),
-        (
-            ActionRole.PROVIDER_MUTATION,
-            Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
-            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
-        ),
-    }
-)
-
 SLOT_REQUIRED_INTENTS = frozenset(
     {
         IntentKind.SHOWING_OFFER,
@@ -462,14 +415,18 @@ SLOT_REQUIRED_INTENTS = frozenset(
 )
 
 
+_KNOWN_INTENT_KINDS = frozenset(member.value for member in IntentKind)
+
+
 class ExecuteRequest(StrictModel):
     op: Literal["execute"]
     wakeup_event_id: PositiveBigInt
     action_role: ActionRole
     operation: Operation
-    intent_kind: IntentKind
+    intent_kind: str
     arguments: ArgumentModel
     appointment_slot: datetime | None = None
+    override: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -484,6 +441,18 @@ class ExecuteRequest(StrictModel):
         data = dict(raw)
         data["arguments"] = ARGUMENT_MODELS[operation].model_validate(raw.get("arguments"))
         return data
+
+    @field_validator("intent_kind", mode="before")
+    @classmethod
+    def normalize_intent_kind(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("intent_kind must be a string")
+        candidate = value.strip().casefold()
+        if not candidate:
+            raise ValueError("intent_kind must not be empty")
+        if len(candidate) > 64:
+            raise ValueError("intent_kind must be at most 64 characters")
+        return candidate
 
     @field_validator("appointment_slot", mode="before")
     @classmethod
@@ -505,12 +474,14 @@ class ExecuteRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_matrix(self) -> ExecuteRequest:
-        combination = (self.action_role, self.operation, self.intent_kind)
-        if combination not in ALLOWED_COMBINATIONS:
-            raise ValueError("unsupported action role, operation, and intent combination")
         if self.intent_kind in SLOT_REQUIRED_INTENTS and self.appointment_slot is None:
             raise ValueError("appointment_slot is required for this intent")
-        if self.intent_kind not in SLOT_REQUIRED_INTENTS and self.appointment_slot is not None:
+        known_intent = self.intent_kind in _KNOWN_INTENT_KINDS
+        if (
+            self.appointment_slot is not None
+            and self.intent_kind not in SLOT_REQUIRED_INTENTS
+            and known_intent
+        ):
             raise ValueError("appointment_slot is forbidden for this intent")
         return self
 
@@ -542,3 +513,10 @@ class PublicResult(StrictModel):
     provider_request_ref: str | None
     retryable: Literal[False] = False
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
+    # Human-readable elaboration of detail_code. None everywhere except traffic-control
+    # blocks: that is the one path where the calling agent must read *why* (which
+    # in-flight action or newer message) to decide skip vs. resend with override=true --
+    # detail_code alone ("lease_held"/"stale_context") does not carry that. Left unset
+    # (None) for every other result so existing consumers see no new key on the wire
+    # (server.py omits it from the response payload when None).
+    detail: str | None = None

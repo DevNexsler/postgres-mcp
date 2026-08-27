@@ -12,26 +12,24 @@ from starlette.testclient import TestClient
 
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.metrics import MetricSample
+from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
-from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_INTENTS
-from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_INTENTS_BY_PROVIDER
-from postgres_mcp.outbound_gateway.server import DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER
 from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import TENANTCLOUD_ORIGIN
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
-from postgres_mcp.outbound_gateway.server import _enabled_intents_by_provider
-from postgres_mcp.outbound_gateway.server import _enabled_operations_by_provider
 from postgres_mcp.outbound_gateway.server import _reject_tenantcloud_origin_overrides
 from postgres_mcp.outbound_gateway.server import _tenantcloud_adapters
 from postgres_mcp.outbound_gateway.server import _tenantcloud_enabled
 from postgres_mcp.outbound_gateway.server import _ThreadOffloadedAdapter
 from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
+from postgres_mcp.outbound_gateway.state_machine import public_result
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
@@ -45,15 +43,6 @@ def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
     }
     assert DEFAULT_PROPERTY_ALIASES["138 bullman street 144 a"] == "building:bullman-st"
     assert DEFAULT_PROPERTY_ALIASES["144 bullman street"] == "building:bullman-st"
-    assert DEFAULT_ENABLED_OPERATIONS_BY_PROVIDER == {
-        "hotpads": frozenset({"email.send"}),
-        "zillow": frozenset({"email.send"}),
-    }
-    assert DEFAULT_ENABLED_INTENTS == frozenset({"inquiry_reply", "showing_offer"})
-    assert DEFAULT_ENABLED_INTENTS_BY_PROVIDER == {
-        "hotpads": frozenset({"inquiry_reply", "showing_offer"}),
-        "zillow": frozenset({"inquiry_reply", "showing_offer"}),
-    }
 
 
 def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
@@ -61,20 +50,6 @@ def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
     assert _bearer_headers("QUO_MCP_TOKEN") == {}
     monkeypatch.setenv("QUO_MCP_TOKEN", "provider-secret")
     assert _bearer_headers("QUO_MCP_TOKEN") == {"Authorization": "Bearer provider-secret"}
-
-
-@pytest.mark.parametrize(
-    ("environment_name", "loader"),
-    [
-        ("OUTBOUND_PROVIDER_OPERATIONS_JSON", _enabled_operations_by_provider),
-        ("OUTBOUND_PROVIDER_INTENTS_JSON", _enabled_intents_by_provider),
-    ],
-)
-def test_explicit_empty_provider_scope_fails_closed(monkeypatch, environment_name, loader):
-    monkeypatch.setenv(environment_name, "{}")
-
-    with pytest.raises(ValueError, match="non-empty JSON object"):
-        loader()
 
 
 def public(status=PublicStatus.SENT, detail="provider_receipt_verified"):
@@ -160,6 +135,21 @@ async def test_execute_and_status_delegate_only_after_strict_json_validation():
 
 
 @pytest.mark.asyncio
+async def test_validation_error_names_field_and_values():
+    service = AsyncMock()
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+    bad = {**execute_payload(), "action_role": "bogus_role"}
+
+    with pytest.raises(ValueError) as exc:
+        await handle_outbound_action(service, policy, bad)
+
+    msg = str(exc.value)
+    assert "action_role" in msg
+    for role in ActionRole:
+        assert role.value in msg
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("policy", "detail"),
     [
@@ -175,6 +165,52 @@ async def test_write_policy_rejects_before_database_or_provider_call(policy, det
     assert result["status"] == "rejected"
     assert result["detail_code"] == detail
     service.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_enforce_traffic_block_detail_reaches_the_mcp_response():
+    """The whole point of a traffic block is that the calling agent reads WHY
+    (which message/action changed since its context) and decides skip vs.
+    override=true. detail_code alone ("stale_context") does not carry that --
+    this asserts the human-readable verdict text (built by the same
+    production public_result() the service actually calls) survives the
+    server's response-dict serialization."""
+    service = AsyncMock()
+    service.execute.return_value = public_result(
+        state=ActionState.DEFINITIVE_FAILED,
+        action_id=ACTION_ID,
+        action_uid=None,
+        provider_request_ref=None,
+        detail_code="stale_context",
+        detail=(
+            "New inbound activity since your context was built: message 999 via zillow "
+            'at 2026-07-16T01:00:00+00:00: "Are you still available Friday?". Re-read the '
+            "thread and skip if your message is now redundant, or resend with override=true "
+            "if it is still needed."
+        ),
+    )
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(service, policy, execute_payload())
+
+    assert result["detail_code"] == "stale_context"
+    assert "override" in result["detail"]
+    assert "Are you still available Friday?" in result["detail"]
+
+
+@pytest.mark.asyncio
+async def test_success_response_does_not_grow_a_detail_key():
+    """Backward compat: every non-blocked result leaves PublicResult.detail
+    unset, and the server must not add a `detail` key to the wire payload
+    for those -- only traffic blocks populate it."""
+    service = AsyncMock()
+    service.execute.return_value = public()
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(service, policy, execute_payload())
+
+    assert result["status"] == "sent"
+    assert "detail" not in result
 
 
 @pytest.mark.asyncio

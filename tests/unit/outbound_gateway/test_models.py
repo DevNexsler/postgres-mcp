@@ -147,41 +147,10 @@ def test_all_seven_operations_use_adapter_owned_strict_argument_schemas(operatio
         {"operation": "calendar.delete", "arguments": {"event_id": "raw-id"}},
         {"operation": "not.a.provider"},
         {"action_role": "staff_approval"},
-        {"intent_kind": "freeform"},
     ],
 )
 def test_adapter_arguments_and_enums_reject_unknown_values(overrides):
     with pytest.raises(ValidationError):
-        parse_outbound_request(execute_payload(**overrides))
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"action_role": "calendar_mutation", "operation": "email.send", "intent_kind": "showing_create"},
-        {
-            "action_role": "prospect_reply",
-            "operation": "calendar.create",
-            "intent_kind": "showing_offer",
-            "arguments": {"calendar_id": "nigel"},
-        },
-        {
-            "action_role": "internal_notification",
-            "operation": "cliq.chat.post",
-            "intent_kind": "showing_offer",
-            "arguments": {"channel_or_chat_id": "chat-1", "text": "Hi"},
-        },
-        {"action_role": "prospect_reply", "operation": "email.send", "intent_kind": "showing_create"},
-        {
-            "action_role": "calendar_mutation",
-            "operation": "calendar.delete",
-            "intent_kind": "showing_update",
-            "arguments": {"calendar_id": "nigel"},
-        },
-    ],
-)
-def test_role_operation_intent_matrix_fails_closed(overrides):
-    with pytest.raises(ValidationError, match="combination"):
         parse_outbound_request(execute_payload(**overrides))
 
 
@@ -283,40 +252,6 @@ def test_tenantcloud_operations_use_exact_strict_argument_models(operation, role
     assert parsed.arguments.model_config["frozen"] is True
     if operation == "tenantcloud.maintenance.create":
         assert parsed.arguments.text == "Pipe is leaking\nunder sink"
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {
-            "operation": "tenantcloud.message.send",
-            "action_role": "provider_mutation",
-            "intent_kind": "inquiry_reply",
-            "arguments": {"text": "Reply"},
-        },
-        {
-            "operation": "tenantcloud.lead.status.update",
-            "action_role": "provider_mutation",
-            "intent_kind": "tenantcloud_maintenance_status",
-            "arguments": {"status": "working"},
-        },
-        {
-            "operation": "tenantcloud.maintenance.create",
-            "action_role": "calendar_mutation",
-            "intent_kind": "tenantcloud_maintenance_create",
-            "arguments": {},
-        },
-        {
-            "operation": "tenantcloud.maintenance.status.update",
-            "action_role": "provider_mutation",
-            "intent_kind": "tenantcloud_lead_status",
-            "arguments": {"status": 1},
-        },
-    ],
-)
-def test_tenantcloud_role_operation_intent_matrix_fails_closed(overrides):
-    with pytest.raises(ValidationError):
-        parse_outbound_request(execute_payload(appointment_slot=None, **overrides))
 
 
 def test_tenantcloud_arguments_carry_agent_supplied_targets():
@@ -699,3 +634,40 @@ def test_calendar_create_still_works_without_event_fields_and_rejects_them_as_ex
                 arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
             )
         )
+
+
+# --- Task 3: override flag, free-form intent metadata ----------------------
+
+
+def test_execute_request_accepts_override_flag():
+    req = execute_payload()
+    req["override"] = True
+    assert ExecuteRequest.model_validate(req).override is True
+
+
+def test_execute_request_default_override_false():
+    assert ExecuteRequest.model_validate(execute_payload()).override is False
+
+
+def test_unknown_intent_is_stored_not_rejected():
+    req = execute_payload()
+    req["intent_kind"] = "escalation"  # the string that burned wake 25789
+    parsed = ExecuteRequest.model_validate(req)
+    assert parsed.intent_kind == "escalation"
+
+
+def test_role_operation_intent_matrix_no_longer_enforced():
+    req = execute_payload()
+    req["action_role"] = "internal_notification"
+    req["operation"] = "cliq.channel.post"
+    req["intent_kind"] = "escalation"
+    req["arguments"] = {"channel_or_chat_id": "tenantleads", "text": "hi"}
+    ExecuteRequest.model_validate(req)  # must not raise
+
+
+def test_slot_still_required_for_showing_offer():
+    req = execute_payload()
+    req["intent_kind"] = "showing_offer"
+    req.pop("appointment_slot", None)
+    with pytest.raises(ValidationError, match="appointment_slot is required"):
+        ExecuteRequest.model_validate(req)

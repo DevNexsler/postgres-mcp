@@ -16,7 +16,6 @@ from .context import ActionContext
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
-from .models import IntentKind
 from .models import Operation
 from .service import OutboundActionRecord
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
@@ -125,7 +124,7 @@ class PostgresActionStore:
                 context.wakeup_event_id,
                 context.action_role.value,
                 context.operation.value,
-                context.intent_kind.value,
+                context.intent_kind,
                 context.appointment_slot,
                 context.payload_hash,
                 _json(context.canonical_context),
@@ -147,9 +146,9 @@ class PostgresActionStore:
     async def prepare(self, context: ActionContext, expected_state: ActionState) -> OutboundActionRecord:
         slot = context.appointment_slot.isoformat() if context.appointment_slot else ""
         if context.action_role is ActionRole.PROSPECT_REPLY:
-            lock_intent = f"{context.intent_kind.value}:turn:{context.source_message_id}"
+            lock_intent = f"{context.intent_kind}:turn:{context.source_message_id}"
         elif context.action_role is ActionRole.CALENDAR_MUTATION:
-            lock_intent = f"{context.intent_kind.value}:lifecycle:{context.showing_lifecycle_id}"
+            lock_intent = f"{context.intent_kind}:lifecycle:{context.showing_lifecycle_id}"
         elif context.action_role is ActionRole.PROVIDER_MUTATION:
             claim_id = context.canonical_context["tenantcloud_claim_id"]
             source_id = context.canonical_context["source_event_id"]
@@ -167,7 +166,7 @@ class PostgresActionStore:
             else:
                 lock_intent = f"{prefix}:state:{desired_hash}"
         else:
-            lock_intent = f"{context.intent_kind.value}:event:{context.wakeup_event_id}"
+            lock_intent = f"{context.intent_kind}:event:{context.wakeup_event_id}"
         return await self._one(
             """
             SELECT * FROM prepare_outbound_action_and_acquire_lock(
@@ -341,6 +340,28 @@ class PostgresActionStore:
             ],
         )
 
+    async def remediate_traffic_block(
+        self,
+        action_id: UUID,
+        *,
+        operator_identity: str,
+        reason: str,
+    ) -> OutboundActionRecord:
+        """Successor-action path for an override=true resend of a
+        traffic-blocked DEFINITIVE_FAILED action. Calls the same
+        create_outbound_remediation_context() operator remediation uses
+        (Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267)
+        rather than a bespoke function -- it derives the next effect_ordinal,
+        mints the successor action_id, and sets retry_of_action_id itself.
+        That function requires an evidence-resolved outbound_action_resolutions
+        row for action_id (067:1221-1228); if none exists yet it raises, and
+        this method does not catch that -- the caller (service.py's
+        _remediate_traffic_block) decides how to degrade gracefully."""
+        return await self._one(
+            "SELECT * FROM create_outbound_remediation_context({}, {}, {})",
+            [action_id, operator_identity, reason],
+        )
+
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -415,7 +436,7 @@ class PostgresActionStore:
             wakeup_event_id=int(cells["wakeup_event_id"]),
             action_role=ActionRole(str(cells["action_role"])),
             operation=Operation(str(cells["operation"])),
-            intent_kind=IntentKind(str(cells["intent_kind"])),
+            intent_kind=str(cells["intent_kind"]),
             appointment_slot=cells.get("appointment_slot"),
             arguments=dict(cells.get("arguments") or {}),
             state=ActionState(str(cells["state"])),
@@ -437,4 +458,5 @@ class PostgresActionStore:
             provider_evidence_reference=cells.get("evidence_reference"),
             provider_evidence_hash=cells.get("evidence_hash"),
             provider_readback_evidence=dict(readback_evidence) if readback_evidence else {},
+            error_category=cells.get("error_category"),
         )
