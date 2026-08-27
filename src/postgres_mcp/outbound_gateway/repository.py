@@ -6,8 +6,27 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from typing import Protocol
+from uuid import UUID
 
 from postgres_mcp.sql import SafeSqlDriver
+
+from .traffic_control import InFlightAction
+from .traffic_control import NewerActivity
+
+# Non-terminal outbound_actions.state values: an action in one of these
+# states still has an in-flight lease on its recipient. Everything else
+# (completed, stale, rejected, definitive_failed, dead_letter,
+# manual_review) is terminal or parked and does not hold the lease.
+NON_TERMINAL_STATES = (
+    "received",
+    "dependency_wait",
+    "prepared",
+    "dispatching",
+    "provider_accepted",
+    "unknown",
+    "reconciling",
+    "retry_ready",
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +84,16 @@ class ContextRepository(Protocol):
         aliases: tuple[str, ...],
         property_scope: str,
     ) -> AliasResolution: ...
+
+    async def in_flight_actions(
+        self, recipient_key: str, exclude_action_id: UUID
+    ) -> list[InFlightAction]: ...
+
+    async def newest_activity_after(
+        self, recipient_key: str, channel_id: int, watermark: datetime
+    ) -> NewerActivity | None: ...
+
+    async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
 
 
 class OutboundGatewayRepository:
@@ -163,3 +192,112 @@ class OutboundGatewayRepository:
             canonical_subject=cells.get("canonical_subject"),
             ambiguous=int(cells.get("subject_count") or 0) > 1,
         )
+
+    async def in_flight_actions(
+        self, recipient_key: str, exclude_action_id: UUID
+    ) -> list[InFlightAction]:
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT
+                action_id,
+                operation,
+                state,
+                created_at,
+                left(coalesce(arguments::text,''), 120) AS preview
+            FROM outbound_actions
+            WHERE subject_key = {}
+              AND action_id <> {}
+              AND state = ANY({})
+            ORDER BY created_at
+            """,
+            [recipient_key, exclude_action_id, list(NON_TERMINAL_STATES)],
+        )
+        return [
+            InFlightAction(
+                action_id=UUID(str(row.cells["action_id"])),
+                operation=str(row.cells["operation"]),
+                state=str(row.cells["state"]),
+                created_at=row.cells["created_at"],
+                preview=str(row.cells.get("preview") or ""),
+            )
+            for row in rows or []
+        ]
+
+    async def newest_activity_after(
+        self, recipient_key: str, channel_id: int, watermark: datetime
+    ) -> NewerActivity | None:
+        ledger_rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT
+                action_id,
+                created_at,
+                left(coalesce(arguments::text,''), 120) AS preview
+            FROM outbound_actions
+            WHERE subject_key = {}
+              AND created_at > {}
+              AND state <> 'rejected'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [recipient_key, watermark],
+        )
+        message_rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT
+                id AS message_id,
+                created_at,
+                direction,
+                left(coalesce(body,''), 120) AS preview
+            FROM messages
+            WHERE channel_id = {}
+              AND created_at > {}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [channel_id, watermark],
+        )
+        candidates: list[NewerActivity] = []
+        if ledger_rows:
+            cells = ledger_rows[0].cells
+            candidates.append(
+                NewerActivity(
+                    direction="outbound",
+                    source="outbound_actions",
+                    occurred_at=cells["created_at"],
+                    preview=str(cells.get("preview") or ""),
+                    message_id=None,
+                    action_id=UUID(str(cells["action_id"])),
+                )
+            )
+        if message_rows:
+            cells = message_rows[0].cells
+            candidates.append(
+                NewerActivity(
+                    direction=str(cells.get("direction") or "inbound"),
+                    source="messages",
+                    occurred_at=cells["created_at"],
+                    preview=str(cells.get("preview") or ""),
+                    message_id=int(cells["message_id"]),
+                    action_id=None,
+                )
+            )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item.occurred_at)
+
+    async def context_watermark(self, wakeup_event_id: int) -> datetime | None:
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT coalesce(webui_accepted_at, created_at) AS watermark
+            FROM hermes_wakeup_events
+            WHERE id = {}
+            """,
+            [wakeup_event_id],
+        )
+        if not rows:
+            return None
+        return rows[0].cells["watermark"]
