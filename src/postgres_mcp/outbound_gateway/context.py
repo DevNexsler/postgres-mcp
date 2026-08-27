@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -32,6 +33,8 @@ from .models import QuoSmsArguments
 from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
 from .repository import WakeEventRecord
+
+logger = logging.getLogger(__name__)
 
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -88,9 +91,6 @@ class RoutingPolicy:
     property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
     calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
-    enabled_operations_by_provider: Mapping[str, frozenset[str]] = dataclass_field(default_factory=dict)
-    enabled_intents: frozenset[str] = frozenset()
-    enabled_intents_by_provider: Mapping[str, frozenset[str]] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -231,27 +231,10 @@ class ActionContextLoader:
         raw = _mapping(record.raw_payload)
         # The operation names its own provider ("tenantcloud.*" is always
         # provider "tenantcloud") -- for these four operations the wake's
-        # message shape must not override that, or an execute against a
-        # non-TenantCloud-shaped wake gets rejected by the allowlist gate
-        # below, reintroducing exactly the wake-shape coupling this task
-        # removes one layer up.
+        # message shape must not override that. _target() below still keys
+        # email/quo account routing on this provider, and canonical_scope
+        # still records it, even with no allowlist gating it anymore.
         provider = "tenantcloud" if request.operation in _TENANTCLOUD_OPERATIONS else self._provider(record, raw, message)
-        if self._policy.enabled_operations_by_provider:
-            allowed_operations = self._policy.enabled_operations_by_provider.get(
-                provider,
-                frozenset(),
-            )
-            if request.operation.value not in allowed_operations:
-                raise ContextDerivationError("provider operation is disabled")
-        if self._policy.enabled_intents and request.intent_kind not in self._policy.enabled_intents:
-            raise ContextDerivationError("intent is disabled")
-        if self._policy.enabled_intents_by_provider:
-            provider_intents = self._policy.enabled_intents_by_provider.get(
-                provider,
-                frozenset(),
-            )
-            if request.intent_kind not in provider_intents:
-                raise ContextDerivationError("provider intent is disabled")
         property_label = self._property_label(record, envelope, raw, message)
         property_scope = normalize_property_key(property_label)
         property_id = self._policy.property_aliases.get(property_scope)
@@ -262,23 +245,6 @@ class ActionContextLoader:
             property_id = str(request.arguments.property_id)
 
         aliases = self._aliases(record, envelope, message, raw)
-        if (
-            not aliases
-            and request.action_role is not ActionRole.INTERNAL_NOTIFICATION
-            and request.operation not in _TENANTCLOUD_OPERATIONS
-        ):
-            raise ContextDerivationError("no stable prospect aliases")
-        if aliases:
-            resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
-            if resolved.ambiguous:
-                raise ContextDerivationError("prospect aliases are ambiguous")
-            prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
-        else:
-            prospect_id = (
-                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
-                if record.tenantcloud_claim_id is not None
-                else "internal:none"
-            )
 
         thread_identity = self._thread_identity(record, raw, message, provider)
         conversation_provider = "zillow" if provider in _ZILLOW_PROVIDER_FAMILY else provider
@@ -297,6 +263,28 @@ class ActionContextLoader:
         )
         if not target.verified:
             raise ContextDerivationError("verified target could not be derived")
+
+        if aliases:
+            resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
+            if resolved.ambiguous:
+                logger.warning(
+                    "ambiguous aliases for wake %s; using address fallback",
+                    request.wakeup_event_id,
+                )
+                prospect_id = f"prospect:{self._preferred_alias(aliases)}"
+            else:
+                prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
+        elif request.action_role is ActionRole.INTERNAL_NOTIFICATION or request.operation in _TENANTCLOUD_OPERATIONS:
+            prospect_id = (
+                f"tenantcloud:claim:{record.tenantcloud_claim_id}"
+                if record.tenantcloud_claim_id is not None
+                else "internal:none"
+            )
+        else:
+            # No stable alias anywhere on the wake. This used to hard-fail;
+            # now fall back to the agent's own verified target address --
+            # exactly what a customer send is keyed on anyway.
+            prospect_id = f"prospect:{target.target_id}"
 
         requires_property = request.intent_kind not in {
             IntentKind.INQUIRY_REPLY,

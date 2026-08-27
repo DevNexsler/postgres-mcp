@@ -538,9 +538,11 @@ async def build_runtime() -> GatewayRuntime:
             DEFAULT_PROPERTY_ALIASES,
         ),
         conversation_aliases=_json_mapping("OUTBOUND_CONVERSATION_ALIASES_JSON", {}),
-        enabled_operations_by_provider=_enabled_operations_by_provider(),
-        enabled_intents=_enabled_intents(),
-        enabled_intents_by_provider=_enabled_intents_by_provider(),
+        # _enabled_operations_by_provider() / _enabled_intents() /
+        # _enabled_intents_by_provider() are no longer wired into
+        # RoutingPolicy -- Task 4 removed the gates they fed; the parsers
+        # and DEFAULT_ENABLED_* constants stay for now (still exercised by
+        # test_server.py) and are archived in Task 5.
     )
     context_repository = OutboundGatewayRepository(driver)
     store = PostgresActionStore(driver)

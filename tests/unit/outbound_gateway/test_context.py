@@ -1,4 +1,3 @@
-from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ from postgres_mcp.outbound_gateway.context import ActionContextLoader
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import RoutingPolicy
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
+from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.repository import AliasResolution
 from postgres_mcp.outbound_gateway.repository import ConversationSnapshot
@@ -424,17 +424,13 @@ async def test_tenantcloud_context_accepts_production_wake_sources(event_source)
 
 @pytest.mark.asyncio
 async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape():
-    """The provider used to gate enabled_operations_by_provider must be the
-    operation's own provider ("tenantcloud" -- it's right there in the
-    operation name), not whatever _provider() infers from the wake's
-    message shape. Otherwise a TenantCloud execute on a non-TenantCloud-
-    shaped wake (e.g. an ordinary email wake) gets rejected by the
-    allowlist gate -- the exact wake-shape coupling this task removes,
-    surviving one layer up."""
-    restricted = replace(
-        policy(),
-        enabled_operations_by_provider={"tenantcloud": frozenset({"tenantcloud.lead.status.update"})},
-    )
+    """The provider used for TenantCloud routing must be the operation's
+    own provider ("tenantcloud" -- it's right there in the operation
+    name), not whatever _provider() infers from the wake's message shape.
+    Provider/intent allowlist gating on that value is gone (this task),
+    but the forced-provider derivation itself stays: a TenantCloud
+    execute on a non-TenantCloud-shaped wake (e.g. an ordinary email
+    wake) must still resolve on the operation's own provider."""
     event = record(  # ordinary zoho_mail / email_thread wake -- no TenantCloud shape at all
         wakeup_event_id=1,
         event_source="zoho_mail",
@@ -453,7 +449,7 @@ async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape(
         "arguments": {"lead_id": 2405115, "status": "working"},
     })
 
-    context = await ActionContextLoader(FakeRepository(event), restricted).load(exec_request)
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(exec_request)
 
     assert context.target.target_id == "2405115"
     assert context.provider_account == "tenantcloud"
@@ -753,16 +749,13 @@ async def test_suggest_targets_has_no_cliq_or_calendar_hint_since_routing_is_con
 
 
 @pytest.mark.asyncio
-async def test_rollout_policy_rejects_cross_channel_provider_route():
-    restricted = replace(
-        policy(),
-        enabled_operations_by_provider={
-            "zillow": frozenset({"email.send"}),
-            "hotpads": frozenset({"email.send"}),
-            "quo": frozenset({"quo.sms.send"}),
-        },
-        enabled_intents=frozenset({"inquiry_reply", "showing_offer"}),
-    )
+async def test_provider_operation_allowlist_gate_is_removed_for_cross_channel_routes():
+    """This used to be test_rollout_policy_rejects_cross_channel_provider_route,
+    asserting that a wake tagged provider "tenantcloud" routed through
+    quo.sms.send was rejected by the enabled_operations_by_provider
+    allowlist. That gate (and the RoutingPolicy field feeding it) is
+    removed by this task -- the same cross-channel route must now derive
+    context normally, keyed on the wake's own explicit provider."""
     tenantcloud = record(
         raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"},
         participant_key="+19085550199",
@@ -777,22 +770,24 @@ async def test_rollout_policy_rejects_cross_channel_provider_route():
         },
     )
 
-    with pytest.raises(ContextDerivationError, match="provider operation is disabled"):
-        await ActionContextLoader(FakeRepository(tenantcloud), restricted).load(
-            request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Friday at 10:30 works.\r\n— Nigel"})
-        )
+    context = await ActionContextLoader(FakeRepository(tenantcloud), policy()).load(
+        request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Friday at 10:30 works.\r\n— Nigel"})
+    )
+
+    assert context.source == "tenantcloud"
+    assert context.provider_account == "leasing-main"
+    assert context.target.target_id == "+19085550199"
 
 
 @pytest.mark.asyncio
-async def test_rollout_policy_rejects_unapproved_intent():
-    restricted = replace(
-        policy(),
-        enabled_operations_by_provider={"zillow": frozenset({"email.send"})},
-        enabled_intents=frozenset({"inquiry_reply", "showing_offer"}),
-    )
+async def test_intent_allowlist_gate_is_removed_for_unrecognized_intents():
+    """This used to be test_rollout_policy_rejects_unapproved_intent,
+    asserting that an intent outside enabled_intents was rejected. That
+    gate (and RoutingPolicy.enabled_intents) is removed by this task --
+    the same request must now derive context normally."""
+    context = await ActionContextLoader(FakeRepository(record()), policy()).load(request(intent_kind="showing_confirmation"))
 
-    with pytest.raises(ContextDerivationError, match="intent is disabled"):
-        await ActionContextLoader(FakeRepository(record()), restricted).load(request(intent_kind="showing_confirmation"))
+    assert context.intent_kind == "showing_confirmation"
 
 
 @pytest.mark.asyncio
@@ -1049,14 +1044,14 @@ async def test_quo_inbound_uses_observed_receiving_line_over_default_route():
 
 
 @pytest.mark.asyncio
-async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing_offer():
-    restricted = replace(
-        policy(),
-        enabled_intents_by_provider={
-            "zillow": frozenset({"inquiry_reply", "showing_offer"}),
-            "quo": frozenset({"inquiry_reply"}),
-        },
-    )
+async def test_quo_route_allows_inquiry_reply_but_not_propertyless_showing_offer():
+    """This used to be
+    test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing_offer,
+    which relied on RoutingPolicy.enabled_intents_by_provider to reject a
+    showing_offer on the quo provider. That gate is removed by this task;
+    a propertyless showing_offer still fails closed, but now for the
+    real reason -- no property could be derived from this wake at all --
+    not because of a per-provider intent allowlist."""
     event = record(
         event_source="quo",
         message_source="quo",
@@ -1077,7 +1072,7 @@ async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing
         envelope={"identity": {}, "message": {}},
     )
 
-    inquiry = await ActionContextLoader(FakeRepository(event), restricted).load(
+    inquiry = await ActionContextLoader(FakeRepository(event), policy()).load(
         request(
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
@@ -1086,8 +1081,8 @@ async def test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing
         )
     )
     assert inquiry.intent_kind == "inquiry_reply"
-    with pytest.raises(ContextDerivationError, match="provider intent is disabled"):
-        await ActionContextLoader(FakeRepository(event), restricted).load(
+    with pytest.raises(ContextDerivationError, match="verified property could not be derived"):
+        await ActionContextLoader(FakeRepository(event), policy()).load(
             request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})
         )
 
@@ -1275,6 +1270,70 @@ async def test_unverified_cross_channel_duplicate_hint_is_ignored(
     assert context.canonical_context["cross_channel_duplicate_message_ids"] == []
 
 
+# --- Task 4: policy gates and alias hard-fail are removed from derivation --
+
+
+@pytest.mark.asyncio
+async def test_zoho_mail_wake_internal_cliq_post_derives_context():
+    """Regression for wake 25789: a zoho_mail-sourced wake with no proxy
+    email, routed as an internal_notification cliq.channel.post whose
+    free-form intent ("escalation", the string introduced by Task 3) was
+    never in the operator's enabled_intents allowlist. That allowlist
+    gate raised "intent is disabled" for any unrecognized intent; the
+    gate (and RoutingPolicy.enabled_intents itself) is removed by this
+    task, so this combination must derive context without raising."""
+    event = record(
+        raw_payload={},
+        envelope={
+            "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
+            "message": {
+                "prospect_name": "Amanda Snyder",
+                "property": "138 Bullman St #144-A",
+                "direct_email": "AmandaSnyder@live.com",
+            },
+        },
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+    exec_request = request(
+        action_role="internal_notification",
+        operation="cliq.channel.post",
+        intent_kind="escalation",
+        appointment_slot=None,
+        arguments={"channel_or_chat_id": "tenant-leads", "text": "Escalation: needs review"},
+    )
+
+    context = await loader.load(exec_request)
+
+    assert context.operation is Operation.CLIQ_CHANNEL_POST
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_aliases_degrade_to_address_fallback():
+    """resolve_canonical_subject returning ambiguous=True no longer raises;
+    prospect_id falls back to the preferred alias instead."""
+    context = await ActionContextLoader(FakeRepository(record(), ambiguous=True), policy()).load(request())
+
+    assert context.prospect_id.startswith("prospect:")
+
+
+@pytest.mark.asyncio
+async def test_missing_aliases_no_longer_reject_customer_send():
+    """A customer-facing send (prospect_reply, non-TenantCloud) whose wake
+    yields zero stable aliases used to hard-fail with "no stable prospect
+    aliases". It must now fall back to a prospect_id derived from the
+    agent-supplied target address rather than raising."""
+    event = record(
+        participant_key="unknown",
+        participant_type="other",
+        envelope={"identity": {}, "message": {"property": "138 Bullman St #144-A"}},
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    assert context.prospect_id  # falls back, never raises
+    assert context.prospect_id == "prospect:amanda.abc@convo.zillow.com"
+
+
 @pytest.mark.asyncio
 async def test_duplicate_provider_and_property_aliases_converge():
     first_repo = FakeRepository(record(), canonical_subject="prospect:amanda")
@@ -1300,15 +1359,18 @@ async def test_duplicate_provider_and_property_aliases_converge():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_aliases_still_fail_closed_but_unresolvable_wake_no_longer_blocks_execute():
-    """Alias ambiguity is unrelated to target selection and still fails
-    closed. The second half used to also fail closed when the wake itself
-    carried no usable email anywhere (participant_key="unknown", no proxy/
-    direct email) -- that was the retired target-derivation gate. Now the
-    agent's own address is all that is required; suggest_targets honestly
-    has nothing to offer, but execute is unaffected."""
-    with pytest.raises(ContextDerivationError, match="ambiguous"):
-        await ActionContextLoader(FakeRepository(record(), ambiguous=True), policy()).load(request())
+async def test_ambiguous_aliases_and_unresolvable_wakes_no_longer_block_execute():
+    """Alias ambiguity used to fail closed; it is unrelated to target
+    selection, so it now degrades to a preferred-alias-based prospect_id
+    fallback (with a warning) instead of raising. The second half used to
+    also fail closed when the wake itself carried no usable email anywhere
+    (participant_key="unknown", no proxy/direct email) -- that was the
+    retired target-derivation gate. Now the agent's own address is all
+    that is required; suggest_targets honestly has nothing to offer, but
+    execute is unaffected."""
+    ambiguous_context = await ActionContextLoader(FakeRepository(record(), ambiguous=True), policy()).load(request())
+    assert ambiguous_context.prospect_id.startswith("prospect:")
+
     unresolvable = record(
         participant_key="unknown",
         envelope={
