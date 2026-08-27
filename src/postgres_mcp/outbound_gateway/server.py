@@ -266,6 +266,16 @@ def _enabled_operations() -> frozenset[Operation]:
 
 
 
+_VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
+
+
+def _traffic_mode() -> str:
+    raw = os.environ.get("OUTBOUND_TRAFFIC_CONTROL", "shadow").casefold()
+    if raw not in _VALID_TRAFFIC_MODES:
+        raise ValueError(f"OUTBOUND_TRAFFIC_CONTROL must be one of {sorted(_VALID_TRAFFIC_MODES)}, got {raw!r}")
+    return raw
+
+
 def _bearer_headers(name: str) -> dict[str, str]:
     token = os.environ.get(name, "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -548,6 +558,8 @@ async def build_runtime() -> GatewayRuntime:
         circuit_guard=observability,
         retry_base_seconds=int(os.environ.get("OUTBOUND_RETRY_BASE_SECONDS", "5")),
         retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
+        traffic_mode=_traffic_mode(),
+        traffic_probe=context_repository,
     )
     return GatewayRuntime(
         pool=pool,

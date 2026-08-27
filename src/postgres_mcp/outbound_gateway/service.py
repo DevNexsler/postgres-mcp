@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -41,8 +42,13 @@ from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
+from .traffic_control import TrafficProbe
+from .traffic_control import check_traffic
+
+logger = logging.getLogger(__name__)
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
 
 
 @dataclass(frozen=True)
@@ -195,7 +201,11 @@ class OutboundActionService:
         circuit_guard: CircuitGuard | None = None,
         retry_base_seconds: int = 5,
         retry_max_seconds: int = 900,
+        traffic_mode: str = "shadow",
+        traffic_probe: TrafficProbe | None = None,
     ):
+        if traffic_mode not in _VALID_TRAFFIC_MODES:
+            raise ValueError(f"traffic_mode must be one of {sorted(_VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
         self._store = store
         self._context_loader = context_loader
         self._evidence_loader = evidence_loader
@@ -209,6 +219,8 @@ class OutboundActionService:
         self._circuit_guard = circuit_guard or ClosedCircuitGuard()
         self._retry_base_seconds = max(1, retry_base_seconds)
         self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
+        self._traffic_mode = traffic_mode
+        self._traffic_probe = traffic_probe
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         context = await self._context_loader.load(request)
@@ -238,11 +250,67 @@ class OutboundActionService:
             ActionState.PROVIDER_ACCEPTED,
         }:
             return self._result(action)
+        blocked = await self._check_traffic(action, context, request)
+        if blocked is not None:
+            return blocked
         if action.state is ActionState.DEPENDENCY_WAIT:
             return await self._resume_dependency(action, context)
         if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
             return await self._dispatch(action, context)
         return await self._preflight(action, context)
+
+    async def _check_traffic(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        request: ExecuteRequest,
+    ) -> PublicResult | None:
+        """Per-recipient traffic gate. Returns a blocking PublicResult when
+        enforce mode must stop dispatch; returns None (proceed) otherwise --
+        including shadow mode (which only logs) and off mode (no probe call
+        at all)."""
+        if self._traffic_mode == "off" or self._traffic_probe is None:
+            return None
+        verdict = await check_traffic(
+            self._traffic_probe,
+            recipient_key=context.prospect_id,
+            channel_id=context.channel_id,
+            wakeup_event_id=context.wakeup_event_id,
+            action_id=context.action_id,
+            override=request.override,
+            logger=logger,
+        )
+        if not verdict.allowed:
+            if self._traffic_mode == "enforce":
+                claimed = await self._store.claim(
+                    action.action_id,
+                    action.state,
+                    self._lease_owner,
+                    self._lease_seconds,
+                )
+                failed = await self._store.definitive_fail(
+                    claimed.action_id,
+                    claimed.state,
+                    self._lease_owner,
+                    ProviderObservation(
+                        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                        verdict.reason,
+                        category="traffic_blocked",
+                        retryable=False,
+                        evidence={"detail": verdict.detail},
+                    ),
+                )
+                return self._result(failed)
+            logger.warning(
+                "traffic control shadow would-block: %s %s wake=%s recipient=%s",
+                verdict.reason,
+                verdict.detail,
+                context.wakeup_event_id,
+                context.prospect_id,
+            )
+        elif verdict.check_failed:
+            logger.warning("traffic control fail-open on wake %s", context.wakeup_event_id)
+        return None
 
     async def status(self, action_id: UUID) -> PublicResult:
         return self._result(await self._require_action(action_id))
