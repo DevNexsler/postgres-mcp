@@ -902,7 +902,9 @@ class OutboundActionService:
                     provider_request_ref=observation.provider_request_ref,
                 )
             else:
-                if expected_state is ActionState.DISPATCHING:
+                if expected_state is ActionState.DISPATCHING or (
+                    expected_state is ActionState.RECONCILING and context.operation in TENANTCLOUD_OPERATIONS
+                ):
                     accepted = await self._store.transition(
                         action.action_id,
                         expected_state,

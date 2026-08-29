@@ -792,6 +792,37 @@ VERIFIED_READBACK_EVIDENCE = {
 
 
 @pytest.mark.asyncio
+async def test_tenantcloud_reconciliation_records_acceptance_before_completion():
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.UNKNOWN,
+            action_uid=ACTION_UID,
+            provider_request_ref="lead:6001",
+        )
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "tenantcloud_lead_status_reconciled",
+        provider_request_ref="lead:6001",
+        message_id="tenantcloud-lead:6001:working",
+        accepted_at=NOW,
+        evidence={**VERIFIED_READBACK_EVIDENCE, "evidence_hash": "e" * 64},
+    )
+
+    result = await tenantcloud_service(store, FakeAdapter(accepted)).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert (
+        "transition",
+        ActionState.RECONCILING,
+        ActionState.PROVIDER_ACCEPTED,
+        "tenantcloud_lead_status_reconciled",
+        "gateway-test",
+    ) in store.calls
+    assert ("complete", ActionState.PROVIDER_ACCEPTED, "lead:6001") in store.calls
+
+
+@pytest.mark.asyncio
 async def test_tenantcloud_persisted_acceptance_with_verified_readback_recovers_without_provider_io():
     store = FakeStore(
         tenantcloud_row(
