@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from hashlib import sha256
 from types import MappingProxyType
@@ -200,6 +201,30 @@ async def test_store_work_query_includes_expired_dispatch_without_unlocking_it()
     assert "attempt_count <" in calls[0][0]
     assert "FOR UPDATE SKIP LOCKED" not in calls[0][0]
     assert calls[0][1] == [5, 20]
+
+
+@pytest.mark.asyncio
+async def test_store_exhausted_query_only_lists_actions_whose_next_attempt_is_due():
+    future_id = UUID(int=8)
+    due_id = UUID(int=9)
+
+    async def execute(_driver, query, _params):
+        rows = [
+            {"action_id": future_id, "state": "unknown", "next_attempt_at": NOW + timedelta(minutes=2)},
+            {"action_id": due_id, "state": "unknown", "next_attempt_at": NOW},
+        ]
+        if "next_attempt_at <= now()" in query:
+            rows = [row for row in rows if row["next_attempt_at"] <= NOW]
+        return [Row(row) for row in rows]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        exhausted = await store.list_exhausted(20, 5)
+
+    assert exhausted == [(due_id, ActionState.UNKNOWN)]
 
 
 @pytest.mark.asyncio
