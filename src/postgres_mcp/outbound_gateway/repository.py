@@ -246,17 +246,44 @@ class OutboundGatewayRepository:
             self._driver,
             """
             SELECT
-                id AS message_id,
-                created_at,
-                direction,
-                left(coalesce(body,''), 120) AS preview
-            FROM messages
-            WHERE channel_id = {}
-              AND created_at > {}
-            ORDER BY created_at DESC
+                message.id AS message_id,
+                message.created_at,
+                message.direction,
+                left(coalesce(message.body,''), 120) AS preview
+            FROM messages AS message
+            LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
+            LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
+            WHERE message.channel_id = {}
+              AND message.created_at > {}
+              AND (
+                  sending.operation IS DISTINCT FROM 'quo.sms.send'
+                  OR (
+                      -- Quo channels identify shared business lines, not people.
+                      -- Match either endpoint: direction labels can be missing
+                      -- or incorrect on imported messages. Never match empties.
+                      lower(message.source) IN ('quo', 'openphone')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM (VALUES
+                              (raw.payload#>'{{data,object,from}}'),
+                              (raw.payload#>'{{data,object,to}}')
+                          ) AS endpoint(value)
+                          CROSS JOIN LATERAL jsonb_array_elements_text(
+                              CASE WHEN jsonb_typeof(endpoint.value) = 'array'
+                                   THEN endpoint.value
+                                   ELSE jsonb_build_array(endpoint.value) END
+                          ) AS phone(value)
+                          WHERE nullif(regexp_replace(phone.value, '[^0-9]', '', 'g'), '')
+                              = nullif(regexp_replace(
+                                  sending.canonical_context->>'recipient_phone', '[^0-9]', '', 'g'
+                              ), '')
+                      )
+                  )
+              )
+            ORDER BY message.created_at DESC
             LIMIT 1
             """,
-            [channel_id, watermark],
+            [exclude_action_id, channel_id, watermark],
         )
         candidates: list[NewerActivity] = []
         if ledger_rows:

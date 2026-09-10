@@ -110,7 +110,7 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
 
     async def execute(_driver, query, params):
         calls.append((query, params))
-        if "outbound_actions" in query:
+        if "subject_key = {}" in query:
             return [ledger_row]
         return [message_row]
 
@@ -143,9 +143,9 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
     messages_query, messages_params = calls[1]
     assert "messages" in messages_query
     assert "channel_id" in messages_query
-    assert "ORDER BY created_at DESC" in messages_query
+    assert "ORDER BY message.created_at DESC" in messages_query
     assert "LIMIT 1" in messages_query
-    assert messages_params == [44, watermark]
+    assert messages_params == [ACTION_ID, 44, watermark]
 
     assert result == NewerActivity(
         direction="inbound",
@@ -177,7 +177,7 @@ async def test_newest_activity_after_picks_ledger_row_when_it_is_newer():
     )
 
     async def execute(_driver, query, params):
-        if "outbound_actions" in query:
+        if "subject_key = {}" in query:
             return [ledger_row]
         return [message_row]
 
@@ -214,7 +214,7 @@ async def test_newest_activity_after_defaults_message_direction_to_unknown_when_
     )
 
     async def execute(_driver, query, params):
-        if "outbound_actions" in query:
+        if "subject_key = {}" in query:
             return []
         return [message_row]
 
