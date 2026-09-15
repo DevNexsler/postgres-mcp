@@ -98,6 +98,31 @@ async def test_received_remediation_is_prepared_before_any_provider_io() -> None
 
 
 @pytest.mark.asyncio
+async def test_unavailable_persisted_context_waits_without_hot_loop() -> None:
+    received = action(ActionState.RECEIVED)
+    store = AsyncMock()
+    store.get.return_value = received
+    service = AsyncMock()
+    service.prepare.return_value = SimpleNamespace(
+        status=PublicStatus.PENDING,
+        detail_code="operator_remediation_created",
+        detail="persisted_context_unavailable",
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(store=store, service=service, auth=auth)
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result == DeliveryResult(
+        DeliveryPhase.WAIT,
+        "persisted_context_unavailable",
+        300,
+    )
+    store.get.assert_awaited_once_with(ACTION_ID)
+
+
+@pytest.mark.asyncio
 async def test_restarted_step_reconciles_dispatching_action_never_blind_resends() -> None:
     row = action(ActionState.PREPARED)
     store = AsyncMock()

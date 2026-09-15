@@ -81,6 +81,7 @@ class OutboundActionRecord:
     provider_evidence_hash: str | None = None
     provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
     error_category: str | None = None
+    retry_of_action_id: UUID | None = None
 
     def execute_request(self) -> ExecuteRequest:
         # create_or_load() persists TenantCloud arguments enriched with
@@ -1040,6 +1041,12 @@ class OutboundActionService:
             context = await self._context_loader.load(action.execute_request())
         except ContextDerivationError:
             return None, "persisted_context_unavailable"
+        if action.retry_of_action_id is not None:
+            context = dataclass_replace(
+                context,
+                action_id=action.action_id,
+                lock_holder=f"outbound-gateway:{action.action_id}",
+            )
         if not action.payload_hash:
             return context, "context_verified"
         expected_recipient = {

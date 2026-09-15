@@ -459,4 +459,9 @@ class PostgresActionStore:
             provider_evidence_hash=cells.get("evidence_hash"),
             provider_readback_evidence=dict(readback_evidence) if readback_evidence else {},
             error_category=cells.get("error_category"),
+            retry_of_action_id=(
+                UUID(str(cells["retry_of_action_id"]))
+                if cells.get("retry_of_action_id")
+                else None
+            ),
         )

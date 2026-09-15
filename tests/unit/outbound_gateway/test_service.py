@@ -701,6 +701,38 @@ async def test_tenantcloud_prepare_remediation_preflights_without_provider_io() 
     adapter.reconcile.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_tenantcloud_prepare_accepts_verified_remediation_successor_identity() -> None:
+    successor_id = UUID("e8f10652-ae8c-528f-9d6a-05f56f7f18c0")
+    context = tenantcloud_context()
+    store = FakeStore(
+        tenantcloud_row(
+            action_id=successor_id,
+            retry_of_action_id=ACTION_ID,
+            detail_code="operator_remediation_created",
+            payload_hash=context.payload_hash,
+            canonical_context=dict(context.canonical_context),
+            canonical_scope=dict(context.canonical_scope),
+            recipient_scope={
+                "kind": context.target.kind,
+                "target_id": context.target.target_id,
+                "verified": context.target.verified,
+            },
+            provider_account=context.provider_account,
+            routing_policy_version=context.routing_policy_version,
+        )
+    )
+    adapter = AsyncMock()
+    gateway = tenantcloud_service(store, adapter)
+
+    result = await gateway.prepare(successor_id)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.PREPARED
+    adapter.invoke.assert_not_called()
+    adapter.reconcile.assert_not_called()
+
+
 def tenantcloud_context_for(operation, **overrides):
     """Full ActionContext for each of the four TenantCloud operations --
     enough detail (canonical_context claim/source/provider_ids, canonical_scope

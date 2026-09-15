@@ -100,6 +100,10 @@ _TERMINAL_STATES = {
     ActionState.DEAD_LETTER,
     ActionState.MANUAL_REVIEW,
 }
+_CONTEXT_WAIT_DETAILS = {
+    "persisted_context_unavailable",
+    "persisted_context_mismatch",
+}
 
 
 class TenantCloudDeliveryCoordinator:
@@ -165,6 +169,15 @@ class TenantCloudDeliveryCoordinator:
 
         if action.state is ActionState.RECEIVED:
             result = await self._service.prepare(action_id)
+            if (
+                result.status is PublicStatus.PENDING
+                and getattr(result, "detail", None) in _CONTEXT_WAIT_DETAILS
+            ):
+                return DeliveryResult(
+                    DeliveryPhase.WAIT,
+                    result.detail,
+                    300,
+                )
         elif action.state in _AMBIGUOUS_STATES:
             result = await self._service.reconcile(action_id)
         elif action.attempt_count >= self._max_attempts:
