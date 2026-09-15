@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionState
+from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.worker import OutboundWorker
 
 
@@ -83,3 +84,24 @@ async def test_worker_isolates_poison_action_and_continues_batch():
     assert await worker.run_once() == 2
     assert service.reconcile.await_args_list[1].args == (healthy,)
     assert failures == [(poison, "reconcile", "RuntimeError")]
+
+
+@pytest.mark.asyncio
+async def test_worker_delegates_tenantcloud_work_to_restate() -> None:
+    action_id = UUID(int=31)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(action_id, ActionState.RETRY_READY)]
+    store.get.return_value = type("Action", (), {"operation": Operation.TENANTCLOUD_MESSAGE_SEND})()
+    service = AsyncMock()
+    submitter = AsyncMock()
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        tenantcloud_submitter=submitter,
+    )
+
+    assert await worker.run_once() == 1
+    submitter.submit.assert_awaited_once_with(action_id)
+    service.resume.assert_not_called()
+    service.reconcile.assert_not_called()

@@ -655,7 +655,11 @@ def tenantcloud_service(store, adapter):
     loader = AsyncMock()
     loader.load.return_value = tenantcloud_context()
     preflight = AsyncMock()
-    preflight.load.return_value = evidence()
+    preflight.load.return_value = evidence(
+        current_recipient_id="6001",
+        current_property_id=None,
+        current_appointment_slot=None,
+    )
     return OutboundActionService(
         store=store,
         context_loader=loader,
@@ -667,6 +671,20 @@ def tenantcloud_service(store, adapter):
         response_budget_seconds=1,
         sleep=AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_enqueue_preflights_and_prepares_without_provider_io() -> None:
+    store = FakeStore(tenantcloud_row())
+    adapter = AsyncMock()
+    gateway = tenantcloud_service(store, adapter)
+
+    result = await gateway.enqueue(tenantcloud_row().execute_request())
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.PREPARED
+    adapter.invoke.assert_not_called()
+    adapter.reconcile.assert_not_called()
 
 
 def tenantcloud_context_for(operation, **overrides):
