@@ -70,7 +70,14 @@ class TenantCloudMutationsProtocol(Protocol):
 
     def update_maintenance_status(self, request_id: object, status: object) -> Any: ...
 
-    def reconcile_message(self, thread_id: object, body: object, *, source_turn_at: object) -> Any: ...
+    def reconcile_message(
+        self,
+        thread_id: object,
+        body: object,
+        *,
+        source_turn_at: object,
+        allow_late: bool = False,
+    ) -> Any: ...
 
     def resolve_lead_thread(self, lead_id: object) -> str | None: ...
 
@@ -202,7 +209,10 @@ class TenantCloudAdapter:
                 resolved = mutations.resolve_lead_thread(target_id)
                 if resolved is not None:
                     result = mutations.reconcile_message(
-                        resolved, body, source_turn_at=context.source_sent_at
+                        resolved,
+                        body,
+                        source_turn_at=context.source_sent_at,
+                        allow_late=True,
                     )
             if resolved is not None and result.disposition.value == "accepted":
                 bound = mutations.bind_lead_message_observation(
@@ -296,7 +306,10 @@ class TenantCloudAdapter:
                 )
             thread_id = resolved
             pre = mutations.reconcile_message(
-                thread_id, body, source_turn_at=arguments["source_sent_at"]
+                thread_id,
+                body,
+                source_turn_at=arguments["source_sent_at"],
+                allow_late=True,
             )
             if pre.disposition.value == "accepted":
                 observation = mutations.bind_lead_message_observation(

@@ -734,8 +734,16 @@ class FakeTenantCloudMutations:
         self.calls.append(("update_maintenance_status", (request_id, status), {}))
         return self.update_maintenance_status_result
 
-    def reconcile_message(self, thread_id, body, *, source_turn_at):
-        self.calls.append(("reconcile_message", (thread_id, body), {"source_turn_at": source_turn_at}))
+    def reconcile_message(
+        self, thread_id, body, *, source_turn_at, allow_late=False
+    ):
+        self.calls.append(
+            (
+                "reconcile_message",
+                (thread_id, body),
+                {"source_turn_at": source_turn_at, "allow_late": allow_late},
+            )
+        )
         if self.reconcile_message_results:
             return self.reconcile_message_results.pop(0)
         return self.reconcile_message_result
@@ -935,6 +943,7 @@ async def test_tenantcloud_message_send_resolves_lead_id_to_provider_thread() ->
     assert observation.provider_request_ref == "thread:2057142"
     assert observation.evidence["target_reference"] == "thread:555"
     assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
+    assert facade.calls[2][2]["allow_late"] is True
 
 
 @pytest.mark.asyncio
@@ -968,6 +977,7 @@ async def test_tenantcloud_resolved_lead_duplicate_rebinds_without_post() -> Non
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.provider_request_ref == "thread:2057142"
     assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
+    assert facade.calls[2][2]["allow_late"] is True
 
 
 @pytest.mark.asyncio
