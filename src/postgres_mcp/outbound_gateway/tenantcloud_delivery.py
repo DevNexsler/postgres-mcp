@@ -295,8 +295,12 @@ def build_restate_app(coordinator: TenantCloudDeliveryCoordinator):
     )
 
     @workflow.main(workflow_retention=timedelta(days=30))
-    async def deliver(ctx: Any, payload: dict[str, object]) -> dict[str, object]:
-        if set(payload) != {"action_id"} or payload.get("action_id") != ctx.key():
+    async def deliver(ctx: Any, payload: object) -> dict[str, object]:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"action_id"}
+            or payload.get("action_id") != ctx.key()
+        ):
             raise restate.TerminalError("action_id must equal workflow key", status_code=400)
         try:
             action_id = UUID(ctx.key())

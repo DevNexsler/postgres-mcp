@@ -233,10 +233,15 @@ async def test_restate_workflow_returns_serializable_terminal_outcome(monkeypatc
 
             return decorate
 
+    class TerminalError(RuntimeError):
+        def __init__(self, message, *, status_code):
+            super().__init__(message)
+            self.status_code = status_code
+
     fake_restate = SimpleNamespace(
         Workflow=Workflow,
         RunOptions=lambda **kwargs: kwargs,
-        TerminalError=RuntimeError,
+        TerminalError=TerminalError,
         app=lambda services: services[0],
     )
     monkeypatch.setitem(sys.modules, "restate", fake_restate)
@@ -256,6 +261,11 @@ async def test_restate_workflow_returns_serializable_terminal_outcome(monkeypatc
 
         async def sleep(self, *_args, **_kwargs):
             raise AssertionError("completed workflow must not sleep")
+
+    with pytest.raises(TerminalError, match="action_id must equal workflow key") as error:
+        await workflow.handler(Context(), None)
+    assert error.value.status_code == 400
+    coordinator.advance.assert_not_awaited()
 
     result = await workflow.handler(
         Context(),
