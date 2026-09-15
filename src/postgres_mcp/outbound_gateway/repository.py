@@ -228,19 +228,31 @@ class OutboundGatewayRepository:
         ledger_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
+            WITH RECURSIVE retry_lineage AS (
+                SELECT action_id, retry_of_action_id
+                FROM outbound_actions
+                WHERE action_id = {}
+
+                UNION
+
+                SELECT ancestor.action_id, ancestor.retry_of_action_id
+                FROM outbound_actions AS ancestor
+                JOIN retry_lineage AS child
+                  ON ancestor.action_id = child.retry_of_action_id
+            )
             SELECT
                 action_id,
                 created_at,
                 left(coalesce(arguments::text,''), 120) AS preview
             FROM outbound_actions
             WHERE subject_key = {}
-              AND action_id <> {}
+              AND action_id NOT IN (SELECT action_id FROM retry_lineage)
               AND created_at > {}
               AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            [recipient_key, exclude_action_id, watermark],
+            [exclude_action_id, recipient_key, watermark],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,

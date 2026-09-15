@@ -72,7 +72,7 @@ async def traffic(traffic_database):
             CREATE TEMP TABLE outbound_actions (
                 action_id uuid PRIMARY KEY, subject_key text, operation text, state text,
                 created_at timestamptz, arguments jsonb, canonical_context jsonb,
-                dispatch_started_at timestamptz
+                dispatch_started_at timestamptz, retry_of_action_id uuid
             );
             CREATE TEMP TABLE hermes_wakeup_events (
                 id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz
@@ -80,7 +80,7 @@ async def traffic(traffic_database):
         """)
         await conn.execute("INSERT INTO hermes_wakeup_events VALUES (26817, %s, %s)", (WATERMARK, WATERMARK))
         await conn.execute(
-            "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}',%s,NULL)",
+            "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}',%s,NULL,NULL)",
             (ACTION, SUBJECT, WATERMARK, Jsonb({"recipient_phone": JESSICA})),
         )
         yield conn, OutboundGatewayRepository(SqlDriver(conn=conn))
@@ -199,7 +199,7 @@ async def test_recipient_leases_and_actual_outbound_activity(traffic, subject, s
     conn, repository = traffic
     created = WATERMARK.replace(minute=12)
     await conn.execute(
-        "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send',%s,%s,'{}','{}',%s)",
+        "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send',%s,%s,'{}','{}',%s,NULL)",
         (UUID(int=2), subject, state, created, created if dispatched else None),
     )
     await add_message(conn)  # unrelated traffic must not alter the verdict
@@ -224,6 +224,24 @@ async def test_own_dispatched_action_does_not_block_itself_on_resume(traffic):
 
 
 @pytest.mark.asyncio
+async def test_dispatched_retry_ancestor_does_not_block_remediation_successor(traffic):
+    conn, repository = traffic
+    failed_ancestor = UUID(int=2)
+    created = WATERMARK.replace(minute=12)
+    await conn.execute(
+        "INSERT INTO outbound_actions VALUES (%s,%s,'tenantcloud.message.send','definitive_failed',%s,'{}','{}',%s,NULL)",
+        (failed_ancestor, SUBJECT, created, created),
+    )
+    await conn.execute("UPDATE outbound_actions SET retry_of_action_id=%s WHERE action_id=%s", (failed_ancestor, ACTION))
+
+    result = await verdict(repository)
+
+    assert result.allowed
+    assert result.reason == "pass"
+    assert not result.check_failed
+
+
+@pytest.mark.asyncio
 async def test_override_bypasses_real_staleness_but_never_recipient_lease(traffic):
     conn, repository = traffic
     await add_message(conn, sender=JESSICA)
@@ -232,7 +250,7 @@ async def test_override_bypasses_real_staleness_but_never_recipient_lease(traffi
     overridden = await verdict(repository, override=True)
     assert overridden.allowed and not overridden.check_failed
     await conn.execute(
-        "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}','{}',NULL)",
+        "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}','{}',NULL,NULL)",
         (UUID(int=2), SUBJECT, WATERMARK.replace(minute=12)),
     )
     leased = await verdict(repository, override=True)
