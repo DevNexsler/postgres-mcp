@@ -292,6 +292,43 @@ class OutboundActionService:
 
         return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
 
+    async def enqueue(self, request: ExecuteRequest) -> PublicResult:
+        """Persist and preflight one action without provider I/O.
+
+        Restate owns every later advance. Repeated calls return the same CDS
+        action, so ingress loss never loses work and never creates a new send.
+        """
+        context = await self._context_loader.load(request)
+        action = await self._store.create_or_load(context)
+        if action.state is ActionState.COMPLETED:
+            return self._result(action, repeated=True)
+        if not self._is_due(action):
+            return self._result(action)
+        if action.state in {
+            ActionState.STALE,
+            ActionState.REJECTED,
+            ActionState.DEFINITIVE_FAILED,
+            ActionState.DEAD_LETTER,
+            ActionState.MANUAL_REVIEW,
+            ActionState.UNKNOWN,
+            ActionState.RECONCILING,
+            ActionState.DISPATCHING,
+            ActionState.PROVIDER_ACCEPTED,
+            ActionState.PREPARED,
+            ActionState.RETRY_READY,
+            ActionState.DEPENDENCY_WAIT,
+        }:
+            return self._result(action)
+        blocked = await self._check_traffic(action, context, override=request.override)
+        if blocked is not None:
+            return blocked
+        evidence = await self._evidence_loader.load(context)
+        decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
+        if decision.outcome is PreflightOutcome.READY:
+            prepared = await self._store.prepare(context, action.state)
+            return self._result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+        return await self._apply_preflight_decision(action, evidence, decision)
+
     async def _dispatch_stage(
         self,
         action: OutboundActionRecord,

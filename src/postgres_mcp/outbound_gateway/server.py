@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -50,9 +51,13 @@ from .provider_client import McpServerConfig
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
+from .tenantcloud_delivery import RestateWorkflowSubmitter
+from .tenantcloud_delivery import TenantCloudAuthGate
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .worker import OutboundWorker
+
+logger = logging.getLogger(__name__)
 
 # TenantCloud's API origin is a fixed literal, never a runtime-configurable
 # value. Task 7's adapter and this module both depend on this exact string;
@@ -102,12 +107,15 @@ class GatewayRuntime:
     store: PostgresActionStore
     policy: FeaturePolicy
     observability: GatewayObservability
+    tenantcloud_submitter: RestateWorkflowSubmitter | None = None
 
 
 async def handle_outbound_action(
     service: OutboundActionService,
     policy: FeaturePolicy,
     request: dict[str, Any],
+    *,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
 ) -> dict[str, Any]:
     try:
         parsed = parse_outbound_request(request)
@@ -159,7 +167,18 @@ async def handle_outbound_action(
                 detail_code="operation_disabled",
             )
         else:
-            result = await service.execute(parsed)
+            if parsed.operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None:
+                result = await service.enqueue(parsed)
+                if result.status is PublicStatus.PENDING:
+                    try:
+                        await tenantcloud_submitter.submit(result.action_id)
+                    except Exception:
+                        logger.exception(
+                            "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                            result.action_id,
+                        )
+            else:
+                result = await service.execute(parsed)
     payload = result.model_dump(mode="json")
     if result.detail is None:
         # Every result except a traffic-control block leaves detail unset --
@@ -175,6 +194,7 @@ def create_server(
     policy: FeaturePolicy,
     *,
     observability: GatewayObservability | None = None,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
 ) -> FastMCP:
     mcp = FastMCP(
         "comm-outbound-gateway",
@@ -201,7 +221,12 @@ def create_server(
         structured_output=True,
     )
     async def outbound_action(request: dict[str, Any]) -> dict[str, Any]:
-        return await handle_outbound_action(service, policy, request)
+        return await handle_outbound_action(
+            service,
+            policy,
+            request,
+            tenantcloud_submitter=tenantcloud_submitter,
+        )
 
     @mcp.resource("health://outbound-gateway", name="outbound-gateway-health")
     def health() -> str:
@@ -380,6 +405,32 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
         return mutations_module.TenantCloudMutations(client)
 
     return TenantCloudAdapter(mutations_factory=build_mutations)
+
+
+def build_tenantcloud_auth_gate() -> TenantCloudAuthGate:
+    """Build same scoped auth path used by TenantCloud provider writes."""
+    _reject_tenantcloud_origin_overrides()
+    control_url = os.environ.get("TENANTCLOUD_RUNNER_CONTROL_URL", "").strip()
+    bearer_file = os.environ.get("TENANTCLOUD_RUNNER_BEARER_FILE", "").strip()
+    next_bearer_file = os.environ.get("TENANTCLOUD_RUNNER_NEXT_BEARER_FILE", "").strip() or None
+    module_dir = os.environ.get("TENANTCLOUD_MODULE_DIR", "/repo/scripts")
+    if not control_url or not bearer_file:
+        raise ValueError("TenantCloud runner control configuration required")
+    auth_module, _client_module, _mutations_module = _load_tenantcloud_modules(module_dir)
+    control = auth_module.HttpRunnerControl(control_url, bearer_file, next_bearer_file)
+
+    def factory():
+        return auth_module.TenantCloudAuth(
+            "tenantcloud-runner",
+            control=control,
+            profile_access=False,
+        )
+
+    return TenantCloudAuthGate(
+        factory,
+        login_required_errors=(auth_module.TenantCloudLoginRequiredError,),
+        transport_errors=(auth_module.TenantCloudAuthTransportError,),
+    )
 
 
 def _run_coroutine_sync(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -572,6 +623,11 @@ async def build_runtime() -> GatewayRuntime:
         store=store,
         policy=policy,
         observability=observability,
+        tenantcloud_submitter=(
+            RestateWorkflowSubmitter(restate_ingress)
+            if (restate_ingress := os.environ.get("OUTBOUND_TENANTCLOUD_RESTATE_INGRESS_URL", "").strip())
+            else None
+        ),
     )
 
 
@@ -589,6 +645,7 @@ async def _serve() -> None:
         runtime.service,
         runtime.policy,
         observability=runtime.observability,
+        tenantcloud_submitter=runtime.tenantcloud_submitter,
     )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
@@ -610,6 +667,7 @@ async def _work() -> None:
         batch_size=int(os.environ.get("OUTBOUND_WORKER_BATCH_SIZE", "20")),
         max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
         observability=runtime.observability,
+        tenantcloud_submitter=runtime.tenantcloud_submitter,
     )
     interval = max(1.0, float(os.environ.get("OUTBOUND_WORKER_INTERVAL_SECONDS", "5")))
     try:

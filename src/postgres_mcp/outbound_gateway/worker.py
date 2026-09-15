@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import Any
 from typing import Protocol
 from uuid import UUID
 
 from .models import ActionState
 from .service import OutboundActionService
+from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 
 class WorkerStore(Protocol):
     async def list_work(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]: ...
 
     async def list_exhausted(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]: ...
+
+    async def get(self, action_id: UUID) -> Any: ...
+
+
+class TenantCloudSubmitter(Protocol):
+    async def submit(self, action_id: UUID) -> None: ...
 
 
 class OutboundWorker:
@@ -27,6 +35,7 @@ class OutboundWorker:
         max_attempts: int = 5,
         observability=None,
         on_error: Callable[[UUID, str, Exception], None] | None = None,
+        tenantcloud_submitter: TenantCloudSubmitter | None = None,
     ):
         self._store = store
         self._service = service
@@ -34,6 +43,7 @@ class OutboundWorker:
         self._max_attempts = max(1, min(max_attempts, 100))
         self._observability = observability
         self._on_error = on_error or self._default_error
+        self._tenantcloud_submitter = tenantcloud_submitter
 
     @staticmethod
     def _default_error(action_id: UUID, operation: str, error: Exception) -> None:
@@ -52,6 +62,11 @@ class OutboundWorker:
 
     async def _run_isolated(self, action_id: UUID, operation: str) -> None:
         try:
+            if self._tenantcloud_submitter is not None:
+                action = await self._store.get(action_id)
+                if action is not None and action.operation in TENANTCLOUD_OPERATIONS:
+                    await self._tenantcloud_submitter.submit(action_id)
+                    return
             await getattr(self._service, operation)(action_id)
         except Exception as exc:
             self._on_error(action_id, operation, exc)

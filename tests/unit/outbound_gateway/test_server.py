@@ -75,6 +75,17 @@ def execute_payload():
     }
 
 
+def tenantcloud_execute_payload():
+    return {
+        "op": "execute",
+        "wakeup_event_id": 7,
+        "action_role": "prospect_reply",
+        "operation": "tenantcloud.message.send",
+        "intent_kind": "inquiry_reply",
+        "arguments": {"thread_id": 2473277, "text": "Tour times here."},
+    }
+
+
 @pytest.mark.asyncio
 async def test_focused_server_exposes_only_outbound_action_and_health_resource():
     service = AsyncMock()
@@ -132,6 +143,54 @@ async def test_execute_and_status_delegate_only_after_strict_json_validation():
     service.status.assert_awaited_once_with(ACTION_ID)
     with pytest.raises(ValueError, match="invalid outbound action request"):
         await handle_outbound_action(service, policy, {**execute_payload(), "recipient": "attacker@example.com"})
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_execute_enqueues_then_submits_keyed_restate_workflow() -> None:
+    service = AsyncMock()
+    service.enqueue.return_value = public(PublicStatus.PENDING, "prepared")
+    submitter = AsyncMock()
+    policy = FeaturePolicy(
+        writes_enabled=True,
+        kill_switch=False,
+        enabled_operations=frozenset({Operation.TENANTCLOUD_MESSAGE_SEND}),
+    )
+
+    result = await handle_outbound_action(
+        service,
+        policy,
+        tenantcloud_execute_payload(),
+        tenantcloud_submitter=submitter,
+    )
+
+    assert result["status"] == "pending"
+    service.enqueue.assert_awaited_once()
+    service.execute.assert_not_called()
+    submitter.submit.assert_awaited_once_with(ACTION_ID)
+
+
+@pytest.mark.asyncio
+async def test_restate_outage_keeps_tenantcloud_action_pending_for_sweeper() -> None:
+    service = AsyncMock()
+    service.enqueue.return_value = public(PublicStatus.PENDING, "prepared")
+    submitter = AsyncMock()
+    submitter.submit.side_effect = RuntimeError("Restate unavailable")
+    policy = FeaturePolicy(
+        writes_enabled=True,
+        kill_switch=False,
+        enabled_operations=frozenset({Operation.TENANTCLOUD_MESSAGE_SEND}),
+    )
+
+    result = await handle_outbound_action(
+        service,
+        policy,
+        tenantcloud_execute_payload(),
+        tenantcloud_submitter=submitter,
+    )
+
+    assert result["status"] == "pending"
+    assert result["detail_code"] == "prepared"
+    service.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
