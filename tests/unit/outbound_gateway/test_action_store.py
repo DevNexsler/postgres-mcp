@@ -180,6 +180,23 @@ async def test_free_form_intent_reconstructs_from_a_persisted_row_without_raisin
 
 
 @pytest.mark.asyncio
+async def test_store_hydrates_remediation_parent_identity() -> None:
+    parent_id = UUID("6e42adba-d08a-5b2c-a908-ce05c4a7e3e0")
+
+    async def execute(_driver, query, params):
+        return [Row({**action_row(), "retry_of_action_id": parent_id})]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        created = await store.create_or_load(context())
+
+    assert created.retry_of_action_id == parent_id
+
+
+@pytest.mark.asyncio
 async def test_store_work_query_includes_expired_dispatch_without_unlocking_it():
     calls = []
 
