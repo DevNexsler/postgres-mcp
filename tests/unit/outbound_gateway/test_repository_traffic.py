@@ -138,7 +138,7 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
     assert "completed" in ledger_query
     assert "ORDER BY created_at DESC" in ledger_query
     assert "LIMIT 1" in ledger_query
-    assert ledger_params == ["email:amanda@example.com", ACTION_ID, watermark]
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", watermark]
 
     messages_query, messages_params = calls[1]
     assert "messages" in messages_query
@@ -250,8 +250,35 @@ async def test_newest_activity_after_excludes_the_calling_action_id_from_the_led
         await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
     ledger_query, ledger_params = calls[0]
-    assert "action_id <> {}" in ledger_query
+    assert "WITH RECURSIVE retry_lineage" in ledger_query
+    assert "retry_of_action_id" in ledger_query
+    assert "action_id NOT IN" in ledger_query
     assert ACTION_ID in ledger_params
+
+
+@pytest.mark.asyncio
+async def test_newest_activity_after_excludes_retry_ancestors_from_the_ledger_query():
+    """A remediation successor must not see its authoritatively failed
+    predecessor as newer outbound traffic and permanently self-block."""
+    watermark = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc)
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return []
+
+    repository = OutboundGatewayRepository(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
+
+    ledger_query, ledger_params = calls[0]
+    assert "JOIN retry_lineage AS child" in ledger_query
+    assert "ancestor.action_id = child.retry_of_action_id" in ledger_query
+    assert "SELECT action_id FROM retry_lineage" in ledger_query
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", watermark]
 
 
 @pytest.mark.asyncio
