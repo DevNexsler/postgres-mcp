@@ -712,6 +712,8 @@ class FakeTenantCloudMutations:
         self.create_maintenance_request_result = None
         self.update_maintenance_status_result = None
         self.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
+        self.reconcile_message_results = []
+        self.resolve_lead_thread_result = None
         self.reconcile_lead_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
         self.reconcile_maintenance_create_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
         self.reconcile_maintenance_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
@@ -734,7 +736,27 @@ class FakeTenantCloudMutations:
 
     def reconcile_message(self, thread_id, body, *, source_turn_at):
         self.calls.append(("reconcile_message", (thread_id, body), {"source_turn_at": source_turn_at}))
+        if self.reconcile_message_results:
+            return self.reconcile_message_results.pop(0)
         return self.reconcile_message_result
+
+    def resolve_lead_thread(self, lead_id):
+        self.calls.append(("resolve_lead_thread", (lead_id,), {}))
+        return self.resolve_lead_thread_result
+
+    def bind_lead_message_observation(self, observation, lead_id, resolved_thread_id):
+        self.calls.append(
+            ("bind_lead_message_observation", (observation, lead_id, resolved_thread_id), {})
+        )
+        return FakeMutationObservation(
+            target_reference=observation.target_reference,
+            provider_object_id=observation.provider_object_id,
+            canonical_observed_state={
+                **observation.canonical_observed_state,
+                "thread_id": str(lead_id),
+            },
+            evidence_hash="f" * 64,
+        )
 
     def reconcile_lead_status(self, lead_id):
         self.calls.append(("reconcile_lead_status", (lead_id,), {}))
@@ -872,6 +894,109 @@ async def test_tenantcloud_message_send_already_present_skips_post():
     assert [call[0] for call in facade.calls] == ["reconcile_message"]
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.message_id == "tenantcloud-message:9001"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_send_resolves_lead_id_to_provider_thread() -> None:
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_message_results = [
+        FakeReconciliationResult(TC_UNKNOWN, None, "readback_failed"),
+        FakeReconciliationResult(TC_UNKNOWN, None, "no_match"),
+    ]
+    facade.resolve_lead_thread_result = "2057142"
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_ACCEPTED),
+        FakeMutationObservation(
+            target_reference="thread:2057142",
+            provider_object_id="9002",
+            canonical_observed_state={
+                "thread_id": "2057142",
+                "body": "Friday at 10:30 works. — Nigel",
+            },
+        ),
+        None,
+    )
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert [call[:2] for call in facade.calls] == [
+        ("reconcile_message", ("555", "Friday at 10:30 works. — Nigel")),
+        ("resolve_lead_thread", ("555",)),
+        ("reconcile_message", ("2057142", "Friday at 10:30 works. — Nigel")),
+        ("send_message", ("2057142", "Friday at 10:30 works. — Nigel")),
+        (
+            "bind_lead_message_observation",
+            (facade.send_message_result.observation, "555", "2057142"),
+        ),
+    ]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.provider_request_ref == "thread:2057142"
+    assert observation.evidence["target_reference"] == "thread:555"
+    assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_resolved_lead_duplicate_rebinds_without_post() -> None:
+    facade = FakeTenantCloudMutations()
+    actual = FakeMutationObservation(
+        target_reference="thread:2057142",
+        provider_object_id="9002",
+        canonical_observed_state={
+            "thread_id": "2057142",
+            "body": "Friday at 10:30 works. — Nigel",
+        },
+    )
+    facade.reconcile_message_results = [
+        FakeReconciliationResult(TC_UNKNOWN, None, "readback_failed"),
+        FakeReconciliationResult(TC_ACCEPTED, actual, None),
+    ]
+    facade.resolve_lead_thread_result = "2057142"
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert not any(call[0] == "send_message" for call in facade.calls)
+    assert [call[0] for call in facade.calls] == [
+        "reconcile_message",
+        "resolve_lead_thread",
+        "reconcile_message",
+        "bind_lead_message_observation",
+    ]
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert observation.provider_request_ref == "thread:2057142"
+    assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["ambiguous_match", "readback_failed"])
+async def test_tenantcloud_message_send_fails_closed_when_precheck_is_not_exact_absence(
+    error_code: str,
+) -> None:
+    facade = FakeTenantCloudMutations()
+    facade.reconcile_message_result = FakeReconciliationResult(
+        TC_UNKNOWN, None, error_code
+    )
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert not any(call[0] == "send_message" for call in facade.calls)
+    if error_code == "readback_failed":
+        assert [call[0] for call in facade.calls] == [
+            "reconcile_message",
+            "resolve_lead_thread",
+        ]
+        assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+        assert observation.retryable is True
+        assert observation.detail_code == "tenantcloud_target_unavailable_before_dispatch"
+    else:
+        assert [call[0] for call in facade.calls] == ["reconcile_message"]
+        assert observation.disposition is ProviderDisposition.AMBIGUOUS
+        assert observation.detail_code == "tenantcloud_prewrite_ambiguous_match"
 
 
 @pytest.mark.asyncio
