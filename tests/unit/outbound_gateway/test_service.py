@@ -687,6 +687,20 @@ async def test_tenantcloud_enqueue_preflights_and_prepares_without_provider_io()
     adapter.reconcile.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_tenantcloud_prepare_remediation_preflights_without_provider_io() -> None:
+    store = FakeStore(tenantcloud_row())
+    adapter = AsyncMock()
+    gateway = tenantcloud_service(store, adapter)
+
+    result = await gateway.prepare(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.PREPARED
+    adapter.invoke.assert_not_called()
+    adapter.reconcile.assert_not_called()
+
+
 def tenantcloud_context_for(operation, **overrides):
     """Full ActionContext for each of the four TenantCloud operations --
     enough detail (canonical_context claim/source/provider_ids, canonical_scope
