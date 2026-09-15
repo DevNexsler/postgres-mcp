@@ -329,6 +329,24 @@ class OutboundActionService:
             return self._result(prepared, repeated=prepared.state is ActionState.COMPLETED)
         return await self._apply_preflight_decision(action, evidence, decision)
 
+    async def prepare(self, action_id: UUID) -> PublicResult:
+        """Preflight a persisted remediation successor without provider I/O."""
+        action = await self._require_action(action_id)
+        if action.state is not ActionState.RECEIVED or not self._is_due(action):
+            return self._result(action)
+        context, context_detail = await self._verified_context(action)
+        if context is None:
+            return self._result(action, detail=context_detail)
+        blocked = await self._check_traffic(action, context, override=False)
+        if blocked is not None:
+            return blocked
+        evidence = await self._evidence_loader.load(context)
+        decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
+        if decision.outcome is PreflightOutcome.READY:
+            prepared = await self._store.prepare(context, action.state)
+            return self._result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+        return await self._apply_preflight_decision(action, evidence, decision)
+
     async def _dispatch_stage(
         self,
         action: OutboundActionRecord,

@@ -76,6 +76,28 @@ async def test_ready_action_resumes_once_after_auth_self_heals() -> None:
 
 
 @pytest.mark.asyncio
+async def test_received_remediation_is_prepared_before_any_provider_io() -> None:
+    received = action(ActionState.RECEIVED)
+    prepared = action(ActionState.PREPARED)
+    store = AsyncMock()
+    store.get.side_effect = [received, prepared]
+    service = AsyncMock()
+    service.prepare.return_value = SimpleNamespace(
+        status=PublicStatus.PENDING,
+        detail_code="prepared",
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(store=store, service=service, auth=auth)
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.WAIT
+    service.prepare.assert_awaited_once_with(ACTION_ID)
+    service.resume.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_restarted_step_reconciles_dispatching_action_never_blind_resends() -> None:
     row = action(ActionState.PREPARED)
     store = AsyncMock()

@@ -67,6 +67,8 @@ class DeliveryStore(Protocol):
 
 
 class DeliveryService(Protocol):
+    async def prepare(self, action_id: UUID) -> Any: ...
+
     async def resume(self, action_id: UUID) -> Any: ...
 
     async def reconcile(self, action_id: UUID) -> Any: ...
@@ -85,6 +87,7 @@ _AMBIGUOUS_STATES = {
     ActionState.RECONCILING,
 }
 _RESUMABLE_STATES = {
+    ActionState.RECEIVED,
     ActionState.PREPARED,
     ActionState.RETRY_READY,
     ActionState.DEPENDENCY_WAIT,
@@ -160,7 +163,9 @@ class TenantCloudDeliveryCoordinator:
                 max(1, auth.retry_after_seconds or default_delay),
             )
 
-        if action.state in _AMBIGUOUS_STATES:
+        if action.state is ActionState.RECEIVED:
+            result = await self._service.prepare(action_id)
+        elif action.state in _AMBIGUOUS_STATES:
             result = await self._service.reconcile(action_id)
         elif action.attempt_count >= self._max_attempts:
             result = await self._service.exhaust(action_id)
