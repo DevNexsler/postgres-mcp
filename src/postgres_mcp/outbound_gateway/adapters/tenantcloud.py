@@ -72,6 +72,12 @@ class TenantCloudMutationsProtocol(Protocol):
 
     def reconcile_message(self, thread_id: object, body: object, *, source_turn_at: object) -> Any: ...
 
+    def resolve_lead_thread(self, lead_id: object) -> str | None: ...
+
+    def bind_lead_message_observation(
+        self, observation: Any, lead_id: object, resolved_thread_id: object
+    ) -> Any: ...
+
     def reconcile_lead_status(self, lead_id: object) -> Any: ...
 
     def reconcile_maintenance_create(self, *, dispatched_after: object, **kwargs: object) -> Any: ...
@@ -186,11 +192,29 @@ class TenantCloudAdapter:
         target_reference = tenantcloud_target_reference(context)
         mutations = self._facade()
         if operation is Operation.TENANTCLOUD_MESSAGE_SEND:
+            target_id = context.target.target_id
+            body = str(context.arguments["text"])
+            resolved = None
             result = mutations.reconcile_message(
-                context.target.target_id,
-                str(context.arguments["text"]),
-                source_turn_at=context.source_sent_at,
+                target_id, body, source_turn_at=context.source_sent_at
             )
+            if result.error_code == "readback_failed":
+                resolved = mutations.resolve_lead_thread(target_id)
+                if resolved is not None:
+                    result = mutations.reconcile_message(
+                        resolved, body, source_turn_at=context.source_sent_at
+                    )
+            if resolved is not None and result.disposition.value == "accepted":
+                bound = mutations.bind_lead_message_observation(
+                    result.observation, target_id, resolved
+                )
+                return self._accepted_from_observation(
+                    bound,
+                    kind="message",
+                    operation_value=operation_value,
+                    target_reference=target_reference,
+                    detail_code="tenantcloud_message_reconciled",
+                )
             return self._from_reconciliation(
                 result,
                 kind="message",
@@ -240,8 +264,16 @@ class TenantCloudAdapter:
     # provider round trip per dispatch attempt; that is the deliberate,
     # paranoid trade this codebase already makes for post-write readback.
 
-    def _invoke_message(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_message(
+        self,
+        mutations: TenantCloudMutationsProtocol,
+        arguments: Mapping[str, Any],
+        operation_value: str,
+        target_reference: str,
+    ) -> ProviderObservation:
         thread_id = arguments["thread_id"]
+        logical_thread_id = thread_id
+        resolved = None
         body = arguments["body"]
         pre = mutations.reconcile_message(thread_id, body, source_turn_at=arguments["source_sent_at"])
         if pre.disposition.value == "accepted":
@@ -252,7 +284,48 @@ class TenantCloudAdapter:
                 target_reference=target_reference,
                 detail_code="tenantcloud_message_already_present",
             )
+        if pre.error_code == "readback_failed":
+            resolved = mutations.resolve_lead_thread(thread_id)
+            if resolved is None:
+                return ProviderObservation(
+                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                    "tenantcloud_target_unavailable_before_dispatch",
+                    category="provider_target_resolution",
+                    retryable=True,
+                    evidence={"kind": "target_resolution"},
+                )
+            thread_id = resolved
+            pre = mutations.reconcile_message(
+                thread_id, body, source_turn_at=arguments["source_sent_at"]
+            )
+            if pre.disposition.value == "accepted":
+                observation = mutations.bind_lead_message_observation(
+                    pre.observation, logical_thread_id, resolved
+                )
+                return self._accepted_from_observation(
+                    observation,
+                    kind="message",
+                    operation_value=operation_value,
+                    target_reference=target_reference,
+                    detail_code="tenantcloud_message_already_present",
+                )
+        if pre.error_code != "no_match":
+            return ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                f"tenantcloud_prewrite_{pre.error_code or 'unknown'}",
+            )
         execution = mutations.send_message(thread_id, body)
+        if resolved is not None and execution.verified:
+            observation = mutations.bind_lead_message_observation(
+                execution.observation, logical_thread_id, resolved
+            )
+            return self._accepted_from_observation(
+                observation,
+                kind="message",
+                operation_value=operation_value,
+                target_reference=target_reference,
+                detail_code="tenantcloud_message_accepted",
+            )
         return self._from_execution(
             execution,
             kind="message",
@@ -261,7 +334,13 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_message_accepted",
         )
 
-    def _invoke_lead_status(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_lead_status(
+        self,
+        mutations: TenantCloudMutationsProtocol,
+        arguments: Mapping[str, Any],
+        operation_value: str,
+        target_reference: str,
+    ) -> ProviderObservation:
         lead_id = arguments["lead_id"]
         pre = mutations.reconcile_lead_status(lead_id)
         if pre.disposition.value == "accepted":
@@ -281,7 +360,13 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_lead_status_accepted",
         )
 
-    def _invoke_maintenance_create(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_maintenance_create(
+        self,
+        mutations: TenantCloudMutationsProtocol,
+        arguments: Mapping[str, Any],
+        operation_value: str,
+        target_reference: str,
+    ) -> ProviderObservation:
         kwargs = {
             "property_id": arguments["property_id"],
             "unit_id": arguments["unit_id"],
@@ -305,7 +390,13 @@ class TenantCloudAdapter:
             accepted_detail="tenantcloud_maintenance_create_accepted",
         )
 
-    def _invoke_maintenance_status(self, mutations: TenantCloudMutationsProtocol, arguments: Mapping[str, Any], operation_value: str, target_reference: str) -> ProviderObservation:
+    def _invoke_maintenance_status(
+        self,
+        mutations: TenantCloudMutationsProtocol,
+        arguments: Mapping[str, Any],
+        operation_value: str,
+        target_reference: str,
+    ) -> ProviderObservation:
         request_id = arguments["request_id"]
         status = arguments["status"]
         pre = mutations.reconcile_maintenance_status(request_id, status)
