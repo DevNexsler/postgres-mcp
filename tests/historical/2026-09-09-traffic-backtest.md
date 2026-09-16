@@ -47,6 +47,22 @@ Jessica wake **26817**: original `stale_context`, fixed `pass`. Unrelated messag
 
 ## Replay method and limits
 
+### Ticket #2148's original 21-block cohort
+
+Filtering the saved case-by-case report to `recorded_detail == "stale_context"`
+and `2026-08-28 <= created_at < 2026-09-06` selects exactly **21 actions**.
+All 21 are conclusive at both replay bounds: **5 unrelated-counterparty false
+blocks**, and **16 preserved stale-context blocks**. The five false blocks are
+wakes **26184, 26189, 26193, 26205, and 26467**. Wake 26817 falls outside this
+original reporting window and must not be counted as a sixth false block in it.
+
+This count was extracted on September 16 from the September 9 archived report
+and its matching sanitized snapshot, not from a fresh production query. The
+current replay runner requires a fixture update for the subsequently added
+`retry_of_action_id` column (Maint-Manager #2441); its failed September 16 rerun
+is not evidence of a successful current-code replay. The historical limitations
+below still apply.
+
 Production was read in one repeatable-read, read-only transaction. Export omits message text, names, and unrelated raw payload fields. Phone values are replaced consistently while retaining punctuation, digit lengths, arrays, and nulls; subject keys are hashed. The saved snapshot is permission-restricted.
 
 A disposable PostgreSQL 16 instance holds the snapshot. Time-filtered views expose messages and actions visible at each replay time; ledger states come from recorded transitions, and dispatch timestamps from the future are hidden. Production SQL and traffic decision code run unchanged against those views. A separate Python policy check validates recipient membership and lease/staleness outcomes.

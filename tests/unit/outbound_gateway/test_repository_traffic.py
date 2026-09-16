@@ -299,6 +299,26 @@ async def test_newest_activity_after_returns_none_when_both_probes_are_empty():
 
 
 @pytest.mark.asyncio
+async def test_shared_line_message_query_scopes_activity_to_sending_recipient():
+    """#2148: channel 18 is a shared line, not the wake's conversation."""
+    watermark = datetime(2026, 8, 31, 14, 15, 18, tzinfo=timezone.utc)
+    execute = AsyncMock(return_value=[])
+    repository = OutboundGatewayRepository(object())
+    with patch("postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query", execute):
+        await repository.newest_activity_after("phone:+12025550101", 18, watermark, ACTION_ID)
+
+    _, query, params = execute.call_args_list[1].args
+    assert "sending.canonical_context->>'recipient_phone'" in query
+    assert params == [ACTION_ID, 18, watermark]
+    assert "sending.action_id = {}" in query
+    assert "sending.operation IS DISTINCT FROM 'quo.sms.send'" in query
+    assert "raw.payload#>'{{data,object,from}}'" in query
+    assert "raw.payload#>'{{data,object,to}}'" in query
+    assert "EXISTS" in query
+    assert query.index("EXISTS") < query.index("ORDER BY message.created_at DESC")
+
+
+@pytest.mark.asyncio
 async def test_context_watermark_returns_coalesced_timestamp():
     row = Row({"watermark": datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)})
     calls = []
