@@ -110,6 +110,36 @@ async def verdict(repository, *, override=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_counterparty", [False, True])
+async def test_wake_26184_shared_line_staleness(traffic, same_counterparty):
+    """Replay ticket #2148's timing and IDs with synthetic phone numbers."""
+    conn, repository = traffic
+    accepted = datetime(2026, 8, 31, 14, 15, 18, tzinfo=timezone.utc)
+    await conn.execute("UPDATE hermes_wakeup_events SET id=26184, webui_accepted_at=%s, created_at=%s", (accepted, accepted))
+    await conn.execute("UPDATE outbound_actions SET created_at=%s", (accepted,))
+    await add_message(conn, sender=JESSICA, message_id=683186)
+    await add_message(conn, sender=JESSICA if same_counterparty else GUNTHER, message_id=683187)
+    await conn.execute("UPDATE messages SET created_at=%s WHERE id=683186", (accepted.replace(second=5),))
+    await conn.execute("UPDATE messages SET created_at=%s WHERE id=683187", (accepted.replace(minute=16, second=15),))
+
+    result = await check_traffic(
+        repository,
+        recipient_key=SUBJECT,
+        channel_id=18,
+        wakeup_event_id=26184,
+        action_id=ACTION,
+        override=False,
+        logger=logging.getLogger(__name__),
+    )
+
+    assert not result.check_failed
+    assert result.allowed is not same_counterparty, result.detail
+    assert result.reason == ("stale_context" if same_counterparty else "pass")
+    if same_counterparty:
+        assert "message 683187 " in result.detail
+
+
+@pytest.mark.asyncio
 async def test_gunther_activity_on_shared_line_does_not_block_jessica(traffic):
     conn, repository = traffic
     await add_message(conn)
