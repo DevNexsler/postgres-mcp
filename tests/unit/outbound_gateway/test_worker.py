@@ -105,3 +105,10 @@ async def test_worker_delegates_tenantcloud_work_to_restate() -> None:
     submitter.submit.assert_awaited_once_with(action_id)
     service.resume.assert_not_called()
     service.reconcile.assert_not_called()
+
+
+def test_default_error_line_names_the_error(capsys):
+    OutboundWorker._default_error(UUID(int=7), "reconcile", KeyError("nigel-zoho"))
+    line = capsys.readouterr().out.strip()
+    assert '"error_type": "KeyError"' in line
+    assert "nigel-zoho" in line

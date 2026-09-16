@@ -51,6 +51,7 @@ class OutboundWorker:
             json.dumps(
                 {
                     "action_id": str(action_id),
+                    "error": str(error)[:500],
                     "error_type": type(error).__name__,
                     "event": "outbound_worker_action_failed",
                     "operation": operation,

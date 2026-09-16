@@ -93,7 +93,16 @@ class EmailAdapter:
             polled = await self.poll(client, observation)
             if polled.disposition is not ProviderDisposition.AMBIGUOUS:
                 return polled
-        domain = self._sender_domains[context.provider_account]
+        domain = self._sender_domains.get(context.provider_account)
+        if domain is None:
+            # Same guard validate() applies on the send path. Reconcile runs
+            # first for UNKNOWN rows, so without it an unconfigured account
+            # raised KeyError on every attempt instead of terminalizing.
+            return ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                "email_sender_account_unconfigured",
+                provider_request_ref=observation.provider_request_ref,
+            )
         message_id = f"<outbound-action-{action_uid}@{domain}>"
         lookup = await client.call(
             "agent-email",
