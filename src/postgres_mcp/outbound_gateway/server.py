@@ -518,7 +518,9 @@ async def build_runtime() -> GatewayRuntime:
         version=os.environ.get("OUTBOUND_ROUTING_POLICY_VERSION", "appointment-v1"),
         email_account_by_provider=_json_mapping(
             "OUTBOUND_EMAIL_ACCOUNTS_JSON",
-            {"zillow": "nigel-zoho", "hotpads": "nigel-zoho", "tenantcloud": "nigel-zoho"},
+            # zoho_mail: a wake sourced from Nigel's mailbox (TenantCloud lead /
+            # application notifications) replies from that same mailbox.
+            {"zillow": "nigel-zoho", "hotpads": "nigel-zoho", "tenantcloud": "nigel-zoho", "zoho_mail": "nigel-zoho"},
         ),
         quo_line_by_provider=_json_mapping(
             "OUTBOUND_QUO_LINES_JSON",

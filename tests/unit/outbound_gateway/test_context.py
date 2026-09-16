@@ -1,3 +1,4 @@
+import dataclasses
 from datetime import datetime
 from datetime import timezone
 from types import SimpleNamespace
@@ -1848,3 +1849,33 @@ async def test_calendar_update_and_delete_still_fail_closed_when_neither_agent_n
                 arguments={"calendar_id": "nigel"},
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_email_send_refuses_provider_without_configured_sender_account():
+    """A wake sourced from a provider with no email account mapping used to
+    produce a row with provider_account="" that the worker could never
+    reconcile (KeyError on the sender-domain lookup, six attempts, then
+    manual_review -- action a648bd51, 2026-09-16). Refuse at execute time."""
+    event = record(message_source="zoho_mail", channel_type="email_thread",
+                   participant_key="someone@gmail.com", raw_payload={},
+                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    unmapped = dataclasses.replace(policy(), email_account_by_provider={"zillow": "nigel-zoho"})
+    loader = ActionContextLoader(FakeRepository(event), unmapped)
+    with pytest.raises(ContextDerivationError, match="no outbound email account is configured for provider 'zoho_mail'"):
+        await loader.load(request(arguments={"to_address": "dan@pfg.io", "text": "hi"}))
+
+
+@pytest.mark.asyncio
+async def test_email_send_from_zoho_mail_wake_uses_mapped_account():
+    event = record(message_source="zoho_mail", channel_type="email_thread",
+                   participant_key="noreply@tenantcloud.com", raw_payload={},
+                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    mapped = dataclasses.replace(
+        policy(), email_account_by_provider={**policy().email_account_by_provider, "zoho_mail": "nigel-zoho"}
+    )
+    context = await ActionContextLoader(FakeRepository(event), mapped).load(
+        request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
+    )
+    assert context.provider_account == "nigel-zoho"
+    assert context.target.target_id == "dan@pfg.io"

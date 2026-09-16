@@ -783,6 +783,15 @@ class ActionContextLoader:
         if request.operation is Operation.EMAIL_SEND:
             assert isinstance(request.arguments, EmailArguments)
             account = self._policy.email_account_by_provider.get(provider, "")
+            if not account:
+                # An empty account used to slip through: the row was created,
+                # the worker's reconcile step then raised KeyError on the
+                # sender-domain lookup six times and parked the action in
+                # manual_review (action a648bd51, 2026-09-16). Refuse at
+                # execute time instead so the agent sees why.
+                raise ContextDerivationError(
+                    f"no outbound email account is configured for provider {provider!r}"
+                )
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
             assert isinstance(request.arguments, QuoSmsArguments)

@@ -1340,3 +1340,18 @@ async def test_tenantcloud_reconciliation_auth_unavailable_on_a_create_is_retrya
     assert reconciled.retryable is True
     assert reconciled.category == "provider_authentication"
     assert reconciled.detail_code == "tenantcloud_auth_rejected_before_dispatch"
+
+
+@pytest.mark.asyncio
+async def test_email_reconcile_terminalizes_unconfigured_sender_account():
+    """reconcile() runs before validate() for UNKNOWN rows; an unconfigured
+    account must terminalize, not raise KeyError on every worker pass."""
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    unknown = ProviderObservation(ProviderDisposition.AMBIGUOUS, "transport_timeout")
+    client = FakeClient()
+
+    reconciled = await adapter.reconcile(client, context(provider_account=""), ACTION_UID, unknown)
+
+    assert reconciled.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert reconciled.detail_code == "email_sender_account_unconfigured"
+    assert client.calls == []
