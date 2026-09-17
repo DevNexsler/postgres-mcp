@@ -422,6 +422,52 @@ def test_email_to_address_rejects_malformed_values(bad):
         parse_outbound_request(execute_payload(arguments={"to_address": bad, "text": "Thanks"}))
 
 
+def test_email_arguments_carry_the_agent_supplied_subject_and_copy_list():
+    parsed = parse_outbound_request(
+        execute_payload(
+            arguments={
+                "to_address": "tenant@example.com",
+                "text": "Packet attached.",
+                "subject": "Lease renewal - 16 N Main St",
+                "cc": ["owner@example.com", "owner@example.com", "staff@pfg.io"],
+            }
+        )
+    )
+    assert parsed.arguments.subject == "Lease renewal - 16 N Main St"
+    assert parsed.arguments.cc == ("owner@example.com", "staff@pfg.io")
+
+
+def test_email_subject_and_copy_list_are_optional():
+    parsed = parse_outbound_request(execute_payload())
+    assert parsed.arguments.subject is None
+    assert parsed.arguments.cc == ()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "   ", "Renewal\nBcc: victim@example.com", "Renewal\rX", "Renewal\tX", "x" * 256, 5, True],
+)
+def test_email_subject_rejects_blank_overlong_and_header_injecting_values(bad):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(execute_payload(arguments={"to_address": "tenant@example.com", "text": "Hi", "subject": bad}))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "owner@example.com",
+        ["no-at-sign"],
+        [""],
+        [5],
+        [{"address": "owner@example.com"}],
+        [f"owner{index}@example.com" for index in range(11)],
+    ],
+)
+def test_email_copy_list_rejects_non_lists_malformed_addresses_and_unbounded_fan_out(bad):
+    with pytest.raises(ValidationError):
+        parse_outbound_request(execute_payload(arguments={"to_address": "tenant@example.com", "text": "Hi", "cc": bad}))
+
+
 def test_quo_arguments_carry_the_agent_supplied_to_phone():
     parsed = parse_outbound_request(
         execute_payload(

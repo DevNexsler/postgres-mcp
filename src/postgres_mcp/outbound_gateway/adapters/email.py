@@ -46,24 +46,46 @@ class EmailAdapter:
 
     def build_request(self, context: ActionContext, action_uid: UUID) -> ProviderRequest:
         self.validate(context)
-        subject = context.source_subject or "Rental inquiry"
-        if not subject.casefold().startswith("re:"):
-            subject = f"Re: {subject}"
         arguments = {
             "account_id": context.provider_account,
             "to": [{"address": context.target.target_id}],
-            "subject": subject,
+            "subject": self._subject(context),
             "text": str(context.arguments["text"]),
             "outbound_action_uid": str(action_uid),
         }
-        copy_address = self._cc_by_source.get(context.source)
-        if copy_address:
-            arguments["cc"] = [{"address": copy_address}]
+        copy_addresses = self._copy_addresses(context)
+        if copy_addresses:
+            arguments["cc"] = [{"address": address} for address in copy_addresses]
         return ProviderRequest(
             server_name="agent-email",
             tool="email_send",
             arguments=arguments,
         )
+
+    @staticmethod
+    def _subject(context: ActionContext) -> str:
+        """The agent's own subject when it supplied one -- an operator-directed
+        email is not a reply, so it is sent verbatim, without the "Re:" prefix.
+        Otherwise the trigger record's subject, as before."""
+        agent_subject = context.arguments.get("subject")
+        if isinstance(agent_subject, str) and agent_subject:
+            return agent_subject
+        subject = context.source_subject or "Rental inquiry"
+        if not subject.casefold().startswith("re:"):
+            subject = f"Re: {subject}"
+        return subject
+
+    def _copy_addresses(self, context: ActionContext) -> tuple[str, ...]:
+        """The configured per-source copy is policy (every Zillow reply is
+        copied to management), so the agent's list adds to it and can never
+        drop it."""
+        configured = self._cc_by_source.get(context.source)
+        addresses = [configured] if configured else []
+        agent_copies = context.arguments.get("cc") or ()
+        for address in agent_copies:
+            if isinstance(address, str) and address and address not in addresses:
+                addresses.append(address)
+        return tuple(addresses)
 
     async def invoke(self, client: McpProviderClient, request: ProviderRequest) -> ProviderObservation:
         return self._parse(await client.call(request.server_name, request.tool, request.arguments))
