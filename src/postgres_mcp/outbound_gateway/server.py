@@ -33,6 +33,7 @@ from .adapters.email import EmailAdapter
 from .adapters.quo import QuoSmsAdapter
 from .adapters.tenantcloud import TenantCloudAdapter
 from .context import ACTION_NAMESPACE
+from .context import DEFAULT_EMAIL_ACCOUNT_KEY
 from .context import ActionContextLoader
 from .context import RoutingPolicy
 from .evidence import DatabasePreflightEvidenceLoader
@@ -520,7 +521,16 @@ async def build_runtime() -> GatewayRuntime:
             "OUTBOUND_EMAIL_ACCOUNTS_JSON",
             # zoho_mail: a wake sourced from Nigel's mailbox (TenantCloud lead /
             # application notifications) replies from that same mailbox.
-            {"zillow": "nigel-zoho", "hotpads": "nigel-zoho", "tenantcloud": "nigel-zoho", "zoho_mail": "nigel-zoho"},
+            # default: the agency mailbox a wake with no implied mailbox of its
+            # own sends from -- a Cliq staff @mention asking the agent to write
+            # a tenant is not a customer email thread (#2444).
+            {
+                "zillow": "nigel-zoho",
+                "hotpads": "nigel-zoho",
+                "tenantcloud": "nigel-zoho",
+                "zoho_mail": "nigel-zoho",
+                DEFAULT_EMAIL_ACCOUNT_KEY: "nigel-zoho",
+            },
         ),
         quo_line_by_provider=_json_mapping(
             "OUTBOUND_QUO_LINES_JSON",

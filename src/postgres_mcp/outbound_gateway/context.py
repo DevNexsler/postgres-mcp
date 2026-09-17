@@ -81,6 +81,14 @@ class DerivedTarget:
     verified: bool
 
 
+# Reserved key in RoutingPolicy.email_account_by_provider: the mailbox an
+# email leaves from when the wake's trigger is not itself a customer email
+# thread (a Cliq staff @mention, say), so no provider mailbox is implied.
+# Consulted only after the provider's own entry, and opt-in -- with no
+# "default" entry an unmapped provider still fails closed.
+DEFAULT_EMAIL_ACCOUNT_KEY = "default"
+
+
 @dataclass(frozen=True)
 class RoutingPolicy:
     version: str
@@ -782,7 +790,10 @@ class ActionContextLoader:
             return DerivedTarget("tenantcloud_maintenance_request", str(request.arguments.request_id), True), "tenantcloud"
         if request.operation is Operation.EMAIL_SEND:
             assert isinstance(request.arguments, EmailArguments)
-            account = self._policy.email_account_by_provider.get(provider, "")
+            account = self._policy.email_account_by_provider.get(provider) or self._policy.email_account_by_provider.get(
+                DEFAULT_EMAIL_ACCOUNT_KEY,
+                "",
+            )
             if not account:
                 # An empty account used to slip through: the row was created,
                 # the worker's reconcile step then raised KeyError on the
@@ -790,7 +801,8 @@ class ActionContextLoader:
                 # manual_review (action a648bd51, 2026-09-16). Refuse at
                 # execute time instead so the agent sees why.
                 raise ContextDerivationError(
-                    f"no outbound email account is configured for provider {provider!r}"
+                    f"no outbound email account is configured for provider {provider!r} "
+                    f"and no {DEFAULT_EMAIL_ACCOUNT_KEY!r} account is configured"
                 )
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:

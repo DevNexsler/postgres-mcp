@@ -294,6 +294,54 @@ async def test_email_reconciliation_polls_bounded_pending_lookup_to_completion()
     ]
 
 
+def test_email_adapter_sends_an_operator_directed_subject_and_copy_list():
+    """A staff-directed email states its own subject and copy list; the
+    trigger-derived "Re: <thread subject>" cannot express either (wake 27029,
+    "please send and CC ..."). The configured per-source copy is policy, so
+    the agent's list adds to it and can never drop it."""
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        cc_by_source={"zillow": "management@pfg.io"},
+    )
+
+    request = adapter.build_request(
+        context(
+            arguments=MappingProxyType(
+                {
+                    "text": "Renewal packet attached.",
+                    "subject": "Lease renewal - 16 N Main St",
+                    "cc": ["owner@example.com", "management@pfg.io"],
+                }
+            )
+        ),
+        ACTION_UID,
+    )
+
+    assert request.arguments["subject"] == "Lease renewal - 16 N Main St"
+    assert request.arguments["cc"] == [
+        {"address": "management@pfg.io"},
+        {"address": "owner@example.com"},
+    ]
+
+
+def test_email_adapter_copies_only_the_agent_list_when_the_source_configures_none():
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        cc_by_source={"zillow": "management@pfg.io"},
+    )
+
+    request = adapter.build_request(
+        context(
+            source="cliq",
+            arguments=MappingProxyType({"text": "Sent as asked.", "cc": ["owner@example.com"]}),
+        ),
+        ACTION_UID,
+    )
+
+    assert request.arguments["cc"] == [{"address": "owner@example.com"}]
+    assert request.arguments["subject"] == "Re: Zillow inquiry for 138 Bullman St #144-A"
+
+
 def test_email_adapter_applies_management_copy_only_to_configured_sources():
     adapter = EmailAdapter(
         sender_domains={"nigel-zoho": "pfg.io"},

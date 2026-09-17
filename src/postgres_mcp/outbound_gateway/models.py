@@ -171,9 +171,56 @@ def normalize_event_url(value: Any, *, field: str) -> str | None:
     return candidate
 
 
+def normalize_email_subject(value: Any, *, field: str) -> str | None:
+    """Format-only check for an agent-supplied email subject. None means the
+    field was omitted and the adapter's trigger-derived subject applies.
+    Unlike a message body this is never newline-folded: the value becomes a
+    header, so any control character is refused rather than normalized."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    candidate = normalize("NFC", value).strip()
+    if not 1 <= len(candidate) <= 255:
+        raise ValueError(f"{field} length must be between 1 and 255")
+    if any(category(character) == "Cc" for character in candidate):
+        raise ValueError(f"{field} must not contain control characters")
+    return candidate
+
+
+# A copy list is fan-out, so it is bounded: one malformed turn must not be
+# able to mail an arbitrary number of people. Ten covers the operator-
+# directed sends we see (a tenant plus the owner and a couple of staff).
+MAX_EMAIL_COPY_ADDRESSES = 10
+
+
+def normalize_email_copy_addresses(value: Any, *, field: str) -> tuple[str, ...]:
+    """Format-only check for the agent-supplied copy list: every entry is an
+    address, duplicates collapse, agent order is kept. Never checks that an
+    address belongs to any prospect, wake, or thread."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be a list of email addresses")
+    addresses: list[str] = []
+    for item in value:
+        address = normalize_target_email(item, field=field)
+        if address not in addresses:
+            addresses.append(address)
+    if len(addresses) > MAX_EMAIL_COPY_ADDRESSES:
+        raise ValueError(f"{field} must name at most {MAX_EMAIL_COPY_ADDRESSES} addresses")
+    return tuple(addresses)
+
+
 class EmailArguments(StrictModel):
     to_address: str
     text: str
+    # An operator-directed email (a staff @mention asking the agent to write
+    # a tenant) states its own subject and copy list; a subject derived from
+    # the trigger record plus a fixed per-source cc cannot express either.
+    # Omitted keeps exactly the pre-existing adapter behaviour.
+    subject: str | None = None
+    cc: tuple[str, ...] = ()
 
     @field_validator("to_address", mode="before")
     @classmethod
@@ -184,6 +231,16 @@ class EmailArguments(StrictModel):
     @classmethod
     def normalize_text(cls, value: Any) -> str:
         return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def normalize_subject(cls, value: Any) -> str | None:
+        return normalize_email_subject(value, field="subject")
+
+    @field_validator("cc", mode="before")
+    @classmethod
+    def normalize_cc(cls, value: Any) -> tuple[str, ...]:
+        return normalize_email_copy_addresses(value, field="cc")
 
 
 class QuoSmsArguments(StrictModel):

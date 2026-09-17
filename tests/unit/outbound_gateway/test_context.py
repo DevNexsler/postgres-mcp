@@ -1134,7 +1134,12 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
     assert first.action_id == second.action_id
     assert first.action_id.version == 5
     assert first.payload_hash == second.payload_hash
-    assert first.arguments == {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"}
+    assert first.arguments == {
+        "to_address": "amanda.abc@convo.zillow.com",
+        "text": "Friday at 10:30 works.\n— Nigel",
+        "subject": None,
+        "cc": [],
+    }
     assert tuple(sorted(first.aliases)) == first.aliases
 
 
@@ -1879,3 +1884,57 @@ async def test_email_send_from_zoho_mail_wake_uses_mapped_account():
     )
     assert context.provider_account == "nigel-zoho"
     assert context.target.target_id == "dan@pfg.io"
+
+
+@pytest.mark.asyncio
+async def test_email_send_from_an_operator_directed_wake_uses_the_default_account():
+    """A rule-27 cliq-nigel-mention wake is a staff @mention, not a customer
+    email thread, so no provider mailbox is implied and
+    email_account_by_provider has no "cliq" key. The reserved "default" entry
+    names the mailbox those sends leave from (#2444); without it the action
+    died on the sender-account guard and the agent mailed around the gateway
+    (wake 26938)."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_message_id="cliq-700",
+        channel_type="cliq_channel",
+        channel_name="nigel-mentions",
+        participant_type="cliq_user",
+        participant_key="nigel",
+        subject=None,
+        raw_payload={},
+        envelope={"identity": {}, "message": {"prospect_name": "Dan"}},
+    )
+    routed = dataclasses.replace(
+        policy(),
+        email_account_by_provider={**policy().email_account_by_provider, "default": "nigel-zoho"},
+    )
+
+    context = await ActionContextLoader(FakeRepository(event), routed).load(
+        request(
+            intent_kind="inquiry_reply",
+            appointment_slot=None,
+            arguments={"to_address": "tenant@example.com", "text": "As requested."},
+        )
+    )
+
+    assert context.source == "cliq"
+    assert context.provider_account == "nigel-zoho"
+    assert context.target.target_id == "tenant@example.com"
+
+
+@pytest.mark.asyncio
+async def test_canonical_arguments_and_payload_hash_cover_subject_and_copy_list():
+    loader = ActionContextLoader(FakeRepository(record()), policy())
+    base_arguments = {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works."}
+
+    base = await loader.load(request(arguments=base_arguments))
+    subjected = await loader.load(request(arguments={**base_arguments, "subject": "Lease renewal"}))
+    copied = await loader.load(request(arguments={**base_arguments, "cc": ["owner@example.com"]}))
+
+    assert base.arguments["subject"] is None
+    assert base.arguments["cc"] == []
+    assert subjected.arguments["subject"] == "Lease renewal"
+    assert copied.arguments["cc"] == ["owner@example.com"]
+    assert len({base.payload_hash, subjected.payload_hash, copied.payload_hash}) == 3
