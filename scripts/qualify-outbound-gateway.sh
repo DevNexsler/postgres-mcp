@@ -15,6 +15,9 @@ compose=(docker compose --project-directory "$scratch/cds" -f "$scratch/cds/dock
 cleanup() {
   local result=$?
   trap - EXIT
+  if (( result != 0 )); then
+    "${compose[@]}" logs --tail 100 gateway || true
+  fi
   "${compose[@]}" down --remove-orphans --volumes || result=1
   if [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")$(docker network ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")$(docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")" ]]; then
     echo 'qualification cleanup failed: project resources remain' >&2
@@ -31,9 +34,10 @@ git -C "$CDS_REPO" archive "$cds_sha" | tar -x -C "$scratch/cds"
 printf 'services:\n  gateway:\n    environment:\n      OUTBOUND_TRAFFIC_CONTROL: enforce\n' > "$scratch/enforce.yml"
 trap cleanup EXIT
 docker build --label "org.opencontainers.image.revision=$source_sha" -t "$OUTBOUND_QUALIFICATION_IMAGE" "$scratch/gateway"
-"${compose[@]}" up -d --wait
+docker compose --project-directory "$scratch/cds" -f "$scratch/cds/docker-compose.outbound-qualification.yml" up -d --wait
 exec_env=(-e COMM_DATA_STORE_CANDIDATE_QUALIFICATION=1 -e "MAINT_DOCKER_RUN_ID=$MAINT_DOCKER_RUN_ID" -e COMM_DATA_STORE_CANDIDATE_GATEWAY_URL=http://127.0.0.1:8094/mcp -e COMM_DATA_STORE_QUALIFICATION_ADMIN_DSN=postgresql://qualification_admin:qualification_admin_password@postgres:5432/qualification)
 "${compose[@]}" exec -T "${exec_env[@]}" gateway python tests/system/test_outbound_gateway_qualification_candidate.py
+"${compose[@]}" up -d --no-deps --force-recreate --wait gateway
 "${compose[@]}" exec -T "${exec_env[@]}" gateway python /app/tests/live/gateway_enforce_candidate.py
 "${compose[@]}" logs gateway > "$scratch/gateway.log"
 if grep -E 'traffic control (check failed|fail-open)' "$scratch/gateway.log"; then

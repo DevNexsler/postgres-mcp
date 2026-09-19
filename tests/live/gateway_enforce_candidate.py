@@ -5,6 +5,7 @@ bundled live suite. Uses its synthetic wake helper and loopback provider stub.
 """
 
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -12,11 +13,12 @@ from pathlib import Path
 from uuid import UUID
 from uuid import uuid5
 
-import psycopg
+from psycopg import Connection
+from psycopg.rows import DictRow
 from psycopg.rows import dict_row
 
 sys.path.insert(0, "/repo")
-from tests.system import test_outbound_gateway_qualification_candidate as qualification  # noqa: E402
+qualification = importlib.import_module("tests.system.test_outbound_gateway_qualification_candidate")
 
 from postgres_mcp.outbound_gateway.context import ACTION_NAMESPACE  # noqa: E402
 from postgres_mcp.outbound_gateway.models import ActionRole  # noqa: E402
@@ -27,7 +29,7 @@ async def qualify():
     run_id = os.environ["MAINT_DOCKER_RUN_ID"]
     url = os.environ["COMM_DATA_STORE_CANDIDATE_GATEWAY_URL"]
     log = Path(os.environ["OUTBOUND_QUALIFICATION_STUB_LOG"])
-    with psycopg.connect(os.environ["COMM_DATA_STORE_QUALIFICATION_ADMIN_DSN"], row_factory=dict_row) as conn:
+    with Connection[DictRow].connect(os.environ["COMM_DATA_STORE_QUALIFICATION_ADMIN_DSN"], row_factory=dict_row) as conn:
         wake = qualification._create_wake(conn, run_id, "enforce", "email.send", "email_thread", "enforce@example.invalid")
         competing_wake = qualification._create_wake(conn, run_id, "competing", "email.send", "email_thread", "enforce@example.invalid")
         conn.commit()
@@ -39,10 +41,11 @@ async def qualify():
             "intent_kind": "inquiry_reply",
             "arguments": {"to_address": "enforce@example.invalid", "text": "isolated enforce qualification"},
         }
-        before = len(log.read_text().splitlines())
+        before = len(log.read_text().splitlines()) if log.exists() else 0
         sent = await qualification._execute(url, request)
         assert sent["status"] == "sent", sent
         own = conn.execute("SELECT * FROM outbound_actions WHERE wakeup_event_id=%s", (wake,)).fetchone()
+        assert own is not None
         assert own["identity_version"] == "v2-internal"
         assert own["action_id"] != uuid5(ACTION_NAMESPACE, f"v1:wakeup:{wake}:role:{ActionRole.PROSPECT_REPLY}:ordinal:0")
         assert own["state"] == "completed" and own["provider_receipt"]
@@ -67,6 +70,7 @@ async def qualify():
             ),
         )
         competitor = conn.execute("SELECT action_id, subject_key FROM outbound_actions WHERE wakeup_event_id=%s", (competing_wake,)).fetchone()
+        assert competitor is not None
         assert competitor["subject_key"] == own["subject_key"]
         blocked_wake = qualification._create_wake(conn, run_id, "blocked", "email.send", "email_thread", "enforce@example.invalid")
         conn.commit()

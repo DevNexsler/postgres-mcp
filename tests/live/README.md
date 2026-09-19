@@ -11,8 +11,9 @@ CDS_REPO=/path/to/Comm-Data-Store CDS_REVISION=<commit-sha> \
 
 `COMPOSE_PROJECT_NAME` and `MAINT_DOCKER_RUN_ID` must already identify this run.
 The driver preserves those values and tags its image with the run ID. It runs the
-bundled suite and internal identity/competing-recipient checks with traffic control
-**enforced**, rejects fail-open probe logs, and prints commit/image/health evidence.
+bundled suite in its default shadow mode, then recreates the gateway with traffic
+control **enforced** for internal identity/competing-recipient checks. It rejects
+fail-open probe logs and prints commit/image/health evidence.
 The Compose network is internal, PostgreSQL data is tmpfs, and providers are stubs;
 no host ports or production credentials are used. Exit cleanup removes and checks
 project containers, networks, volumes, the candidate image, and exported source.
