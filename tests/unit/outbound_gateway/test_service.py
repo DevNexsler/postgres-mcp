@@ -362,7 +362,7 @@ class FakeProbe:
         self.calls.append(("in_flight", recipient_key, exclude_action_id))
         if self.raise_on_in_flight:
             raise RuntimeError("probe boom")
-        return self.in_flight
+        return [action for action in self.in_flight if action.action_id != exclude_action_id]
 
     async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
         self.calls.append(("newest_activity", recipient_key, channel_id, watermark, exclude_action_id))
@@ -1473,6 +1473,44 @@ def _accepted_observation() -> ProviderObservation:
         accepted_at=NOW,
         evidence={"kind": "provider_message_id"},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["execute", "enqueue", "prepare", "resume"])
+@pytest.mark.parametrize("competing", [False, True])
+async def test_traffic_gate_excludes_durable_id_when_context_identity_differs(method, competing):
+    """Migration 120 assigns v2-internal IDs while context still derives v1."""
+    durable_id = UUID("20000000-0000-0000-0000-000000000001")
+    competitor_id = UUID("20000000-0000-0000-0000-000000000002")
+    assert durable_id != context().action_id
+    initial_state = ActionState.PREPARED if method == "resume" else ActionState.RECEIVED
+    store = FakeStore(row(initial_state, action_id=durable_id))
+    adapter = FakeAdapter(_accepted_observation())
+    own = InFlightAction(durable_id, "email.send", initial_state.value, NOW, "own send")
+    other = InFlightAction(competitor_id, "email.send", "prepared", NOW, "competing send")
+    probe = FakeProbe(in_flight=[own, other] if competing else [own])
+    gateway = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
+
+    argument = request() if method in {"execute", "enqueue"} else durable_id
+    result = await getattr(gateway, method)(argument)
+
+    if competing:
+        assert result.status is PublicStatus.PENDING
+        assert result.detail_code == "lease_held"
+        assert str(competitor_id) in result.detail
+        assert str(durable_id) not in result.detail
+        assert adapter.calls == []
+    elif method in {"execute", "resume"}:
+        assert result.status is PublicStatus.SENT
+        assert store.current.state is ActionState.COMPLETED
+        assert ("invoke",) in adapter.calls
+    else:
+        assert store.current.state is ActionState.PREPARED
+        assert result.detail_code != "lease_held"
+        assert adapter.calls == []
+    assert probe.calls[0] == ("in_flight", context().prospect_id, durable_id)
+    if not competing:
+        assert probe.calls[-1] == ("newest_activity", context().prospect_id, context().channel_id, NOW, durable_id)
 
 
 @pytest.mark.asyncio
