@@ -486,7 +486,9 @@ class OutboundActionService:
             recipient_key=context.prospect_id,
             channel_id=context.channel_id,
             wakeup_event_id=context.wakeup_event_id,
-            action_id=context.action_id,
+            # Persistence may assign a different identity (e.g. v2-internal).
+            # Exclude the loaded row from both lease and activity probes.
+            action_id=action.action_id,
             override=override,
             logger=logger,
         )
