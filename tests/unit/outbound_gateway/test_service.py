@@ -17,6 +17,7 @@ import pytest
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
+from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
@@ -1933,6 +1934,58 @@ async def test_resume_swallows_post_dispatch_exception_and_returns_durable_row_s
     assert store.current.state is ActionState.DISPATCHING
     messages = [r.getMessage() for r in caplog.records]
     assert any("post-dispatch exception" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_execute_fails_definitively_when_the_provider_request_cannot_be_built(caplog):
+    """build_request() is local, deterministic and provider-free, so a
+    context this gateway can never send is knowable before the row is
+    claimed. Wake 27065 (2026-09-16) proved what happens when it is not:
+    an email.send whose provider had no configured sender account was
+    marked DISPATCHING first, the adapter's own validate() then raised,
+    and _dispatch_stage filed that refusal as a post-dispatch exception
+    of unknown provider outcome -- six lease expiries later the action
+    parked in manual_review carrying `retry_budget_exhausted` instead of
+    the real reason. Nothing may reach the provider, the row must never
+    claim it dispatched, and the failure must be terminal on the first
+    pass."""
+    store = FakeStore()
+    unconfigured = EmailAdapter(sender_domains={})
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, unconfigured).execute(request())
+
+    assert result.status is PublicStatus.FAILED
+    assert result.detail_code == "provider_request_unbuildable"
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert store.current.error_category == "provider_request_invalid"
+    assert [call[0] for call in store.calls] == ["create", "prepare", "definitive_fail"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("cannot build provider request for wake 7" in m for m in messages)
+    assert not any("post-dispatch exception" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_resume_fails_definitively_when_the_provider_request_cannot_be_built():
+    """Same guarantee on the worker's route into _dispatch, from the other
+    claimable pre-dispatch state: a retry that can never be built is
+    terminalized instead of re-entering the ambiguity machinery every
+    pass."""
+
+    def unbuildable(ctx, action_uid):
+        raise ValueError("calendar account is not configured")
+
+    store = FakeStore(row(ActionState.RETRY_READY, action_uid=ACTION_UID))
+    adapter = FakeAdapter()
+    adapter.build_request = unbuildable
+
+    result = await service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.FAILED
+    assert result.detail_code == "provider_request_unbuildable"
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert [call[0] for call in store.calls] == ["definitive_fail"]
+    assert adapter.calls == []
 
 
 @pytest.mark.asyncio
