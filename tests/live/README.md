@@ -18,5 +18,7 @@ The Compose network is internal, PostgreSQL data is tmpfs, and providers are stu
 no host ports or production credentials are used. Exit cleanup removes and checks
 project containers, networks, volumes, the candidate image, and exported source.
 
-The narrow regression runs in the default `uv run pytest` suite and CI:
+The driver first runs the full pytest suite against its exported candidate, so
+the pre-deploy gate always executes the narrow regression. It also runs in the
+default `uv run pytest` suite and CI:
 `tests/unit/outbound_gateway/test_service.py::test_traffic_gate_excludes_durable_id_when_context_identity_differs`.
