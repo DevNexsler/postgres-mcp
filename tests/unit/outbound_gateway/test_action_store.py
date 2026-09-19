@@ -89,7 +89,7 @@ def context():
     )
 
 
-def provider_context(operation, arguments, target, *, claim_id=301, source_event_id="tenantcloud:claim:301", desired_hash="d" * 64):
+def provider_context(operation, arguments, target, *, claim_id: int | str = 301, source_event_id="tenantcloud:claim:301", desired_hash="d" * 64):
     intent = {
         Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
         Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,

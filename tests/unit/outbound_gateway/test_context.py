@@ -1,7 +1,6 @@
 import dataclasses
 from datetime import datetime
 from datetime import timezone
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
@@ -46,6 +45,15 @@ class FakeRepository:
             canonical_subject=self.canonical_subject,
             ambiguous=self.ambiguous,
         )
+
+    async def in_flight_actions(self, recipient_key, exclude_action_id):
+        raise AssertionError("context derivation must not query traffic")
+
+    async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
+        raise AssertionError("context derivation must not query traffic")
+
+    async def context_watermark(self, wakeup_event_id):
+        raise AssertionError("context derivation must not query traffic")
 
 
 def record(**overrides):
@@ -158,7 +166,7 @@ def tenantcloud_record(*, family="lead", entity_ids=None, entity_scope_key=None,
         },
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return WakeEventRecord(**values)
 
 
 def tenantcloud_request(operation):
@@ -449,6 +457,7 @@ async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape(
         "appointment_slot": None,
         "arguments": {"lead_id": 2405115, "status": "working"},
     })
+    assert isinstance(exec_request, ExecuteRequest)
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(exec_request)
 
@@ -475,6 +484,7 @@ async def test_tenantcloud_claim_bookkeeping_never_bakes_the_literal_string_none
         "appointment_slot": None,
         "arguments": {"lead_id": 2405115, "status": "working"},
     })
+    assert isinstance(request, ExecuteRequest)
     assert event.tenantcloud_claim_id is None
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
@@ -498,6 +508,7 @@ async def test_tenantcloud_target_comes_from_arguments_on_any_wake_shape():
         "appointment_slot": None,
         "arguments": {"lead_id": 2405115, "status": "working"},
     })
+    assert isinstance(request, ExecuteRequest)
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
@@ -517,6 +528,7 @@ async def test_execute_ignores_a_target_that_disagrees_with_the_wake():
         "appointment_slot": None,
         "arguments": {"lead_id": 2405115, "status": "working"},
     })
+    assert isinstance(request, ExecuteRequest)
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
@@ -1509,6 +1521,7 @@ async def test_repository_event_query_survives_literal_empty_json_object():
 
     loaded = await OutboundGatewayRepository(Driver()).load_wake_event(12345)
 
+    assert loaded is not None
     assert loaded.wakeup_event_id == 12345
 
 

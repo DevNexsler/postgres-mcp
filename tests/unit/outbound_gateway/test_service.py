@@ -329,9 +329,9 @@ class FakeAdapter:
         return self.observations.pop(0)
 
 
-def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off", traffic_probe=None):
+def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off", traffic_probe=None, loaded_context=None):
     loader = AsyncMock()
-    loader.load.return_value = context()
+    loader.load.return_value = loaded_context if loaded_context is not None else context()
     preflight = AsyncMock()
     preflight.load.return_value = proof or evidence()
     return OutboundActionService(
@@ -483,7 +483,7 @@ async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_c
         {
             "action_role": current_context.action_role.value,
             "operation": current_context.operation.value,
-            "intent_kind": current_context.intent_kind.value,
+            "intent_kind": str(current_context.intent_kind),
             "appointment_slot": current_context.appointment_slot,
             "arguments": current_context.arguments,
             "canonical_context": stored_context,
@@ -512,8 +512,7 @@ async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_c
         side_effect=RuntimeError("outbound action payload mismatch")
     )
     adapter = FakeAdapter()
-    gateway = service(store, adapter)
-    gateway._context_loader.load.return_value = current_context
+    gateway = service(store, adapter, loaded_context=current_context)
 
     result = await gateway.execute(request())
 
@@ -807,7 +806,7 @@ def tenantcloud_context_for(operation, **overrides):
     return ActionContext(**values)
 
 
-@pytest.mark.parametrize("operation", sorted(TENANTCLOUD_OPERATIONS, key=lambda op: op.value))
+@pytest.mark.parametrize("operation", sorted(TENANTCLOUD_OPERATIONS))
 def test_execute_request_round_trips_arguments_enriched_by_create_or_load(operation):
     """Regression test for the round-2 finding: store.create_or_load()
     persists arguments enriched with desired_state/target_reference/
@@ -1382,7 +1381,7 @@ async def test_worker_accepts_one_way_durable_subject_alias_promotion():
         {
             "action_role": current_context.action_role.value,
             "operation": current_context.operation.value,
-            "intent_kind": current_context.intent_kind.value,
+            "intent_kind": str(current_context.intent_kind),
             "appointment_slot": current_context.appointment_slot,
             "arguments": current_context.arguments,
             "canonical_context": stored_context,

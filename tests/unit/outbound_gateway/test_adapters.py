@@ -518,6 +518,7 @@ async def test_calendar_adapter_accepts_plain_text_fallback_with_real_newlines()
 
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.message_id == "created-event"
+    assert observation.evidence is not None
     assert observation.evidence["event_url"] == "https://calendar.local/events/created-event.ics"
 
 
@@ -706,14 +707,14 @@ class FakeTenantCloudMutations:
     repo and cannot be imported here."""
 
     def __init__(self):
-        self.calls: list[tuple[str, tuple, dict]] = []
-        self.send_message_result = None
-        self.mark_lead_working_result = None
-        self.create_maintenance_request_result = None
-        self.update_maintenance_status_result = None
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.send_message_result: FakeMutationExecution | None = None
+        self.mark_lead_working_result: FakeMutationExecution | None = None
+        self.create_maintenance_request_result: FakeMutationExecution | None = None
+        self.update_maintenance_status_result: FakeMutationExecution | None = None
         self.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
         self.reconcile_message_results = []
-        self.resolve_lead_thread_result = None
+        self.resolve_lead_thread_result: str | None = None
         self.reconcile_lead_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
         self.reconcile_maintenance_create_result = FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
         self.reconcile_maintenance_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
@@ -871,6 +872,7 @@ async def test_tenantcloud_message_send_performs_one_write_and_verified_readback
         "canonical_observed_state", "operation", "provider_object_id",
         "target_reference", "readback_timestamp", "readback_verified", "evidence_hash",
     }
+    assert observation.evidence is not None
     assert observation.evidence["canonical_observed_state"] == {"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"}
     assert observation.evidence["operation"] == "tenantcloud.message.send"
     assert observation.evidence["provider_object_id"] == "9001"
@@ -941,6 +943,7 @@ async def test_tenantcloud_message_send_resolves_lead_id_to_provider_thread() ->
     ]
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.provider_request_ref == "thread:2057142"
+    assert observation.evidence is not None
     assert observation.evidence["target_reference"] == "thread:555"
     assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
     assert facade.calls[2][2]["allow_late"] is True
@@ -976,6 +979,7 @@ async def test_tenantcloud_resolved_lead_duplicate_rebinds_without_post() -> Non
     ]
     assert observation.disposition is ProviderDisposition.ACCEPTED
     assert observation.provider_request_ref == "thread:2057142"
+    assert observation.evidence is not None
     assert observation.evidence["canonical_observed_state"]["thread_id"] == "555"
     assert facade.calls[2][2]["allow_late"] is True
 
@@ -1099,6 +1103,7 @@ async def test_tenantcloud_maintenance_create_evidence_target_reference_is_stabl
 
     observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
 
+    assert observation.evidence is not None
     assert observation.evidence["target_reference"] == "property:12:unit:34"
     assert observation.provider_request_ref == "maintenance_request:4200"
 

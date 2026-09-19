@@ -225,6 +225,7 @@ async def test_newest_activity_after_defaults_message_direction_to_unknown_when_
     ):
         result = await repository.newest_activity_after("email:amanda@example.com", 44, watermark, ACTION_ID)
 
+    assert result is not None
     assert result.direction == "unknown"
 
 

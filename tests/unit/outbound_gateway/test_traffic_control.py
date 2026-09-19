@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from datetime import timezone
+from typing import TypedDict
+from uuid import UUID
 from uuid import uuid4
 
 import pytest
@@ -18,7 +20,7 @@ LOGGER = logging.getLogger("test.traffic")
 
 
 class FakeProbe:
-    def __init__(self, *, in_flight=(), newer=None, watermark=WATERMARK, raises=None):
+    def __init__(self, *, in_flight=(), newer=None, watermark: datetime | None = WATERMARK, raises=None):
         self._in_flight = list(in_flight)
         self._newer = newer
         self._watermark = watermark
@@ -40,17 +42,24 @@ class FakeProbe:
         return self._watermark
 
 
-def _kwargs(**over):
-    base = dict(
-        recipient_key="prospect:email:melody@example.com",
-        channel_id=676079,
-        wakeup_event_id=25789,
-        action_id=uuid4(),
-        override=False,
-        logger=LOGGER,
-    )
-    base.update(over)
-    return base
+class TrafficArguments(TypedDict):
+    recipient_key: str
+    channel_id: int
+    wakeup_event_id: int
+    action_id: UUID
+    override: bool
+    logger: logging.Logger
+
+
+def _kwargs(*, action_id: UUID | None = None, override: bool = False) -> TrafficArguments:
+    return {
+        "recipient_key": "prospect:email:melody@example.com",
+        "channel_id": 676079,
+        "wakeup_event_id": 25789,
+        "action_id": action_id if action_id is not None else uuid4(),
+        "override": override,
+        "logger": LOGGER,
+    }
 
 
 @pytest.mark.asyncio

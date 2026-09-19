@@ -249,7 +249,7 @@ def test_tenantcloud_operations_use_exact_strict_argument_models(operation, role
     )
 
     assert type(parsed.arguments).__name__ == argument_type
-    assert parsed.arguments.model_config["frozen"] is True
+    assert parsed.arguments.model_config.get("frozen") is True
     if operation == "tenantcloud.maintenance.create":
         assert parsed.arguments.text == "Pipe is leaking\nunder sink"
 
