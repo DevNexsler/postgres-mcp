@@ -29,6 +29,7 @@ from uuid import UUID
 
 import docker
 import psycopg
+from psycopg.rows import DictRow
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -57,10 +58,12 @@ def write_json(path, value):
 
 
 def capture(path):
-    with psycopg.connect(os.environ["GATEWAY_BACKTEST_PRODUCTION_DSN"], row_factory=dict_row) as conn:
+    with psycopg.Connection[DictRow].connect(os.environ["GATEWAY_BACKTEST_PRODUCTION_DSN"], row_factory=dict_row) as conn:
         conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SET LOCAL statement_timeout='60s'")
-        snapshot = {"captured_at": conn.execute("SELECT now() AS time").fetchone()["time"]}
+        captured = conn.execute("SELECT now() AS time").fetchone()
+        assert captured is not None
+        snapshot = {"captured_at": captured["time"]}
         snapshot["actions"] = conn.execute("""
             SELECT action_id, wakeup_event_id, subject_key, operation, created_at,
                    canonical_context->>'recipient_phone' AS phone,
@@ -283,16 +286,20 @@ async def replay(snapshot, dsn):
                 async with conn.cursor(row_factory=dict_row) as cursor:
                     visible_actions = await (await cursor.execute("SELECT * FROM outbound_actions")).fetchall()
                 expected = expected_decision(action, visible_actions, visible)
-                kwargs = dict(
-                    recipient_key=action["subject_key"],
-                    channel_id=action["channel_id"],
-                    wakeup_event_id=action["wakeup_event_id"],
-                    action_id=UUID(action["action_id"]),
-                    override=False,
-                    logger=logging.getLogger("historical-replay"),
-                )
-                before = await check_traffic(old, **kwargs)
-                after = await check_traffic(fixed, **kwargs)
+
+                async def verdict(probe, action):
+                    return await check_traffic(
+                        probe,
+                        recipient_key=action["subject_key"],
+                        channel_id=action["channel_id"],
+                        wakeup_event_id=action["wakeup_event_id"],
+                        action_id=UUID(action["action_id"]),
+                        override=False,
+                        logger=logging.getLogger("historical-replay"),
+                    )
+
+                before = await verdict(old, action)
+                after = await verdict(fixed, action)
                 bounds.append(
                     {
                         "at": at,
@@ -348,7 +355,7 @@ def main():
     snapshot = json.loads(args.snapshot.read_text())
     client = docker.from_env()
     container = client.containers.run(
-        "postgres:16", detach=True, remove=True, environment={"POSTGRES_HOST_AUTH_METHOD": "trust"}, ports={"5432/tcp": ("127.0.0.1", None)}
+        "postgres:16", detach=True, remove=True, environment={"POSTGRES_HOST_AUTH_METHOD": "trust"}, ports={"5432/tcp": ("127.0.0.1", 0)}
     )
     try:
         container.reload()

@@ -107,8 +107,15 @@ async def test_worker_delegates_tenantcloud_work_to_restate() -> None:
     service.reconcile.assert_not_called()
 
 
-def test_default_error_line_names_the_error(capsys):
-    OutboundWorker._default_error(UUID(int=7), "reconcile", KeyError("nigel-zoho"))
+@pytest.mark.asyncio
+async def test_default_error_line_names_the_error(capsys):
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(UUID(int=7), ActionState.UNKNOWN)]
+    service = AsyncMock()
+    service.reconcile.side_effect = KeyError("nigel-zoho")
+    worker = OutboundWorker(store=store, service=service)
+    assert await worker.run_once() == 1
     line = capsys.readouterr().out.strip()
     assert '"error_type": "KeyError"' in line
     assert "nigel-zoho" in line

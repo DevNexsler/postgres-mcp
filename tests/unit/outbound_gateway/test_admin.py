@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+from unittest.mock import Mock
+
 import pytest
 
-from postgres_mcp.outbound_gateway.admin import _run
+from postgres_mcp.outbound_gateway import admin
 from postgres_mcp.outbound_gateway.admin import build_parser
 
 
@@ -49,8 +52,7 @@ def test_admin_remediation_accepts_no_recipient_or_provider_override():
     assert not hasattr(args, "provider")
 
 
-@pytest.mark.asyncio
-async def test_admin_resolution_query_survives_literal_empty_json_object():
+def test_admin_resolution_query_survives_literal_empty_json_object(monkeypatch, capsys):
     class Row:
         cells = {"action_id": "00000000-0000-0000-0000-000000000001"}
 
@@ -78,4 +80,11 @@ async def test_admin_resolution_query_survives_literal_empty_json_object():
         ]
     )
 
-    assert str(await _run(args, Driver())) == "00000000-0000-0000-0000-000000000001"
+    monkeypatch.setenv("DATABASE_URI", "postgresql://unused/test")
+    monkeypatch.setattr(admin, "build_parser", lambda: Mock(parse_args=lambda: args))
+    pool = AsyncMock()
+    monkeypatch.setattr(admin, "DbConnPool", lambda uri: pool)
+    monkeypatch.setattr(admin, "SqlDriver", lambda **kwargs: Driver())
+    admin.main()
+    assert capsys.readouterr().out.strip() == "00000000-0000-0000-0000-000000000001"
+    pool.close.assert_awaited_once()

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -10,6 +12,10 @@ from uuid import UUID
 import pytest
 from starlette.testclient import TestClient
 
+from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
+from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
+from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
+from postgres_mcp.outbound_gateway.adapters.base import ProviderRequest
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.metrics import MetricSample
 from postgres_mcp.outbound_gateway.models import ActionRole
@@ -378,7 +384,7 @@ def _clean_tenantcloud_env(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def _write_stub_tenantcloud_modules(directory: Path, *, base_url_capture: list) -> None:
+def _write_stub_tenantcloud_modules(directory: Path, *, base_url_capture: list[str]) -> None:
     (directory / "tenantcloud_auth.py").write_text(
         """
 class HttpRunnerControl:
@@ -508,6 +514,7 @@ def test_tenantcloud_uses_the_hardcoded_literal_origin(tmp_path, monkeypatch):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("captured_client", module_dir / "tenantcloud_client.py")
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     # Re-importing the stub module from disk only proves the file's own
@@ -603,9 +610,9 @@ class _FakeInnerAdapter:
         self.validate_calls = []
         self.build_request_calls = []
         self.parse_receipt_calls = []
-        self.invoke_result = "invoke-result"
+        self.invoke_result = ProviderObservation(ProviderDisposition.ACCEPTED, "invoke-result")
         self.invoke_error: Exception | None = None
-        self.reconcile_result = "reconcile-result"
+        self.reconcile_result = ProviderObservation(ProviderDisposition.ACCEPTED, "reconcile-result")
         self.observed_thread_ident = None
 
     def validate(self, context):
@@ -613,11 +620,11 @@ class _FakeInnerAdapter:
 
     def build_request(self, context, action_uid):
         self.build_request_calls.append((context, action_uid))
-        return "built-request"
+        return ProviderRequest("test", "built-request", {})
 
     def parse_receipt(self, context, observation):
         self.parse_receipt_calls.append((context, observation))
-        return "receipt"
+        return ProviderReceipt("request", "message", datetime(2026, 1, 1, tzinfo=timezone.utc), {})
 
     async def invoke(self, client, request):
         import threading
@@ -644,7 +651,7 @@ async def test_thread_offloaded_adapter_runs_invoke_off_the_event_loop_and_retur
 
     result = await wrapped.invoke(client=None, request="req")
 
-    assert result == "invoke-result"
+    assert result is inner.invoke_result
     assert inner.observed_thread_ident is not None
     assert inner.observed_thread_ident != calling_thread
 
@@ -671,7 +678,8 @@ async def test_thread_offloaded_adapter_delegates_reconcile_and_sync_methods():
 
     assert inner.validate_calls == ["ctx"]
     assert inner.build_request_calls == [("ctx", "uid")]
-    assert request == "built-request"
+    assert request == ProviderRequest("test", "built-request", {})
     assert inner.parse_receipt_calls == [("ctx", "obs")]
-    assert receipt == "receipt"
-    assert reconciled == "reconcile-result"
+    assert receipt is not None
+    assert receipt.provider_message_id == "message"
+    assert reconciled is inner.reconcile_result

@@ -36,7 +36,7 @@ def traffic_database():
         detach=True,
         remove=True,
         environment={"POSTGRES_HOST_AUTH_METHOD": "trust"},
-        ports={"5432/tcp": ("127.0.0.1", None)},
+        ports={"5432/tcp": ("127.0.0.1", 0)},
     )
     try:
         container.reload()

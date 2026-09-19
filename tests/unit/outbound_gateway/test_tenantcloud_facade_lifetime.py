@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 import pytest
 
@@ -40,7 +42,7 @@ class _Facade:
     def __init__(self, clock: dict[str, Any], log: list[tuple[int, str]]) -> None:
         self._clock = clock
         self._log = log
-        self._used = 0
+        self.refresh_count = 0
         self._cached: str | None = None
 
     def _token(self) -> str:
@@ -49,9 +51,9 @@ class _Facade:
             return self._cached
         if now != LAPSE_AT:
             return f"tok@{(now // TOKEN_TTL) * TOKEN_TTL}"
-        if self._used >= 1:
+        if self.refresh_count >= 1:
             raise RuntimeError("authentication unavailable")
-        self._used += 1
+        self.refresh_count += 1
         self._cached = f"tok@{now}"
         return self._cached
 
@@ -62,6 +64,30 @@ class _Facade:
     def mark_lead_working(self, lead_id: object) -> Any:  # pragma: no cover
         self._log.append((self._clock["t"], self._token()))
         raise _Stop()
+
+    def send_message(self, thread_id: object, body: object) -> Any:
+        raise AssertionError("unexpected message write")
+
+    def create_maintenance_request(self, **kwargs: object) -> Any:
+        raise AssertionError("unexpected maintenance write")
+
+    def update_maintenance_status(self, request_id: object, status: object) -> Any:
+        raise AssertionError("unexpected maintenance update")
+
+    def reconcile_message(self, thread_id: object, body: object, *, source_turn_at: object, allow_late: bool = False) -> Any:
+        raise AssertionError("unexpected message reconciliation")
+
+    def resolve_lead_thread(self, lead_id: object) -> str | None:
+        raise AssertionError("unexpected thread resolution")
+
+    def bind_lead_message_observation(self, observation: Any, lead_id: object, resolved_thread_id: object) -> Any:
+        raise AssertionError("unexpected message observation")
+
+    def reconcile_maintenance_create(self, *, dispatched_after: object, **kwargs: object) -> Any:
+        raise AssertionError("unexpected maintenance reconciliation")
+
+    def reconcile_maintenance_status(self, request_id: object, status: object) -> Any:
+        raise AssertionError("unexpected maintenance reconciliation")
 
 
 def _request() -> Any:
@@ -116,8 +142,8 @@ def test_operations_do_not_share_an_auth_refresh_budget() -> None:
     _drive(adapter)
 
     assert len(made) == 2, "each operation must build its own facade"
-    assert all(f._used <= 1 for f in made)
-    assert [f._used for f in made] == [1, 1], "second operation could not refresh"
+    assert all(f.refresh_count <= 1 for f in made)
+    assert [f.refresh_count for f in made] == [1, 1], "second operation could not refresh"
 
 
 def test_one_operation_shares_a_single_facade() -> None:
@@ -212,7 +238,13 @@ def test_production_wiring_builds_a_facade_per_operation(monkeypatch: Any) -> No
     ):
         monkeypatch.setenv(name, value)
 
-    adapter = server_module._build_tenantcloud_adapter()
+    monkeypatch.setenv("DATABASE_URI", "postgresql://unused/test")
+    monkeypatch.setenv("OUTBOUND_ENABLED_OPERATIONS_JSON", '["tenantcloud.lead.status.update"]')
+    monkeypatch.setattr(server_module, "DbConnPool", Mock(return_value=AsyncMock()))
+    service_factory = Mock()
+    monkeypatch.setattr(server_module, "OutboundActionService", service_factory)
+    asyncio.run(server_module.build_runtime())
+    adapter = service_factory.call_args.kwargs["adapters"][Operation.TENANTCLOUD_LEAD_STATUS_UPDATE]
     _drive(adapter)
     _drive(adapter)
 
