@@ -390,6 +390,12 @@ class OutboundActionService:
         before this call) is deliberately NOT covered by this except clause
         and still raises, so a true pre-dispatch rejection keeps the error
         wrapper the reconciler depends on.
+
+        The corollary belongs to _dispatch(): a failure it can attribute to
+        itself, with no provider call made, must not arrive here wearing this
+        line's "outcome unknown" reading. _dispatch() therefore builds the
+        provider request before it claims the row, and terminalizes a request
+        it cannot build (_refuse_unbuildable_request) rather than raising.
         """
         try:
             if action.state is ActionState.DEPENDENCY_WAIT:
@@ -906,6 +912,24 @@ class OutboundActionService:
                 "provider_circuit_open",
             )
             return self._result(scheduled)
+        # Everything the send needs locally is assembled BEFORE the row is
+        # claimed and marked DISPATCHING, so that marker keeps meaning exactly
+        # one thing: a provider call is about to happen. build_request() is
+        # pure local validation plus argument assembly (adapters/*.py) and it
+        # raises on a context this gateway can never send -- an unconfigured
+        # sender account, an unverified target, a missing calendar account.
+        # Built after the transition, such a refusal landed on a row that was
+        # already durably DISPATCHING and so was indistinguishable from a
+        # provider call of unknown outcome: _dispatch_stage logged it as a
+        # post-dispatch exception and the row spent its whole retry budget on
+        # lease expiry before parking in manual_review with no usable error
+        # (wake 27065, 2026-09-16).
+        try:
+            if action.action_uid is None:
+                raise RuntimeError("prepared action has no deterministic action UID")
+            provider_request = adapter.build_request(context, action.action_uid)
+        except Exception as error:
+            return await self._refuse_unbuildable_request(action, context, adapter, error)
         claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         dispatching = await self._store.transition(
             claimed.action_id,
@@ -914,9 +938,6 @@ class OutboundActionService:
             self._lease_owner,
             ProviderObservation(ProviderDisposition.PENDING, "dispatch_started"),
         )
-        if dispatching.action_uid is None:
-            raise RuntimeError("prepared action has no deterministic action UID")
-        provider_request = adapter.build_request(context, dispatching.action_uid)
         observation = await adapter.invoke(self._provider_client, provider_request)
         if observation.provider_request_ref:
             dispatching = await self._store.record_provider_request(
@@ -940,6 +961,41 @@ class OutboundActionService:
                     provider_call_id=observation.provider_call_id,
                 )
         return await self._finish_observation(dispatching, context, adapter, observation)
+
+    async def _refuse_unbuildable_request(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        adapter: ProviderAdapter,
+        error: Exception,
+    ) -> PublicResult:
+        """Terminalize an action whose provider request cannot be built.
+
+        No provider call has happened, and none can: build_request() is
+        deterministic in the action's own context, so every later attempt
+        would fail the same way. Fail it definitively -- the same
+        DEFINITIVE_NON_ACCEPTANCE path a provider rejection takes, which
+        releases the intent lock and hands the caller the reason -- instead
+        of feeding it to the ambiguity machinery that exists for sends whose
+        outcome is genuinely unknown.
+        """
+        logger.error(
+            "cannot build provider request for wake %s action %s -- no provider call was made, failing the action definitively: %s",
+            context.wakeup_event_id,
+            action.action_id,
+            error,
+            exc_info=True,
+        )
+        return await self._finish_observation(
+            action,
+            context,
+            adapter,
+            ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                "provider_request_unbuildable",
+                category="provider_request_invalid",
+            ),
+        )
 
     async def _finish_observation(
         self,
