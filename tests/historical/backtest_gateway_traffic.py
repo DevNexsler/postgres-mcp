@@ -62,7 +62,7 @@ def capture(path):
         conn.execute("SET LOCAL statement_timeout='60s'")
         snapshot = {"captured_at": conn.execute("SELECT now() AS time").fetchone()["time"]}
         snapshot["actions"] = conn.execute("""
-            SELECT action_id, wakeup_event_id, subject_key, operation, created_at,
+            SELECT action_id, retry_of_action_id, wakeup_event_id, subject_key, operation, created_at,
                    canonical_context->>'recipient_phone' AS phone,
                    (canonical_context->>'channel_id')::bigint AS channel_id,
                    dispatch_started_at, state, detail_code, provenance
@@ -158,6 +158,14 @@ def old_repository():
 
 
 async def load_snapshot(conn, snapshot):
+    # Old captures lost lineage; silently filling NULL would misclassify retries.
+    action_ids = {str(a["action_id"]) for a in snapshot["actions"]}
+    for action in snapshot["actions"]:
+        if "retry_of_action_id" not in action:
+            raise ValueError("Snapshot lacks retry lineage; recapture from the source database")
+        parent = action["retry_of_action_id"]
+        if parent is not None and str(parent) not in action_ids:
+            raise ValueError("Snapshot lacks a retry ancestor; recapture from the source database")
     # Applies only to disposable replay DB. Statistics keep temporal views fast.
     await conn.execute("SET jit=off")
     await conn.execute("""
@@ -165,7 +173,7 @@ async def load_snapshot(conn, snapshot):
         INSERT INTO replay_clock VALUES ('2000-01-01');
         CREATE TABLE action_history (
             action_id uuid PRIMARY KEY, subject_key text, operation text,
-            created_at timestamptz, canonical_context jsonb, dispatch_started_at timestamptz
+            created_at timestamptz, canonical_context jsonb, dispatch_started_at timestamptz, retry_of_action_id uuid
         );
         CREATE TABLE attempt_history (
             attempt_id bigint PRIMARY KEY, action_id uuid, created_at timestamptz, to_state text
@@ -180,7 +188,7 @@ async def load_snapshot(conn, snapshot):
             SELECT m.*, m.id AS raw_event_id, 'historical message'::text AS body
             FROM message_history m, replay_clock c WHERE m.created_at<=c.at;
         CREATE VIEW outbound_actions AS
-            SELECT a.action_id,a.subject_key,a.operation,a.created_at,a.canonical_context,
+            SELECT a.action_id,a.subject_key,a.operation,a.created_at,a.canonical_context,a.retry_of_action_id,
                    '{}'::jsonb AS arguments,
                    coalesce(t.to_state,'received') AS state,
                    CASE WHEN a.dispatch_started_at<=c.at THEN a.dispatch_started_at END AS dispatch_started_at
@@ -194,9 +202,17 @@ async def load_snapshot(conn, snapshot):
     """)
     async with conn.cursor() as cursor:
         await cursor.executemany(
-            "INSERT INTO action_history VALUES (%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO action_history VALUES (%s,%s,%s,%s,%s,%s,%s)",
             [
-                (a["action_id"], a["subject_key"], a["operation"], a["created_at"], Jsonb({"recipient_phone": a["phone"]}), a["dispatch_started_at"])
+                (
+                    a["action_id"],
+                    a["subject_key"],
+                    a["operation"],
+                    a["created_at"],
+                    Jsonb({"recipient_phone": a["phone"]}),
+                    a["dispatch_started_at"],
+                    a["retry_of_action_id"],
+                )
                 for a in snapshot["actions"]
             ],
         )
@@ -225,7 +241,17 @@ def expected_decision(action, visible_actions, messages):
     others = [a for a in visible_actions if str(a["action_id"]) != action["action_id"] and a["subject_key"] == action["subject_key"]]
     if any(a["state"] in active for a in others):
         return "lease_held"
-    if any(a["created_at"] > action["watermark"] and (a["dispatch_started_at"] or a["state"] == "completed") for a in others):
+    # Retry ancestry is not new outbound activity. Active leases still win above.
+    by_id = {str(a["action_id"]): a for a in visible_actions}
+    lineage = set()
+    ancestor_id = str(action["action_id"])
+    while ancestor_id in by_id and ancestor_id not in lineage:
+        lineage.add(ancestor_id)
+        ancestor_id = str(by_id[ancestor_id]["retry_of_action_id"])
+    if any(
+        str(a["action_id"]) not in lineage and a["created_at"] > action["watermark"] and (a["dispatch_started_at"] or a["state"] == "completed")
+        for a in others
+    ):
         return "stale_context"
     if action["operation"] != "quo.sms.send":
         return "stale_context" if messages else "pass"
