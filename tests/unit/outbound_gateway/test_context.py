@@ -528,6 +528,7 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
     event = tenantcloud_record(
         family="maintenance",
         entity_ids={"request_id": "81"},
+        entity_scope_key="tenantcloud:maintenance-request:81",
         source_channel_id="tenantcloud:maintenance-request:81",
         channel_type="tenantcloud_maintenance",
         participant_type=None,
@@ -545,11 +546,99 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
         },
     )
 
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(
-        tenantcloud_request("tenantcloud.maintenance.status.update")
+    context = await ActionContextLoader(
+        FakeRepository(event, canonical_subject=None),
+        policy(),
+    ).load(tenantcloud_request("tenantcloud.maintenance.status.update"))
+
+    assert context.prospect_id == "tenantcloud:maintenance-request:81"
+    assert "tenantcloud:claim:301" in context.aliases
+    assert "tenantcloud:maintenance-request:81" in context.aliases
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_claims_on_one_lead_share_durable_scope_aliases():
+    """#2985: each TenantCloud claim used to mint prospect_id=tenantcloud:claim:<id>
+    with that claim as its only alias, so acquire_outbound_intent_lock could never
+    fold two claims of one lead onto one subject. Register the durable
+    entity_scope_key and the claim handle together (plus any contact address) so
+    the existing alias table folds them. Production evidence: lead 2440054 held
+    claims 545 and 550 as singleton subjects."""
+
+    def claim_wake(claim_id: int, *, email: str | None = None):
+        message = {"direct_email": email} if email else {}
+        return tenantcloud_record(
+            tenantcloud_claim_id=claim_id,
+            entity_scope_key="tenantcloud:lead:2440054",
+            source_event_id=f"tenantcloud:claim:{claim_id}",
+            participant_type=None,
+            participant_key=None,
+            envelope={
+                "identity": {},
+                "message": message,
+                "tenantcloud": {
+                    "claim_id": claim_id,
+                    "action_owner": "tenantcloud_api",
+                    "claim_state": "claimed",
+                    "event_family": "lead",
+                    "entity_ids": {"lead_id": "2440054", "thread_id": "8001"},
+                },
+            },
+        )
+
+    first = await ActionContextLoader(
+        FakeRepository(claim_wake(545), canonical_subject=None),
+        policy(),
+    ).load(tenantcloud_request("tenantcloud.message.send"))
+    second = await ActionContextLoader(
+        FakeRepository(claim_wake(550, email="pariss73@gmail.com"), canonical_subject=None),
+        policy(),
+    ).load(tenantcloud_request("tenantcloud.message.send"))
+
+    assert first.prospect_id == second.prospect_id == "tenantcloud:lead:2440054"
+    assert "tenantcloud:lead:2440054" in first.aliases
+    assert "tenantcloud:claim:545" in first.aliases
+    assert "tenantcloud:claim:550" in second.aliases
+    assert "email:pariss73@gmail.com" in second.aliases
+    # Contact address is optional glue; the durable scope alone must fold.
+    assert first.aliases != second.aliases
+    assert set(first.aliases) & set(second.aliases) == {"tenantcloud:lead:2440054"}
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_entity_scope_falls_back_to_envelope_when_claim_row_key_is_absent():
+    """#2985 names envelope.tenantcloud.entity_scope_key as the durable
+    scope. Production usually also joins it onto the claim row, but a wake
+    that only carries the envelope key must still mint tenantcloud:lead:<id>
+    rather than tenantcloud:claim:<id>."""
+    event = tenantcloud_record(
+        tenantcloud_claim_id=564,
+        entity_scope_key=None,
+        participant_type=None,
+        participant_key=None,
+        envelope={
+            "identity": {},
+            "message": {},
+            "tenantcloud": {
+                "claim_id": 564,
+                "action_owner": "tenantcloud_api",
+                "claim_state": "claimed",
+                "event_family": "lead",
+                "entity_ids": {"lead_id": "1839860", "thread_id": "8001"},
+                "entity_scope_key": "tenantcloud:lead:1839860",
+            },
+        },
     )
 
-    assert context.prospect_id == "tenantcloud:claim:301"
+    context = await ActionContextLoader(
+        FakeRepository(event, canonical_subject=None),
+        policy(),
+    ).load(tenantcloud_request("tenantcloud.message.send"))
+
+    assert context.prospect_id == "tenantcloud:lead:1839860"
+    assert "tenantcloud:lead:1839860" in context.aliases
+    assert "tenantcloud:claim:564" in context.aliases
+    assert context.canonical_context["tenantcloud_entity_scope_key"] == "tenantcloud:lead:1839860"
 
 
 @pytest.mark.asyncio

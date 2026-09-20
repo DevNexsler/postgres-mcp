@@ -89,7 +89,16 @@ def context():
     )
 
 
-def provider_context(operation, arguments, target, *, claim_id=301, source_event_id="tenantcloud:claim:301", desired_hash="d" * 64):
+def provider_context(
+    operation,
+    arguments,
+    target,
+    *,
+    claim_id=301,
+    source_event_id="tenantcloud:claim:301",
+    desired_hash="d" * 64,
+    entity_scope_key="",
+):
     intent = {
         Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: IntentKind.TENANTCLOUD_LEAD_STATUS,
         Operation.TENANTCLOUD_MAINTENANCE_CREATE: IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
@@ -108,6 +117,7 @@ def provider_context(operation, arguments, target, *, claim_id=301, source_event
             {
                 "identity_version": "v1",
                 "tenantcloud_claim_id": claim_id,
+                "tenantcloud_entity_scope_key": entity_scope_key,
                 "source_event_id": source_event_id,
                 "operation_target": {"kind": target.kind, "target_id": target.target_id},
                 **({"provider_ids": {"property_id": "12", "unit_id": "34"}} if operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE else {}),
@@ -292,6 +302,27 @@ async def test_provider_status_lock_has_versioned_claim_source_target_and_desire
 
 
 @pytest.mark.asyncio
+async def test_provider_status_lock_keys_on_durable_entity_scope_when_present():
+    """#2985: once claims of one lead share a subject, the lock must also drop
+    claim/source uniqueness or duplicate-send protection still cannot see
+    across two wakes. Scope + op + target + desired state is the durable key;
+    empty slot + existing 86400s completed_block still applies."""
+    subject = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "6001", True),
+        entity_scope_key="tenantcloud:lead:2440054",
+    )
+
+    lock_intent = await prepared_lock_intent(subject)
+
+    assert lock_intent == (
+        "v1:scope:tenantcloud:lead:2440054:op:tenantcloud.lead.status.update:target:6001:state:" + "d" * 64
+    )
+    assert "claim:301" not in lock_intent
+
+
+@pytest.mark.asyncio
 async def test_provider_status_lock_omits_claim_segment_without_a_literal_none_when_claim_is_absent():
     """context.py stores "" (not None) for tenantcloud_claim_id when a wake
     has no TenantCloud claim linkage -- confirm prepare() consumes that
@@ -370,7 +401,32 @@ async def test_provider_lock_changes_for_desired_state_and_distinct_wake_identit
 
     assert same_key == base_key
     assert changed_key != base_key
+    # Without a durable scope, claim/source remain part of the lock identity.
     assert distinct_key != base_key
+
+
+@pytest.mark.asyncio
+async def test_provider_lock_collides_across_claims_of_one_durable_scope():
+    """Same desired state on two claims of one lead must share the lock key so
+    the completed-block window can suppress the duplicate send."""
+    first = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "2440054", True),
+        claim_id=545,
+        source_event_id="tenantcloud:claim:545",
+        entity_scope_key="tenantcloud:lead:2440054",
+    )
+    second = provider_context(
+        Operation.TENANTCLOUD_LEAD_STATUS_UPDATE,
+        {"status": "working"},
+        DerivedTarget("tenantcloud_lead", "2440054", True),
+        claim_id=550,
+        source_event_id="tenantcloud:claim:550",
+        entity_scope_key="tenantcloud:lead:2440054",
+    )
+
+    assert await prepared_lock_intent(first) == await prepared_lock_intent(second)
 
 
 @pytest.mark.asyncio
@@ -384,6 +440,28 @@ async def test_tenantcloud_message_keeps_existing_reply_lock_identity():
     )
 
     assert await prepared_lock_intent(subject) == "inquiry_reply:turn:700"
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_replies_on_one_lead_stay_turn_keyed():
+    """#2985 slot decision: sharing a lead subject must not make two replies
+    to different inbound messages collide inside p_completed_block_seconds.
+    Replies stay keyed on source_message_id; provider mutations are the
+    ones that share the durable-scope lock."""
+    first = replace(
+        context(),
+        operation=Operation.TENANTCLOUD_MESSAGE_SEND,
+        intent_kind=IntentKind.INQUIRY_REPLY,
+        appointment_slot=None,
+        prospect_id="tenantcloud:lead:2440054",
+        aliases=("tenantcloud:lead:2440054", "tenantcloud:claim:545"),
+        arguments=MappingProxyType({"text": "Reply"}),
+        source_message_id=545,
+    )
+    second = replace(first, source_message_id=550, aliases=("tenantcloud:lead:2440054", "tenantcloud:claim:550"))
+
+    assert await prepared_lock_intent(first) == "inquiry_reply:turn:545"
+    assert await prepared_lock_intent(second) == "inquiry_reply:turn:550"
 
 
 @pytest.mark.asyncio

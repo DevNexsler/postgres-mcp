@@ -153,7 +153,17 @@ class PostgresActionStore:
             claim_id = context.canonical_context["tenantcloud_claim_id"]
             source_id = context.canonical_context["source_event_id"]
             desired_hash = context.canonical_scope["desired_state_hash"]
-            prefix = f"v1:claim:{claim_id}:source:{source_id}:op:{context.operation.value}:target:{context.target.target_id}"
+            # Prefer the durable entity scope over the claim handle so two
+            # claims of one lead with the same desired state share one intent
+            # lock (and collide inside p_completed_block_seconds). Prospect
+            # replies take the turn-keyed branch above and do not reach here,
+            # so two replies to different inbound messages on the same lead
+            # still each get their own lock.
+            scope_key = str(context.canonical_context.get("tenantcloud_entity_scope_key") or "").strip()
+            if scope_key:
+                prefix = f"v1:scope:{scope_key}:op:{context.operation.value}:target:{context.target.target_id}"
+            else:
+                prefix = f"v1:claim:{claim_id}:source:{source_id}:op:{context.operation.value}:target:{context.target.target_id}"
             if context.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
                 provider_ids = context.canonical_context["provider_ids"]
                 normalized_text_hash = sha256(str(context.arguments["text"]).encode("utf-8")).hexdigest()
