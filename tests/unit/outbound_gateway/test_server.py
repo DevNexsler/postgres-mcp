@@ -24,6 +24,7 @@ from postgres_mcp.outbound_gateway.server import TENANTCLOUD_ORIGIN
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
 from postgres_mcp.outbound_gateway.server import _reject_tenantcloud_origin_overrides
+from postgres_mcp.outbound_gateway.server import _require_sender_domains_for_accounts
 from postgres_mcp.outbound_gateway.server import _tenantcloud_adapters
 from postgres_mcp.outbound_gateway.server import _tenantcloud_enabled
 from postgres_mcp.outbound_gateway.server import _ThreadOffloadedAdapter
@@ -43,6 +44,47 @@ def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
     }
     assert DEFAULT_PROPERTY_ALIASES["138 bullman street 144 a"] == "building:bullman-st"
     assert DEFAULT_PROPERTY_ALIASES["144 bullman street"] == "building:bullman-st"
+
+
+def test_startup_refuses_email_account_missing_from_sender_domains():
+    """#2677: OUTBOUND_EMAIL_ACCOUNTS_JSON must not name an account absent from
+    OUTBOUND_EMAIL_SENDER_DOMAINS_JSON. Pre-fix the gateway started healthy and
+    only failed at EmailAdapter.validate with 'email sender domain is not
+    configured' on a real wake."""
+    with pytest.raises(ValueError, match=r"typo-zoho"):
+        _require_sender_domains_for_accounts(
+            referenced_accounts={"zillow": "typo-zoho", "hotpads": "nigel-zoho"},
+            sender_domains=DEFAULT_EMAIL_SENDER_DOMAINS,
+            source="OUTBOUND_EMAIL_ACCOUNTS_JSON",
+        )
+
+
+def test_startup_refuses_calendar_account_missing_from_sender_domains():
+    """Calendar routes through the same Agent Email account ids; cover that map."""
+    with pytest.raises(ValueError, match=r"orphan-cal"):
+        _require_sender_domains_for_accounts(
+            referenced_accounts={"appointment-setter": "orphan-cal"},
+            sender_domains=DEFAULT_EMAIL_SENDER_DOMAINS,
+            source="calendar account mapping",
+        )
+
+
+def test_startup_accepts_production_default_email_and_calendar_accounts():
+    _require_sender_domains_for_accounts(
+        referenced_accounts={
+            "zillow": "nigel-zoho",
+            "hotpads": "nigel-zoho",
+            "tenantcloud": "nigel-zoho",
+            "zoho_mail": "nigel-zoho",
+        },
+        sender_domains=DEFAULT_EMAIL_SENDER_DOMAINS,
+        source="OUTBOUND_EMAIL_ACCOUNTS_JSON",
+    )
+    _require_sender_domains_for_accounts(
+        referenced_accounts={"appointment-setter": "nigel-zoho"},
+        sender_domains=DEFAULT_EMAIL_SENDER_DOMAINS,
+        source="calendar account mapping",
+    )
 
 
 def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):

@@ -15,6 +15,8 @@ from datetime import timezone
 from types import ModuleType
 from typing import Any
 from typing import Coroutine
+from typing import Iterable
+from typing import Mapping
 from uuid import uuid5
 
 from mcp.server.fastmcp import FastMCP
@@ -502,6 +504,38 @@ def _tenantcloud_adapters(enabled_operations: frozenset[Operation]) -> dict[Oper
     return {operation: adapter for operation in TENANTCLOUD_OPERATIONS}
 
 
+def _require_sender_domains_for_accounts(
+    *,
+    referenced_accounts: Mapping[str, str] | Iterable[str],
+    sender_domains: Mapping[str, str],
+    source: str,
+) -> None:
+    """Fail closed when a routed Agent Email account has no sender domain.
+
+    OUTBOUND_EMAIL_ACCOUNTS_JSON (provider -> account) and
+    OUTBOUND_EMAIL_SENDER_DOMAINS_JSON (account -> domain) are independent env
+    maps. Without this check the gateway starts healthy and only discovers a
+    typo when EmailAdapter.validate raises at send time (#2677). Calendar
+    account ids use the same Agent Email account namespace, so they get the
+    same coverage.
+    """
+    accounts = (
+        referenced_accounts.values()
+        if isinstance(referenced_accounts, Mapping)
+        else referenced_accounts
+    )
+    missing = sorted(
+        {account for account in accounts if account and account not in sender_domains}
+    )
+    if not missing:
+        return
+    named = ", ".join(repr(account) for account in missing)
+    raise ValueError(
+        f"email sender domain is not configured for account(s) {named} "
+        f"referenced by {source}; add each account to OUTBOUND_EMAIL_SENDER_DOMAINS_JSON"
+    )
+
+
 async def build_runtime() -> GatewayRuntime:
     database_uri = os.environ.get("DATABASE_URI")
     if not database_uri:
@@ -592,6 +626,16 @@ async def build_runtime() -> GatewayRuntime:
         DEFAULT_EMAIL_CC_BY_SOURCE,
     )
     calendar_accounts = {routing.calendar_by_profile["appointment-setter"]: routing.calendar_account_by_profile["appointment-setter"]}
+    _require_sender_domains_for_accounts(
+        referenced_accounts=routing.email_account_by_provider,
+        sender_domains=email_domains,
+        source="OUTBOUND_EMAIL_ACCOUNTS_JSON",
+    )
+    _require_sender_domains_for_accounts(
+        referenced_accounts=routing.calendar_account_by_profile,
+        sender_domains=email_domains,
+        source="calendar account mapping",
+    )
     adapters = {
         Operation.EMAIL_SEND: EmailAdapter(
             sender_domains=email_domains,
