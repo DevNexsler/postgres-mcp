@@ -540,9 +540,9 @@ async def build_runtime() -> GatewayRuntime:
     database_uri = os.environ.get("DATABASE_URI")
     if not database_uri:
         raise ValueError("DATABASE_URI is required")
-    pool = DbConnPool(database_uri)
-    await pool.pool_connect()
-    driver = SqlDriver(conn=pool)
+    # Resolve and cross-check routing maps before opening a DB pool so a
+    # config typo fails the deploy instead of waiting on connectivity and
+    # only surfacing on a real wake (#2677).
     policy = FeaturePolicy(
         writes_enabled=_bool("OUTBOUND_GATEWAY_WRITES_ENABLED", False),
         kill_switch=_bool("OUTBOUND_GATEWAY_KILL_SWITCH", True),
@@ -572,6 +572,32 @@ async def build_runtime() -> GatewayRuntime:
         ),
         conversation_aliases=_json_mapping("OUTBOUND_CONVERSATION_ALIASES_JSON", {}),
     )
+    email_domains = _json_mapping(
+        "OUTBOUND_EMAIL_SENDER_DOMAINS_JSON",
+        {
+            "nigel-zoho": os.environ.get(
+                "OUTBOUND_DEFAULT_EMAIL_DOMAIN",
+                DEFAULT_EMAIL_SENDER_DOMAINS["nigel-zoho"],
+            )
+        },
+    )
+    email_cc_by_source = _json_mapping(
+        "OUTBOUND_EMAIL_CC_BY_SOURCE_JSON",
+        DEFAULT_EMAIL_CC_BY_SOURCE,
+    )
+    _require_sender_domains_for_accounts(
+        referenced_accounts=routing.email_account_by_provider,
+        sender_domains=email_domains,
+        source="OUTBOUND_EMAIL_ACCOUNTS_JSON",
+    )
+    _require_sender_domains_for_accounts(
+        referenced_accounts=routing.calendar_account_by_profile,
+        sender_domains=email_domains,
+        source="calendar account mapping",
+    )
+    pool = DbConnPool(database_uri)
+    await pool.pool_connect()
+    driver = SqlDriver(conn=pool)
     context_repository = OutboundGatewayRepository(driver)
     store = PostgresActionStore(driver)
     observability = GatewayObservability(
@@ -612,30 +638,7 @@ async def build_runtime() -> GatewayRuntime:
             ),
         }
     )
-    email_domains = _json_mapping(
-        "OUTBOUND_EMAIL_SENDER_DOMAINS_JSON",
-        {
-            "nigel-zoho": os.environ.get(
-                "OUTBOUND_DEFAULT_EMAIL_DOMAIN",
-                DEFAULT_EMAIL_SENDER_DOMAINS["nigel-zoho"],
-            )
-        },
-    )
-    email_cc_by_source = _json_mapping(
-        "OUTBOUND_EMAIL_CC_BY_SOURCE_JSON",
-        DEFAULT_EMAIL_CC_BY_SOURCE,
-    )
     calendar_accounts = {routing.calendar_by_profile["appointment-setter"]: routing.calendar_account_by_profile["appointment-setter"]}
-    _require_sender_domains_for_accounts(
-        referenced_accounts=routing.email_account_by_provider,
-        sender_domains=email_domains,
-        source="OUTBOUND_EMAIL_ACCOUNTS_JSON",
-    )
-    _require_sender_domains_for_accounts(
-        referenced_accounts=routing.calendar_account_by_profile,
-        sender_domains=email_domains,
-        source="calendar account mapping",
-    )
     adapters = {
         Operation.EMAIL_SEND: EmailAdapter(
             sender_domains=email_domains,
