@@ -1041,12 +1041,16 @@ class OutboundActionService:
             context = await self._context_loader.load(action.execute_request())
         except ContextDerivationError:
             return None, "persisted_context_unavailable"
-        if action.retry_of_action_id is not None:
-            context = dataclass_replace(
-                context,
-                action_id=action.action_id,
-                lock_holder=f"outbound-gateway:{action.action_id}",
-            )
+        # Persistence owns action identity. Context derivation still emits the
+        # client-side v1 UUID formula, while create_or_load may mint a different
+        # durable id (v2-internal qualification, remediation successors). Align
+        # identity before comparing immutable payload fields so resume/prepare
+        # do not reject database-owned rows that execute already accepted.
+        context = dataclass_replace(
+            context,
+            action_id=action.action_id,
+            lock_holder=f"outbound-gateway:{action.action_id}",
+        )
         if not action.payload_hash:
             return context, "context_verified"
         expected_recipient = {
