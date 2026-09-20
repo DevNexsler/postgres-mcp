@@ -472,12 +472,8 @@ async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_c
     current_context = replace(
         context(),
         prospect_id=current_prospect,
-        canonical_context=MappingProxyType(
-            {"identity_version": "v1", "prospect_id": current_prospect}
-        ),
-        canonical_scope=MappingProxyType(
-            {"version": "v1", "prospect_id": current_prospect}
-        ),
+        canonical_context=MappingProxyType({"identity_version": "v1", "prospect_id": current_prospect}),
+        canonical_scope=MappingProxyType({"version": "v1", "prospect_id": current_prospect}),
     )
     payload_hash = canonical_payload_hash(
         {
@@ -508,9 +504,7 @@ async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_c
             routing_policy_version="v1",
         )
     )
-    store.create_or_load = AsyncMock(
-        side_effect=RuntimeError("outbound action payload mismatch")
-    )
+    store.create_or_load = AsyncMock(side_effect=RuntimeError("outbound action payload mismatch"))
     adapter = FakeAdapter()
     gateway = service(store, adapter)
     gateway._context_loader.load.return_value = current_context
@@ -1371,12 +1365,8 @@ async def test_worker_accepts_one_way_durable_subject_alias_promotion():
     current_context = replace(
         context(),
         prospect_id=current_prospect,
-        canonical_context=MappingProxyType(
-            {"identity_version": "v1", "prospect_id": current_prospect}
-        ),
-        canonical_scope=MappingProxyType(
-            {"version": "v1", "prospect_id": current_prospect}
-        ),
+        canonical_context=MappingProxyType({"identity_version": "v1", "prospect_id": current_prospect}),
+        canonical_scope=MappingProxyType({"version": "v1", "prospect_id": current_prospect}),
     )
     payload_hash = canonical_payload_hash(
         {

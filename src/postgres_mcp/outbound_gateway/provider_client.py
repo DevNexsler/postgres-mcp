@@ -151,8 +151,4 @@ def _contains_http_auth_rejection(error: BaseException) -> bool:
     response = getattr(error, "response", None)
     if getattr(response, "status_code", None) in {401, 403}:
         return True
-    return any(
-        _contains_http_auth_rejection(child)
-        for child in getattr(error, "exceptions", ())
-        if isinstance(child, BaseException)
-    )
+    return any(_contains_http_auth_rejection(child) for child in getattr(error, "exceptions", ()) if isinstance(child, BaseException))

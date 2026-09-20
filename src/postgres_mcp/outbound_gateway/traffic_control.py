@@ -4,6 +4,7 @@ Pure decision logic over a small probe interface. Fail-open on probe
 malfunction: a broken check must never stop outbound traffic (the kill
 switch is the only fail-closed control). A check that RUNS and FIRES
 blocks normally."""
+
 from __future__ import annotations
 
 import logging
@@ -41,9 +42,7 @@ class TrafficVerdict:
 
 
 class TrafficProbe(Protocol):
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]: ...
+    async def in_flight_actions(self, recipient_key: str, exclude_action_id: UUID) -> list[InFlightAction]: ...
 
     async def newest_activity_after(
         self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
@@ -59,9 +58,7 @@ VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
 
 
 _PASS = TrafficVerdict(allowed=True, reason="pass", detail="", check_failed=False)
-_FAIL_OPEN = TrafficVerdict(
-    allowed=True, reason="gate_check_failed", detail="", check_failed=True
-)
+_FAIL_OPEN = TrafficVerdict(allowed=True, reason="gate_check_failed", detail="", check_failed=True)
 
 
 async def check_traffic(
@@ -77,9 +74,7 @@ async def check_traffic(
     try:
         in_flight = await probe.in_flight_actions(recipient_key, action_id)
     except Exception:
-        logger.warning(
-            "traffic control check failed (in_flight) for %s", recipient_key, exc_info=True
-        )
+        logger.warning("traffic control check failed (in_flight) for %s", recipient_key, exc_info=True)
         return _FAIL_OPEN
     if in_flight:
         other = in_flight[0]
@@ -89,7 +84,7 @@ async def check_traffic(
             detail=(
                 f"Another send to this recipient is in flight: action {other.action_id} "
                 f"({other.operation}, state {other.state}, started {other.created_at.isoformat()}): "
-                f"\"{other.preview}\". Wait for it to reach a terminal state, then re-check "
+                f'"{other.preview}". Wait for it to reach a terminal state, then re-check '
                 f"the thread before sending."
             ),
             check_failed=False,
@@ -125,15 +120,11 @@ async def check_traffic(
     try:
         watermark = await probe.context_watermark(wakeup_event_id)
         if watermark is None:
-            logger.warning(
-                "traffic control check failed (no watermark) for wake %s", wakeup_event_id
-            )
+            logger.warning("traffic control check failed (no watermark) for wake %s", wakeup_event_id)
             return _FAIL_OPEN
         newer = await probe.newest_activity_after(recipient_key, channel_id, watermark, action_id)
     except Exception:
-        logger.warning(
-            "traffic control check failed (staleness) for %s", recipient_key, exc_info=True
-        )
+        logger.warning("traffic control check failed (staleness) for %s", recipient_key, exc_info=True)
         return _FAIL_OPEN
     if newer is None:
         return _PASS
@@ -143,7 +134,7 @@ async def check_traffic(
         reason="stale_context",
         detail=(
             f"New {newer.direction} activity since your context was built: {ref} via "
-            f"{newer.source} at {newer.occurred_at.isoformat()}: \"{newer.preview}\". "
+            f'{newer.source} at {newer.occurred_at.isoformat()}: "{newer.preview}". '
             f"Re-read the thread and skip if your message is now redundant, or resend "
             f"with override=true if it is still needed."
         ),

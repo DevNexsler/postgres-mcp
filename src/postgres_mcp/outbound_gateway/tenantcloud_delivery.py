@@ -169,10 +169,7 @@ class TenantCloudDeliveryCoordinator:
 
         if action.state is ActionState.RECEIVED:
             result = await self._service.prepare(action_id)
-            if (
-                result.status is PublicStatus.PENDING
-                and getattr(result, "detail", None) in _CONTEXT_WAIT_DETAILS
-            ):
+            if result.status is PublicStatus.PENDING and getattr(result, "detail", None) in _CONTEXT_WAIT_DETAILS:
                 return DeliveryResult(
                     DeliveryPhase.WAIT,
                     result.detail,
@@ -296,11 +293,7 @@ def build_restate_app(coordinator: TenantCloudDeliveryCoordinator):
 
     @workflow.main(workflow_retention=timedelta(days=30))
     async def deliver(ctx: Any, payload: object) -> dict[str, object]:
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"action_id"}
-            or payload.get("action_id") != ctx.key()
-        ):
+        if not isinstance(payload, dict) or set(payload) != {"action_id"} or payload.get("action_id") != ctx.key():
             raise restate.TerminalError("action_id must equal workflow key", status_code=400)
         try:
             action_id = UUID(ctx.key())

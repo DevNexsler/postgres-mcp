@@ -127,9 +127,7 @@ async def handle_outbound_action(
             hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
         elif location.endswith("operation"):
             hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
-        raise ValueError(
-            f"invalid outbound action request: {location}: {first['msg']}{hint}"
-        ) from exc
+        raise ValueError(f"invalid outbound action request: {location}: {first['msg']}{hint}") from exc
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
@@ -212,7 +210,7 @@ def create_server(
             "TenantCloud action. You choose the target id (to_address, to_phone, "
             "channel_or_chat_id, calendar_id, thread_id, lead_id, etc.) as part of "
             "arguments -- it is never derived from wakeup_event_id for you. Use suggest "
-            "({\"op\": \"suggest\", \"wakeup_event_id\"}) to ask what the wake implies "
+            '({"op": "suggest", "wakeup_event_id"}) to ask what the wake implies '
             "-- it returns advisory target ids drawn from the wake, never blocks, and "
             "stays reachable even when writes are disabled. Its answer is a suggestion "
             "only: you may pass any target id you like to execute, including ones that "
@@ -297,8 +295,6 @@ def _enabled_operations() -> frozenset[Operation]:
         raise ValueError("OUTBOUND_ENABLED_OPERATIONS_JSON contains an unsupported operation") from exc
 
 
-
-
 def _traffic_mode() -> str:
     raw = os.environ.get("OUTBOUND_TRAFFIC_CONTROL", "shadow").casefold()
     if raw not in VALID_TRAFFIC_MODES:
@@ -319,8 +315,7 @@ def _reject_tenantcloud_origin_overrides() -> None:
     present = sorted(name for name in _TENANTCLOUD_ORIGIN_OVERRIDE_ENV_VARS if os.environ.get(name))
     if present:
         raise ValueError(
-            "TenantCloud API origin is a fixed literal (" + TENANTCLOUD_ORIGIN + "); "
-            "unsupported override variable(s) set: " + ", ".join(present)
+            "TenantCloud API origin is a fixed literal (" + TENANTCLOUD_ORIGIN + "); unsupported override variable(s) set: " + ", ".join(present)
         )
 
 

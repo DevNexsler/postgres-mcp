@@ -85,9 +85,7 @@ class ContextRepository(Protocol):
         property_scope: str,
     ) -> AliasResolution: ...
 
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]: ...
+    async def in_flight_actions(self, recipient_key: str, exclude_action_id: UUID) -> list[InFlightAction]: ...
 
     async def newest_activity_after(
         self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
@@ -193,9 +191,7 @@ class OutboundGatewayRepository:
             ambiguous=int(cells.get("subject_count") or 0) > 1,
         )
 
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]:
+    async def in_flight_actions(self, recipient_key: str, exclude_action_id: UUID) -> list[InFlightAction]:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """

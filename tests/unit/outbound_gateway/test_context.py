@@ -415,9 +415,7 @@ async def test_suggest_targets_is_empty_for_malformed_or_cross_family_entity_ids
 async def test_tenantcloud_context_accepts_production_wake_sources(event_source):
     event = tenantcloud_record(event_source=event_source)
 
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(
-        tenantcloud_request("tenantcloud.lead.status.update")
-    )
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request("tenantcloud.lead.status.update"))
 
     assert context.provider_account == "tenantcloud"
     assert context.canonical_context["tenantcloud_claim_id"] == 301
@@ -443,12 +441,17 @@ async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape(
             "message": {"direct_email": "tenant@example.com"},
         },
     )
-    exec_request = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
-        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
-        "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
-    })
+    exec_request = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "provider_mutation",
+            "operation": "tenantcloud.lead.status.update",
+            "intent_kind": "tenantcloud_lead_status",
+            "appointment_slot": None,
+            "arguments": {"lead_id": 2405115, "status": "working"},
+        }
+    )
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(exec_request)
 
@@ -469,12 +472,17 @@ async def test_tenantcloud_claim_bookkeeping_never_bakes_the_literal_string_none
         message_source="zoho_mail",
         channel_type="email_thread",
     )
-    request = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
-        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
-        "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
-    })
+    request = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "provider_mutation",
+            "operation": "tenantcloud.lead.status.update",
+            "intent_kind": "tenantcloud_lead_status",
+            "appointment_slot": None,
+            "arguments": {"lead_id": 2405115, "status": "working"},
+        }
+    )
     assert event.tenantcloud_claim_id is None
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
@@ -492,12 +500,17 @@ async def test_tenantcloud_target_comes_from_arguments_on_any_wake_shape():
         message_source="zoho_mail",
         channel_type="email_thread",
     )
-    request = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
-        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
-        "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
-    })
+    request = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "provider_mutation",
+            "operation": "tenantcloud.lead.status.update",
+            "intent_kind": "tenantcloud_lead_status",
+            "appointment_slot": None,
+            "arguments": {"lead_id": 2405115, "status": "working"},
+        }
+    )
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
@@ -511,12 +524,17 @@ async def test_tenantcloud_target_comes_from_arguments_on_any_wake_shape():
 async def test_execute_ignores_a_target_that_disagrees_with_the_wake():
     """The wake's own claim says lead 999; the agent says 2405115. The agent wins."""
     event = tenantcloud_record(wakeup_event_id=1, entity_ids={"lead_id": "999"})
-    request = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
-        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
-        "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
-    })
+    request = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "provider_mutation",
+            "operation": "tenantcloud.lead.status.update",
+            "intent_kind": "tenantcloud_lead_status",
+            "appointment_slot": None,
+            "arguments": {"lead_id": 2405115, "status": "working"},
+        }
+    )
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
@@ -545,9 +563,7 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
         },
     )
 
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(
-        tenantcloud_request("tenantcloud.maintenance.status.update")
-    )
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(tenantcloud_request("tenantcloud.maintenance.status.update"))
 
     assert context.prospect_id == "tenantcloud:claim:301"
 
@@ -747,8 +763,6 @@ async def test_suggest_targets_has_no_cliq_or_calendar_hint_since_routing_is_con
     assert "calendar_id" not in hints
 
 
-
-
 @pytest.mark.asyncio
 async def test_provider_operation_allowlist_gate_is_removed_for_cross_channel_routes():
     """This used to be test_rollout_policy_rejects_cross_channel_provider_route,
@@ -814,9 +828,7 @@ async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_
     )
     loader = ActionContextLoader(FakeRepository(event), policy())
 
-    context = await loader.load(
-        request(arguments={"to_address": "relay-only@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
-    )
+    context = await loader.load(request(arguments={"to_address": "relay-only@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"}))
     hints = await loader.suggest_targets(event.wakeup_event_id)
 
     assert context.source == "zillow"
@@ -829,10 +841,7 @@ async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_
 @pytest.mark.asyncio
 async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
     event = record(
-        subject=(
-            "Kailani is requesting information about 138 Bullman St #144-A, "
-            "Phillipsburg, NJ, 08865"
-        ),
+        subject=("Kailani is requesting information about 138 Bullman St #144-A, Phillipsburg, NJ, 08865"),
         participant_key="kailani.abc@convo.zillow.com",
         envelope={
             "identity": {},
@@ -864,10 +873,7 @@ async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
 @pytest.mark.asyncio
 async def test_zillow_information_about_subject_derives_listing_address():
     event = record(
-        subject=(
-            "Kailani is requesting information about 138 Bullman St #144-A, "
-            "Phillipsburg, NJ, 08865"
-        ),
+        subject=("Kailani is requesting information about 138 Bullman St #144-A, Phillipsburg, NJ, 08865"),
         participant_key="kailani.abc@convo.zillow.com",
         envelope={
             "identity": {},
@@ -904,9 +910,7 @@ async def test_zillow_wake_with_no_proxy_offers_no_email_suggestion_but_execute_
     loader = ActionContextLoader(FakeRepository(event), policy())
 
     hints = await loader.suggest_targets(event.wakeup_event_id)
-    context = await loader.load(
-        request(arguments={"to_address": "prospect@gmail.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
-    )
+    context = await loader.load(request(arguments={"to_address": "prospect@gmail.com", "text": "Friday at 10:30 works.\r\n— Nigel"}))
 
     assert "to_address" not in hints
     assert context.target.target_id == "prospect@gmail.com"
@@ -1128,9 +1132,7 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
     repo = FakeRepository(event)
     loader = ActionContextLoader(repo, policy())
     first = await loader.load(request())
-    second = await loader.load(
-        request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"})
-    )
+    second = await loader.load(request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"}))
     assert first.action_id == second.action_id
     assert first.action_id.version == 5
     assert first.payload_hash == second.payload_hash
@@ -1142,12 +1144,8 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
 async def test_payload_hash_canonicalizes_equivalent_slot_offsets():
     loader = ActionContextLoader(FakeRepository(record()), policy())
 
-    eastern = await loader.load(
-        request(appointment_slot="2026-07-17T10:30:00-04:00")
-    )
-    utc = await loader.load(
-        request(appointment_slot="2026-07-17T14:30:00Z")
-    )
+    eastern = await loader.load(request(appointment_slot="2026-07-17T10:30:00-04:00"))
+    utc = await loader.load(request(appointment_slot="2026-07-17T14:30:00Z"))
 
     assert eastern.appointment_slot == utc.appointment_slot
     assert eastern.payload_hash == utc.payload_hash
@@ -1416,9 +1414,7 @@ async def test_ambiguous_aliases_and_unresolvable_wakes_no_longer_block_execute(
     loader = ActionContextLoader(FakeRepository(unresolvable), policy())
 
     hints = await loader.suggest_targets(unresolvable.wakeup_event_id)
-    context = await loader.load(
-        request(arguments={"to_address": "agent-chosen@example.com", "text": "Friday at 10:30 works.\r\n— Nigel"})
-    )
+    context = await loader.load(request(arguments={"to_address": "agent-chosen@example.com", "text": "Friday at 10:30 works.\r\n— Nigel"}))
 
     assert "to_address" not in hints
     assert context.target.target_id == "agent-chosen@example.com"
@@ -1454,9 +1450,7 @@ async def test_system_sender_offers_no_suggestion_but_execute_still_honors_the_a
     loader = ActionContextLoader(FakeRepository(unsafe), policy())
 
     hints = await loader.suggest_targets(unsafe.wakeup_event_id)
-    context = await loader.load(
-        request(arguments={"to_address": unsafe_address, "text": "Friday at 10:30 works.\r\n— Nigel"})
-    )
+    context = await loader.load(request(arguments={"to_address": unsafe_address, "text": "Friday at 10:30 works.\r\n— Nigel"}))
 
     assert "to_address" not in hints
     assert context.target.target_id == unsafe_address
@@ -1526,7 +1520,7 @@ async def test_repository_event_query_survives_literal_empty_json_object():
 
 @pytest.mark.asyncio
 async def test_adversarial_quo_shared_line_send_goes_only_to_agent_supplied_phone():
-    """"Quo channel is a line, not a conversation" (the class of bug that
+    """ "Quo channel is a line, not a conversation" (the class of bug that
     killed PR #158): a Quo phone line is shared by many counterparties, so
     any identity derived from the wake's own channel/participant data risks
     collapsing distinct prospects onto each other. This wake's own data
@@ -1606,9 +1600,7 @@ async def test_adversarial_zillow_rotating_proxy_send_goes_only_to_agent_supplie
     loader = ActionContextLoader(FakeRepository(event), policy())
 
     hints = await loader.suggest_targets(event.wakeup_event_id)
-    context = await loader.load(
-        request(arguments={"to_address": "prospect-direct@gmail.com", "text": "Thanks for reaching out"})
-    )
+    context = await loader.load(request(arguments={"to_address": "prospect-direct@gmail.com", "text": "Thanks for reaching out"}))
 
     # suggest still surfaces exactly the rotating proxy the retired
     # derivation would have enforced.
@@ -1857,9 +1849,13 @@ async def test_email_send_refuses_provider_without_configured_sender_account():
     produce a row with provider_account="" that the worker could never
     reconcile (KeyError on the sender-domain lookup, six attempts, then
     manual_review -- action a648bd51, 2026-09-16). Refuse at execute time."""
-    event = record(message_source="zoho_mail", channel_type="email_thread",
-                   participant_key="someone@gmail.com", raw_payload={},
-                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    event = record(
+        message_source="zoho_mail",
+        channel_type="email_thread",
+        participant_key="someone@gmail.com",
+        raw_payload={},
+        envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}},
+    )
     unmapped = dataclasses.replace(policy(), email_account_by_provider={"zillow": "nigel-zoho"})
     loader = ActionContextLoader(FakeRepository(event), unmapped)
     with pytest.raises(ContextDerivationError, match="no outbound email account is configured for provider 'zoho_mail'"):
@@ -1868,14 +1864,14 @@ async def test_email_send_refuses_provider_without_configured_sender_account():
 
 @pytest.mark.asyncio
 async def test_email_send_from_zoho_mail_wake_uses_mapped_account():
-    event = record(message_source="zoho_mail", channel_type="email_thread",
-                   participant_key="noreply@tenantcloud.com", raw_payload={},
-                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
-    mapped = dataclasses.replace(
-        policy(), email_account_by_provider={**policy().email_account_by_provider, "zoho_mail": "nigel-zoho"}
+    event = record(
+        message_source="zoho_mail",
+        channel_type="email_thread",
+        participant_key="noreply@tenantcloud.com",
+        raw_payload={},
+        envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}},
     )
-    context = await ActionContextLoader(FakeRepository(event), mapped).load(
-        request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
-    )
+    mapped = dataclasses.replace(policy(), email_account_by_provider={**policy().email_account_by_provider, "zoho_mail": "nigel-zoho"})
+    context = await ActionContextLoader(FakeRepository(event), mapped).load(request(arguments={"to_address": "dan@pfg.io", "text": "hi"}))
     assert context.provider_account == "nigel-zoho"
     assert context.target.target_id == "dan@pfg.io"

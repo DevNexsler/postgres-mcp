@@ -315,7 +315,9 @@ async def test_suggest_returns_ids_the_wake_implies():
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert result["wakeup_event_id"] == 1
@@ -330,7 +332,9 @@ async def test_suggest_returns_empty_for_a_wake_with_no_hints():
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 2},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 2},
     )
 
     assert result["suggestions"] == {}
@@ -344,7 +348,9 @@ async def test_suggest_never_writes_and_ignores_the_kill_switch():
     policy = FeaturePolicy(writes_enabled=False, kill_switch=True)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert "suggestions" in result
@@ -543,9 +549,7 @@ def test_reject_tenantcloud_origin_overrides_is_a_noop_without_any_override_env(
     ],
 )
 def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_path, monkeypatch, bad_url):
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
@@ -570,9 +574,7 @@ def test_tenantcloud_import_resolves_under_container_shaped_web_usage_mount(tmp_
     shape -- not merely when the developer's full host workspace happens to
     already sit at /home/danpark/workspace. Reproduces the container
     ModuleNotFoundError crash-loop reported in review."""
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
