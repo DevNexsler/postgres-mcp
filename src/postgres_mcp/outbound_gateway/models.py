@@ -477,11 +477,7 @@ class ExecuteRequest(StrictModel):
         if self.intent_kind in SLOT_REQUIRED_INTENTS and self.appointment_slot is None:
             raise ValueError("appointment_slot is required for this intent")
         known_intent = self.intent_kind in _KNOWN_INTENT_KINDS
-        if (
-            self.appointment_slot is not None
-            and self.intent_kind not in SLOT_REQUIRED_INTENTS
-            and known_intent
-        ):
+        if self.appointment_slot is not None and self.intent_kind not in SLOT_REQUIRED_INTENTS and known_intent:
             raise ValueError("appointment_slot is forbidden for this intent")
         return self
 
@@ -496,9 +492,7 @@ class SuggestRequest(StrictModel):
     wakeup_event_id: PositiveBigInt
 
 
-OutboundRequest: TypeAlias = Annotated[
-    ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")
-]
+OutboundRequest: TypeAlias = Annotated[ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")]
 _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 

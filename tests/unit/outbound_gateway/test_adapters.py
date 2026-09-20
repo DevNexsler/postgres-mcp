@@ -734,9 +734,7 @@ class FakeTenantCloudMutations:
         self.calls.append(("update_maintenance_status", (request_id, status), {}))
         return self.update_maintenance_status_result
 
-    def reconcile_message(
-        self, thread_id, body, *, source_turn_at, allow_late=False
-    ):
+    def reconcile_message(self, thread_id, body, *, source_turn_at, allow_late=False):
         self.calls.append(
             (
                 "reconcile_message",
@@ -753,9 +751,7 @@ class FakeTenantCloudMutations:
         return self.resolve_lead_thread_result
 
     def bind_lead_message_observation(self, observation, lead_id, resolved_thread_id):
-        self.calls.append(
-            ("bind_lead_message_observation", (observation, lead_id, resolved_thread_id), {})
-        )
+        self.calls.append(("bind_lead_message_observation", (observation, lead_id, resolved_thread_id), {}))
         return FakeMutationObservation(
             target_reference=observation.target_reference,
             provider_object_id=observation.provider_object_id,
@@ -868,8 +864,13 @@ async def test_tenantcloud_message_send_performs_one_write_and_verified_readback
     # Exactly migration 118's six required keys (118_...sql:353-364) plus the
     # facade's own opaque evidence_hash the store must peel off separately.
     assert set(observation.evidence) == {
-        "canonical_observed_state", "operation", "provider_object_id",
-        "target_reference", "readback_timestamp", "readback_verified", "evidence_hash",
+        "canonical_observed_state",
+        "operation",
+        "provider_object_id",
+        "target_reference",
+        "readback_timestamp",
+        "readback_verified",
+        "evidence_hash",
     }
     assert observation.evidence["canonical_observed_state"] == {"thread_id": "555", "body": "Friday at 10:30 works. — Nigel"}
     assert observation.evidence["operation"] == "tenantcloud.message.send"
@@ -986,9 +987,7 @@ async def test_tenantcloud_message_send_fails_closed_when_precheck_is_not_exact_
     error_code: str,
 ) -> None:
     facade = FakeTenantCloudMutations()
-    facade.reconcile_message_result = FakeReconciliationResult(
-        TC_UNKNOWN, None, error_code
-    )
+    facade.reconcile_message_result = FakeReconciliationResult(TC_UNKNOWN, None, error_code)
     adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
 
@@ -1252,9 +1251,7 @@ async def test_tenantcloud_reconciliation_with_zero_or_multiple_matches_remains_
 @pytest.mark.asyncio
 async def test_tenantcloud_status_reconciliation_retries_patch_only_after_authoritative_absence():
     facade = FakeTenantCloudMutations()
-    facade.reconcile_lead_status_result = FakeReconciliationResult(
-        TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence"
-    )
+    facade.reconcile_lead_status_result = FakeReconciliationResult(TC_DEFINITIVE_NON_ACCEPTANCE, None, "authoritative_absence")
     adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
     ctx = tenantcloud_context(Operation.TENANTCLOUD_LEAD_STATUS_UPDATE)
     prior = ProviderObservation(ProviderDisposition.AMBIGUOUS, "tenantcloud_write_ambiguous_transport_error")

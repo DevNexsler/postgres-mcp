@@ -30,7 +30,7 @@ TIMELINE = (0, 300, 900, 1500, 3600, 7200)
 LAPSE_AT = 900
 
 
-class _Stop(Exception):
+class _StopError(Exception):
     """Abort the adapter right after the facade call; only token choice matters."""
 
 
@@ -57,11 +57,11 @@ class _Facade:
 
     def reconcile_lead_status(self, lead_id: object) -> Any:
         self._log.append((self._clock["t"], self._token()))
-        raise _Stop()
+        raise _StopError()
 
     def mark_lead_working(self, lead_id: object) -> Any:  # pragma: no cover
         self._log.append((self._clock["t"], self._token()))
-        raise _Stop()
+        raise _StopError()
 
 
 def _request() -> Any:
@@ -78,7 +78,7 @@ def _request() -> Any:
 def _drive(adapter: TenantCloudAdapter) -> None:
     try:
         asyncio.run(adapter.invoke(None, _request()))
-    except _Stop:
+    except _StopError:
         pass
 
 
@@ -186,7 +186,7 @@ def test_production_wiring_builds_a_facade_per_operation(monkeypatch: Any) -> No
             built.append(client)
 
         def reconcile_lead_status(self, lead_id: object) -> Any:
-            raise _Stop()
+            raise _StopError()
 
     class _Auth:
         def __init__(self, *a: object, **k: object) -> None: ...
@@ -216,8 +216,5 @@ def test_production_wiring_builds_a_facade_per_operation(monkeypatch: Any) -> No
     _drive(adapter)
     _drive(adapter)
 
-    assert len(built) == 2, (
-        "each operation must construct its own TenantCloudClient; "
-        f"got {len(built)} for 2 operations"
-    )
+    assert len(built) == 2, f"each operation must construct its own TenantCloudClient; got {len(built)} for 2 operations"
     assert built[0] is not built[1], "operations shared one client (and one auth budget)"

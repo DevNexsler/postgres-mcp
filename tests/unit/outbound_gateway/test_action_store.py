@@ -478,8 +478,12 @@ async def test_transition_to_provider_accepted_sends_exact_six_key_observation_a
     sent_observation = json.loads(params[8])
     assert sent_observation == SIX_KEY_OBSERVATION
     assert set(sent_observation) == {
-        "canonical_observed_state", "operation", "provider_object_id",
-        "target_reference", "readback_timestamp", "readback_verified",
+        "canonical_observed_state",
+        "operation",
+        "provider_object_id",
+        "target_reference",
+        "readback_timestamp",
+        "readback_verified",
     }
     assert "evidence_hash" not in sent_observation
     assert params[9] == "verified_provider_readback"
@@ -545,8 +549,7 @@ async def test_create_or_load_persists_desired_state_target_reference_idempotenc
     assert persisted_arguments["desired_state"] == {"status": "working"}
     assert persisted_arguments["target_reference"] == "lead:6001"
     assert persisted_arguments["idempotency_key"] == (
-        "v1:claim:301:source:tenantcloud:claim:301:op:tenantcloud.lead.status.update:"
-        "target:lead:6001:state:" + "d" * 64
+        "v1:claim:301:source:tenantcloud:claim:301:op:tenantcloud.lead.status.update:target:lead:6001:state:" + "d" * 64
     )
 
 

@@ -81,9 +81,7 @@ class TenantCloudMutationsProtocol(Protocol):
 
     def resolve_lead_thread(self, lead_id: object) -> str | None: ...
 
-    def bind_lead_message_observation(
-        self, observation: Any, lead_id: object, resolved_thread_id: object
-    ) -> Any: ...
+    def bind_lead_message_observation(self, observation: Any, lead_id: object, resolved_thread_id: object) -> Any: ...
 
     def reconcile_lead_status(self, lead_id: object) -> Any: ...
 
@@ -202,9 +200,7 @@ class TenantCloudAdapter:
             target_id = context.target.target_id
             body = str(context.arguments["text"])
             resolved = None
-            result = mutations.reconcile_message(
-                target_id, body, source_turn_at=context.source_sent_at
-            )
+            result = mutations.reconcile_message(target_id, body, source_turn_at=context.source_sent_at)
             if result.error_code == "readback_failed":
                 resolved = mutations.resolve_lead_thread(target_id)
                 if resolved is not None:
@@ -215,9 +211,7 @@ class TenantCloudAdapter:
                         allow_late=True,
                     )
             if resolved is not None and result.disposition.value == "accepted":
-                bound = mutations.bind_lead_message_observation(
-                    result.observation, target_id, resolved
-                )
+                bound = mutations.bind_lead_message_observation(result.observation, target_id, resolved)
                 return self._accepted_from_observation(
                     bound,
                     kind="message",
@@ -312,9 +306,7 @@ class TenantCloudAdapter:
                 allow_late=True,
             )
             if pre.disposition.value == "accepted":
-                observation = mutations.bind_lead_message_observation(
-                    pre.observation, logical_thread_id, resolved
-                )
+                observation = mutations.bind_lead_message_observation(pre.observation, logical_thread_id, resolved)
                 return self._accepted_from_observation(
                     observation,
                     kind="message",
@@ -329,9 +321,7 @@ class TenantCloudAdapter:
             )
         execution = mutations.send_message(thread_id, body)
         if resolved is not None and execution.verified:
-            observation = mutations.bind_lead_message_observation(
-                execution.observation, logical_thread_id, resolved
-            )
+            observation = mutations.bind_lead_message_observation(execution.observation, logical_thread_id, resolved)
             return self._accepted_from_observation(
                 observation,
                 kind="message",

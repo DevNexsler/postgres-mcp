@@ -331,11 +331,7 @@ class ActionContextLoader:
             assert isinstance(request.arguments, (CalendarUpdateArguments, CalendarDeleteArguments))
             calendar_event_url = request.arguments.event_url or calendar_event_url
             calendar_event_etag = request.arguments.etag or calendar_event_etag
-            calendar_event_uid = (
-                request.arguments.event_uid
-                or _calendar_event_uid_from_url(calendar_event_url)
-                or calendar_event_uid
-            )
+            calendar_event_uid = request.arguments.event_uid or _calendar_event_uid_from_url(calendar_event_url) or calendar_event_uid
             if not calendar_event_uid:
                 raise ContextDerivationError("canonical calendar event UID is required")
             if not calendar_event_url or not calendar_event_etag:
@@ -580,12 +576,7 @@ class ActionContextLoader:
             return ()
         if parsed_sent_at.tzinfo is None:
             return ()
-        delta_seconds = abs(
-            (
-                parsed_sent_at.astimezone(timezone.utc)
-                - record.message_sent_at.astimezone(timezone.utc)
-            ).total_seconds()
-        )
+        delta_seconds = abs((parsed_sent_at.astimezone(timezone.utc) - record.message_sent_at.astimezone(timezone.utc)).total_seconds())
         if delta_seconds > _CROSS_CHANNEL_DUPLICATE_MAX_SECONDS:
             return ()
         return (duplicate_id,)
@@ -635,11 +626,7 @@ class ActionContextLoader:
             or _nonblank(message.get("zillow_proxy_email"))
             or _nonblank(raw.get("proxy_email"))
             or _nonblank(raw.get("zillow_proxy_email"))
-            or (
-                record.participant_key
-                if record.participant_type in _EMAIL_PARTICIPANT_TYPES
-                else None
-            ),
+            or (record.participant_key if record.participant_type in _EMAIL_PARTICIPANT_TYPES else None),
             require_zillow_proxy=True,
         )
         nearby_messages = _mapping(envelope.get("conversation_context")).get(
@@ -650,8 +637,7 @@ class ActionContextLoader:
             for nearby_value in nearby_messages:
                 nearby = _mapping(nearby_value)
                 nearby_proxy = replyable_email(
-                    _nonblank(nearby.get("proxy_email"))
-                    or _nonblank(nearby.get("zillow_proxy_email")),
+                    _nonblank(nearby.get("proxy_email")) or _nonblank(nearby.get("zillow_proxy_email")),
                     require_zillow_proxy=True,
                 )
                 nearby_property = _nonblank(nearby.get("property"))
@@ -789,9 +775,7 @@ class ActionContextLoader:
                 # sender-domain lookup six times and parked the action in
                 # manual_review (action a648bd51, 2026-09-16). Refuse at
                 # execute time instead so the agent sees why.
-                raise ContextDerivationError(
-                    f"no outbound email account is configured for provider {provider!r}"
-                )
+                raise ContextDerivationError(f"no outbound email account is configured for provider {provider!r}")
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
             assert isinstance(request.arguments, QuoSmsArguments)
@@ -810,11 +794,7 @@ class ActionContextLoader:
             # account/line selection, not recipient identity -- the agent's
             # to_phone (above) is the only thing that decides who receives
             # the message.
-            account = (
-                observed_account
-                if provider == "quo" and observed_account and observed_inbound
-                else configured_account
-            )
+            account = observed_account if provider == "quo" and observed_account and observed_inbound else configured_account
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)

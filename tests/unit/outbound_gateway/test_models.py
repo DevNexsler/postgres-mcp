@@ -164,9 +164,7 @@ def test_appointment_slot_matrix_requires_explicit_offset_and_normalizes_utc():
 
 
 def test_text_is_nfc_lf_normalized_and_length_bounded():
-    request = parse_outbound_request(
-        execute_payload(arguments={"to_address": "prospect@example.com", "text": "Cafe\u0301\r\nTour"})
-    )
+    request = parse_outbound_request(execute_payload(arguments={"to_address": "prospect@example.com", "text": "Cafe\u0301\r\nTour"}))
     assert request.arguments.text == "Café\nTour"
     for value in ("", "x" * 10001):
         with pytest.raises(ValidationError):
@@ -255,32 +253,47 @@ def test_tenantcloud_operations_use_exact_strict_argument_models(operation, role
 
 
 def test_tenantcloud_arguments_carry_agent_supplied_targets():
-    msg = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "prospect_reply",
-        "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
-        "appointment_slot": None,
-        "arguments": {"thread_id": 2002331, "text": "Thanks"},
-    })
+    msg = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "prospect_reply",
+            "operation": "tenantcloud.message.send",
+            "intent_kind": "inquiry_reply",
+            "appointment_slot": None,
+            "arguments": {"thread_id": 2002331, "text": "Thanks"},
+        }
+    )
     assert msg.arguments.thread_id == 2002331
 
-    lead = parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
-        "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
-        "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
-    })
+    lead = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": "provider_mutation",
+            "operation": "tenantcloud.lead.status.update",
+            "intent_kind": "tenantcloud_lead_status",
+            "appointment_slot": None,
+            "arguments": {"lead_id": 2405115, "status": "working"},
+        }
+    )
     assert lead.arguments.lead_id == 2405115
 
 
 @pytest.mark.parametrize("bad", [0, -1, "12", 1.5, None, True])
 def test_tenantcloud_target_ids_reject_non_positive_integers(bad):
     with pytest.raises(ValueError):
-        parse_outbound_request({
-            "op": "execute", "wakeup_event_id": 1, "action_role": "prospect_reply",
-            "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
-            "appointment_slot": None,
-            "arguments": {"thread_id": bad, "text": "Thanks"},
-        })
+        parse_outbound_request(
+            {
+                "op": "execute",
+                "wakeup_event_id": 1,
+                "action_role": "prospect_reply",
+                "operation": "tenantcloud.message.send",
+                "intent_kind": "inquiry_reply",
+                "appointment_slot": None,
+                "arguments": {"thread_id": bad, "text": "Thanks"},
+            }
+        )
 
 
 @pytest.mark.parametrize("field", ["thread_id", "request_id", "property_id", "unit_id"])
@@ -410,9 +423,7 @@ def test_maintenance_create_normalizes_unicode_and_newlines_before_hashing():
 
 
 def test_email_arguments_carry_the_agent_supplied_to_address():
-    parsed = parse_outbound_request(
-        execute_payload(arguments={"to_address": "prospect@example.com", "text": "Thanks"})
-    )
+    parsed = parse_outbound_request(execute_payload(arguments={"to_address": "prospect@example.com", "text": "Thanks"}))
     assert parsed.arguments.to_address == "prospect@example.com"
 
 

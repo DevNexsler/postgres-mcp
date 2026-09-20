@@ -359,10 +359,7 @@ class GatewayObservability:
                     {"outcome": outcome},
                 )
             )
-        replay_counts = {
-            str(row.get("outcome") or "unknown"): int(row.get("count") or 0)
-            for row in replay_rows
-        }
+        replay_counts = {str(row.get("outcome") or "unknown"): int(row.get("count") or 0) for row in replay_rows}
         for outcome in _REPLAY_OUTCOMES:
             replay_counts.setdefault(outcome, 0)
         samples.extend(

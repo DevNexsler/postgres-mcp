@@ -76,16 +76,12 @@ class PostgresActionStore:
         if str(cells.get("state")) == ActionState.PROVIDER_ACCEPTED.value and str(cells.get("operation")) in {
             operation.value for operation in TENANTCLOUD_OPERATIONS
         }:
-            attempt = await self._latest_provider_accepted_attempt(
-                UUID(str(cells["action_id"])), int(cells.get("attempt_count") or 0)
-            )
+            attempt = await self._latest_provider_accepted_attempt(UUID(str(cells["action_id"])), int(cells.get("attempt_count") or 0))
             if attempt is not None:
                 merged.update(attempt)
         return self._record(merged)
 
-    async def _latest_provider_accepted_attempt(
-        self, action_id: UUID, attempt_number: int
-    ) -> dict[str, Any] | None:
+    async def _latest_provider_accepted_attempt(self, action_id: UUID, attempt_number: int) -> dict[str, Any] | None:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -223,9 +219,7 @@ class PostgresActionStore:
         observation: ProviderObservation,
     ) -> OutboundActionRecord:
         authoritative = next_state is ActionState.RETRY_READY
-        verified_readback = (
-            _verified_readback_evidence(observation) if next_state is ActionState.PROVIDER_ACCEPTED else None
-        )
+        verified_readback = _verified_readback_evidence(observation) if next_state is ActionState.PROVIDER_ACCEPTED else None
         sanitized = _observation(observation)
         if authoritative:
             evidence = dict(observation.evidence or {})
@@ -459,9 +453,5 @@ class PostgresActionStore:
             provider_evidence_hash=cells.get("evidence_hash"),
             provider_readback_evidence=dict(readback_evidence) if readback_evidence else {},
             error_category=cells.get("error_category"),
-            retry_of_action_id=(
-                UUID(str(cells["retry_of_action_id"]))
-                if cells.get("retry_of_action_id")
-                else None
-            ),
+            retry_of_action_id=(UUID(str(cells["retry_of_action_id"])) if cells.get("retry_of_action_id") else None),
         )

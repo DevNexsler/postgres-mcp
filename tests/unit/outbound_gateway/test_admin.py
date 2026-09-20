@@ -52,7 +52,8 @@ def test_admin_remediation_accepts_no_recipient_or_provider_override():
 @pytest.mark.asyncio
 async def test_admin_resolution_query_survives_literal_empty_json_object():
     class Row:
-        cells = {"action_id": "00000000-0000-0000-0000-000000000001"}
+        def __init__(self):
+            self.cells = {"action_id": "00000000-0000-0000-0000-000000000001"}
 
     class Driver:
         async def execute_query(self, query, *args, **kwargs):
