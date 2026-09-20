@@ -1362,6 +1362,87 @@ async def test_worker_resume_rejects_mutated_persisted_context_before_provider_i
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
 
 
+def _persisted_row_matching_context(state, *, action_id, **overrides):
+    """Row whose immutable fields match context() but whose durable id may not.
+
+    Mirrors v2-internal qualification: create_or_load persists a database-owned
+    UUID while ActionContextLoader still derives the client-side v1 formula.
+    """
+    ctx = context()
+    values = dict(
+        action_id=action_id,
+        action_uid=ACTION_UID,
+        payload_hash=ctx.payload_hash,
+        canonical_context=dict(ctx.canonical_context),
+        canonical_scope=dict(ctx.canonical_scope),
+        recipient_scope={
+            "kind": ctx.target.kind,
+            "target_id": ctx.target.target_id,
+            "verified": ctx.target.verified,
+        },
+        provider_account=ctx.provider_account,
+        routing_policy_version=ctx.routing_policy_version,
+    )
+    values.update(overrides)
+    return row(state, **values)
+
+
+@pytest.mark.asyncio
+async def test_resume_accepts_database_owned_action_id_when_immutable_context_matches():
+    """#2840: populated payload_hash must not reject v2-internal durable ids."""
+    durable_id = UUID("20000000-0000-0000-0000-000000000001")
+    assert durable_id != ACTION_ID
+    store = FakeStore(_persisted_row_matching_context(ActionState.PREPARED, action_id=durable_id))
+    adapter = FakeAdapter(_accepted_observation())
+
+    result = await service(store, adapter).resume(durable_id)
+
+    assert result.status is PublicStatus.SENT
+    assert result.action_id == durable_id
+    assert store.current.state is ActionState.COMPLETED
+    assert ("invoke",) in adapter.calls
+
+
+@pytest.mark.asyncio
+async def test_prepare_accepts_database_owned_action_id_when_immutable_context_matches():
+    durable_id = UUID("20000000-0000-0000-0000-000000000002")
+    assert durable_id != ACTION_ID
+    store = FakeStore(
+        _persisted_row_matching_context(
+            ActionState.RECEIVED,
+            action_id=durable_id,
+            action_uid=None,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).prepare(durable_id)
+
+    assert result.status is PublicStatus.PENDING
+    assert result.action_id == durable_id
+    assert store.current.state is ActionState.PREPARED
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_still_rejects_altered_immutable_context_with_database_owned_id():
+    durable_id = UUID("20000000-0000-0000-0000-000000000003")
+    store = FakeStore(
+        _persisted_row_matching_context(
+            ActionState.PREPARED,
+            action_id=durable_id,
+            payload_hash="f" * 64,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).resume(durable_id)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert result.detail_code == "persisted_context_mismatch"
+    assert adapter.calls == []
+
+
 @pytest.mark.asyncio
 async def test_worker_accepts_one_way_durable_subject_alias_promotion():
     stored_prospect = "prospect:factbook:stable-id"
