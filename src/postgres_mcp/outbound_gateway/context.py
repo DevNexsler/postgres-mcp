@@ -271,9 +271,9 @@ class ActionContextLoader:
                     "ambiguous aliases for wake %s; using address fallback",
                     request.wakeup_event_id,
                 )
-                prospect_id = f"prospect:{self._preferred_alias(aliases)}"
+                prospect_id = self._prospect_id_from_preferred_alias(aliases)
             else:
-                prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
+                prospect_id = resolved.canonical_subject or self._prospect_id_from_preferred_alias(aliases)
         elif request.action_role is ActionRole.INTERNAL_NOTIFICATION or request.operation in _TENANTCLOUD_OPERATIONS:
             if record.tenantcloud_claim_id is not None:
                 prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}"
@@ -416,6 +416,7 @@ class ActionContextLoader:
             canonical_context_data.update(
                 tenantcloud_claim_id=record.tenantcloud_claim_id or "",
                 tenantcloud_claim_family=record.tenantcloud_claim_family,
+                tenantcloud_entity_scope_key=self._tenantcloud_entity_scope_key(record, envelope) or "",
                 source_event_id=record.source_event_id,
                 operation_target={"kind": target.kind, "target_id": target.target_id},
             )
@@ -698,15 +699,63 @@ class ActionContextLoader:
             value = _nonblank(raw.get(field))
             if value:
                 values.add(f"{field}:{value.casefold()}")
+        # TenantCloud claim handles are work-item keys, not prospects. Register
+        # each claim alongside the claim row's durable entity_scope_key (and any
+        # contact address above) so acquire_outbound_intent_lock's alias union
+        # folds every claim of one lead/maintenance request onto one subject.
+        claim_id = record.tenantcloud_claim_id
+        if type(claim_id) is int and claim_id > 0:
+            values.add(f"tenantcloud:claim:{claim_id}")
+        scope_key = ActionContextLoader._tenantcloud_entity_scope_key(record, envelope)
+        if scope_key:
+            values.add(scope_key)
         return tuple(sorted(values))
 
     @staticmethod
+    def _tenantcloud_entity_scope_key(
+        record: WakeEventRecord,
+        envelope: Mapping[str, Any] | None = None,
+    ) -> str | None:
+        scope_key = _nonblank(getattr(record, "tenantcloud_entity_scope_key", None))
+        if scope_key:
+            return scope_key
+        if envelope is None:
+            return None
+        return _nonblank(_mapping(envelope.get("tenantcloud")).get("entity_scope_key"))
+
+    @staticmethod
     def _preferred_alias(aliases: tuple[str, ...]) -> str:
-        for prefix in ("factbook:", "prospect_id:", "contact_id:", "email:", "phone:"):
+        # Durable TenantCloud entity scopes outrank claim handles and contact
+        # addresses so two claims of one lead prefer the same written subject
+        # even before the alias table has been seeded by a prior acquire.
+        for prefix in (
+            "tenantcloud:lead:",
+            "tenantcloud:maintenance-request:",
+            "tenantcloud-lead:",
+            "tenantcloud-prospect:",
+            "tc-lead:",
+            "lead:",
+            "factbook:",
+            "prospect_id:",
+            "contact_id:",
+            "email:",
+            "phone:",
+            "tenantcloud:claim:",
+        ):
             match = next((alias for alias in aliases if alias.startswith(prefix)), None)
             if match:
                 return match
         return aliases[0]
+
+    @staticmethod
+    def _prospect_id_from_preferred_alias(aliases: tuple[str, ...]) -> str:
+        preferred = ActionContextLoader._preferred_alias(aliases)
+        # TenantCloud durable keys already carry their own namespace; wrapping
+        # them in prospect: would mint a third subject shape beside claim keys
+        # and CDS's tenantcloud:entity:<scope> fold.
+        if preferred.startswith("tenantcloud:") or preferred.startswith(("lead:", "tc-lead:", "tenantcloud-")):
+            return preferred
+        return f"prospect:{preferred}"
 
     @staticmethod
     def _thread_identity(
