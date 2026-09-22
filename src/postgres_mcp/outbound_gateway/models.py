@@ -477,11 +477,7 @@ class ExecuteRequest(StrictModel):
         if self.intent_kind in SLOT_REQUIRED_INTENTS and self.appointment_slot is None:
             raise ValueError("appointment_slot is required for this intent")
         known_intent = self.intent_kind in _KNOWN_INTENT_KINDS
-        if (
-            self.appointment_slot is not None
-            and self.intent_kind not in SLOT_REQUIRED_INTENTS
-            and known_intent
-        ):
+        if self.appointment_slot is not None and self.intent_kind not in SLOT_REQUIRED_INTENTS and known_intent:
             raise ValueError("appointment_slot is forbidden for this intent")
         return self
 
@@ -496,9 +492,7 @@ class SuggestRequest(StrictModel):
     wakeup_event_id: PositiveBigInt
 
 
-OutboundRequest: TypeAlias = Annotated[
-    ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")
-]
+OutboundRequest: TypeAlias = Annotated[ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")]
 _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 
@@ -515,8 +509,9 @@ class PublicResult(StrictModel):
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
     # Human-readable elaboration of detail_code. None everywhere except traffic-control
     # blocks: that is the one path where the calling agent must read *why* (which
-    # in-flight action or newer message) to decide skip vs. resend with override=true --
-    # detail_code alone ("lease_held"/"stale_context") does not carry that. Left unset
-    # (None) for every other result so existing consumers see no new key on the wire
+    # in-flight action or newer message) to decide skip vs. record needs_human --
+    # detail_code alone ("lease_held"/"stale_context") does not carry that. Override
+    # is an operator remediation and is not named in this text. Left unset (None)
+    # for every other result so existing consumers see no new key on the wire
     # (server.py omits it from the response payload when None).
     detail: str | None = None

@@ -1572,14 +1572,17 @@ async def test_traffic_control_enforce_blocks_on_stale_context():
     assert result.detail_code == "stale_context"
     assert result.detail is not None
     assert "Are you still available Friday?" in result.detail
-    assert "override" in result.detail
+    assert "needs_human" in result.detail
+    assert "stale_context, reply still needed" in result.detail
+    assert "override" not in result.detail.casefold()
     assert adapter.calls == []
     definitive_calls = [call for call in store.calls if call[0] == "definitive_fail"]
     assert len(definitive_calls) == 1
     observation = definitive_calls[0][2]
     assert observation.category == "traffic_blocked"
     assert "Are you still available Friday?" in observation.evidence["detail"]
-    assert "override" in observation.evidence["detail"]
+    assert "needs_human" in observation.evidence["detail"]
+    assert "override" not in observation.evidence["detail"].casefold()
 
 
 @pytest.mark.asyncio
@@ -1855,7 +1858,8 @@ async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_
     assert result.status is PublicStatus.PENDING
     assert result.detail_code == "stale_context"
     assert result.detail is not None
-    assert "override" in result.detail
+    assert "needs_human" in result.detail
+    assert "override" not in result.detail.casefold()
     assert store.current.state is ActionState.DEPENDENCY_WAIT
     assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
     assert adapter.calls == []

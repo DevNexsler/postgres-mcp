@@ -91,7 +91,12 @@ async def test_stale_context_blocks_with_detail():
     verdict = await check_traffic(FakeProbe(newer=newer), **_kwargs())
     assert not verdict.allowed
     assert verdict.reason == "stale_context"
-    assert "withdrew" in verdict.detail and "override" in verdict.detail
+    assert "withdrew" in verdict.detail
+    assert "needs_human" in verdict.detail
+    assert "stale_context, reply still needed" in verdict.detail
+    # The preview is the only customer text. The instruction must not hand the
+    # agent the operator-only override switch (wake 27138).
+    assert "override" not in verdict.detail.casefold()
 
 
 @pytest.mark.asyncio
