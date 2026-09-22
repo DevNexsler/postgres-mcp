@@ -230,10 +230,10 @@ async def test_write_policy_rejects_before_database_or_provider_call(policy, det
 async def test_enforce_traffic_block_detail_reaches_the_mcp_response():
     """The whole point of a traffic block is that the calling agent reads WHY
     (which message/action changed since its context) and decides skip vs.
-    override=true. detail_code alone ("stale_context") does not carry that --
+    needs_human. detail_code alone ("stale_context") does not carry that --
     this asserts the human-readable verdict text (built by the same
     production public_result() the service actually calls) survives the
-    server's response-dict serialization."""
+    server's response-dict serialization. The text must not name override."""
     service = AsyncMock()
     service.execute.return_value = public_result(
         state=ActionState.DEFINITIVE_FAILED,
@@ -244,8 +244,10 @@ async def test_enforce_traffic_block_detail_reaches_the_mcp_response():
         detail=(
             "New inbound activity since your context was built: message 999 via zillow "
             'at 2026-07-16T01:00:00+00:00: "Are you still available Friday?". Re-read the '
-            "thread and skip if your message is now redundant, or resend with override=true "
-            "if it is still needed."
+            "thread and skip if your message is now redundant. If the reply is still "
+            'needed, record needs_human with the reason "stale_context, reply still '
+            'needed". A gateway refusal is final. Circumventing the outbound gateway '
+            "is never an option."
         ),
     )
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
@@ -253,7 +255,8 @@ async def test_enforce_traffic_block_detail_reaches_the_mcp_response():
     result = await handle_outbound_action(service, policy, execute_payload())
 
     assert result["detail_code"] == "stale_context"
-    assert "override" in result["detail"]
+    assert "override" not in result["detail"].casefold()
+    assert "needs_human" in result["detail"]
     assert "Are you still available Friday?" in result["detail"]
 
 
@@ -315,7 +318,9 @@ async def test_suggest_returns_ids_the_wake_implies():
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert result["wakeup_event_id"] == 1
@@ -330,7 +335,9 @@ async def test_suggest_returns_empty_for_a_wake_with_no_hints():
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 2},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 2},
     )
 
     assert result["suggestions"] == {}
@@ -344,7 +351,9 @@ async def test_suggest_never_writes_and_ignores_the_kill_switch():
     policy = FeaturePolicy(writes_enabled=False, kill_switch=True)
 
     result = await handle_outbound_action(
-        service, policy, {"op": "suggest", "wakeup_event_id": 1},
+        service,
+        policy,
+        {"op": "suggest", "wakeup_event_id": 1},
     )
 
     assert "suggestions" in result
@@ -543,9 +552,7 @@ def test_reject_tenantcloud_origin_overrides_is_a_noop_without_any_override_env(
     ],
 )
 def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_path, monkeypatch, bad_url):
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
@@ -570,9 +577,7 @@ def test_tenantcloud_import_resolves_under_container_shaped_web_usage_mount(tmp_
     shape -- not merely when the developer's full host workspace happens to
     already sit at /home/danpark/workspace. Reproduces the container
     ModuleNotFoundError crash-loop reported in review."""
-    real_scripts = Path(
-        "/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts"
-    )
+    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
