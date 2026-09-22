@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from types import MappingProxyType
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 from uuid import UUID
 from uuid import uuid4
 
@@ -17,6 +20,7 @@ import pytest
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.base import ProviderReceipt
+from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
@@ -32,6 +36,8 @@ from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
+from postgres_mcp.outbound_gateway.provider_client import McpProviderClient
+from postgres_mcp.outbound_gateway.provider_client import McpServerConfig
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -329,7 +335,7 @@ class FakeAdapter:
         return self.observations.pop(0)
 
 
-def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off", traffic_probe=None):
+def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off", traffic_probe=None, provider_client=None):
     loader = AsyncMock()
     loader.load.return_value = context()
     preflight = AsyncMock()
@@ -339,7 +345,7 @@ def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off
         context_loader=loader,
         evidence_loader=preflight,
         adapters={Operation.EMAIL_SEND: adapter},
-        provider_client=object(),
+        provider_client=provider_client or object(),
         clock=lambda: NOW,
         lease_owner="gateway-test",
         response_budget_seconds=1,
@@ -1030,6 +1036,60 @@ async def test_ambiguous_timeout_retains_lock_and_never_retries_inline():
     assert store.current.state is ActionState.UNKNOWN
     assert not any(call[0] == "definitive_fail" for call in store.calls)
     assert any(call[0] == "schedule" and call[3] == "provider_timeout" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_whose_session_hangs_before_tool_request_is_retry_ready():
+    # #3240: mcp-gate held the gateway's `initialize` past the 10 s deadline,
+    # so `tools/call` for email_send was never written. The action must be
+    # retried, not parked in reconciliation and then manual review.
+    tool_calls = []
+
+    @asynccontextmanager
+    async def transport(_url, **_kwargs):
+        yield object(), object(), lambda: None
+
+    class InitializeHangs:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            await asyncio.Event().wait()
+
+        async def call_tool(self, *args, **_kwargs):
+            tool_calls.append(args)
+
+    config = McpServerConfig(
+        name="agent-email",
+        url="http://127.0.0.1:9090/mcp",
+        transport="streamable_http",
+        allowed_tools=frozenset({"email_send", "request_status", "email_get_thread"}),
+        timeout_seconds=0.05,
+    )
+    store = FakeStore()
+    gateway = service(
+        store,
+        EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"}),
+        provider_client=McpProviderClient({config.name: config}),
+    )
+
+    with (
+        patch("postgres_mcp.outbound_gateway.provider_client.streamablehttp_client", transport),
+        patch("postgres_mcp.outbound_gateway.provider_client.ClientSession", InitializeHangs),
+    ):
+        result = await gateway.execute(request())
+
+    assert tool_calls == []
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.RETRY_READY
+    assert ("transition", ActionState.DISPATCHING, ActionState.RETRY_READY, "provider_unavailable_before_tool_request", "gateway-test") in store.calls
+    assert not any(call[0] == "transition" and call[2] is ActionState.UNKNOWN for call in store.calls)
 
 
 @pytest.mark.asyncio

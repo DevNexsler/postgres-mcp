@@ -39,6 +39,23 @@ class McpCallResult:
     is_error: bool = False
     error_kind: TransportErrorKind | None = None
     safe_detail: str | None = None
+    # True only when the invoker recorded that the failure happened while the
+    # MCP session was still being set up, before `tools/call` was handed to it.
+    before_tool_request: bool = False
+
+
+@dataclass
+class CallProgress:
+    """How far one invocation reached before it ended.
+
+    `call()` owns the deadline, so a timeout cancels the invoker wherever it
+    is and the exception type cannot tell session setup from the tool call
+    (the outer deadline and the session read timeout are the same length).
+    The invoker records the phase as it goes instead. The default is the
+    conservative answer: a failure may have followed the tool request.
+    """
+
+    before_tool_request: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,7 +81,7 @@ class McpServerConfig:
             raise ValueError("provider MCP headers must be non-empty single-line strings")
 
 
-Invoker = Callable[[McpServerConfig, str, dict[str, Any]], Awaitable[McpCallResult]]
+Invoker = Callable[[McpServerConfig, str, dict[str, Any], CallProgress], Awaitable[McpCallResult]]
 
 
 class McpProviderClient:
@@ -85,9 +102,10 @@ class McpProviderClient:
             raise ProviderClientError(f"provider MCP server {server_name!r} is not configured")
         if tool not in config.allowed_tools:
             raise ProviderClientError(f"provider MCP tool {tool!r} is not allowed for {server_name!r}")
+        progress = CallProgress()
         try:
             return await asyncio.wait_for(
-                self._invoker(config, tool, dict(arguments)),
+                self._invoker(config, tool, dict(arguments), progress),
                 timeout=config.timeout_seconds,
             )
         except (TimeoutError, asyncio.TimeoutError):
@@ -95,12 +113,14 @@ class McpProviderClient:
                 is_error=True,
                 error_kind=TransportErrorKind.TIMEOUT,
                 safe_detail="provider_transport_timeout",
+                before_tool_request=progress.before_tool_request,
             )
         except (ConnectionError, BrokenPipeError, EOFError):
             return McpCallResult(
                 is_error=True,
                 error_kind=TransportErrorKind.CONNECTION_LOST,
                 safe_detail="provider_connection_lost",
+                before_tool_request=progress.before_tool_request,
             )
         except Exception as exc:
             if _contains_http_auth_rejection(exc):
@@ -108,16 +128,24 @@ class McpProviderClient:
                     is_error=True,
                     error_kind=TransportErrorKind.AUTH_REJECTED,
                     safe_detail="provider_auth_rejected",
+                    before_tool_request=progress.before_tool_request,
                 )
             return McpCallResult(
                 is_error=True,
                 error_kind=TransportErrorKind.TRANSPORT,
                 safe_detail="provider_transport_error",
+                before_tool_request=progress.before_tool_request,
             )
 
     @staticmethod
-    async def _invoke_mcp(config: McpServerConfig, tool: str, arguments: dict[str, Any]) -> McpCallResult:
+    async def _invoke_mcp(
+        config: McpServerConfig,
+        tool: str,
+        arguments: dict[str, Any],
+        progress: CallProgress,
+    ) -> McpCallResult:
         timeout = timedelta(seconds=config.timeout_seconds)
+        progress.before_tool_request = True
         transport = streamablehttp_client if config.transport == "streamable_http" else sse_client
         async with transport(
             config.url,
@@ -128,6 +156,7 @@ class McpProviderClient:
             read_stream, write_stream = streams[0], streams[1]
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=timeout) as session:
                 await session.initialize()
+                progress.before_tool_request = False
                 result = await session.call_tool(tool, arguments, read_timeout_seconds=timeout)
         structured = result.structuredContent if isinstance(result.structuredContent, dict) else None
         text_parts = [item.text for item in result.content if isinstance(item, TextContent)]

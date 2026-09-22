@@ -87,7 +87,7 @@ class CalendarAdapter:
         return ProviderRequest("agent-email", tool, {key: value for key, value in arguments.items() if value is not None})
 
     async def invoke(self, client: McpProviderClient, request: ProviderRequest) -> ProviderObservation:
-        return self._parse(await client.call(request.server_name, request.tool, request.arguments))
+        return self._parse(await client.call(request.server_name, request.tool, request.arguments), effect_call=True)
 
     async def poll(self, client: McpProviderClient, observation: ProviderObservation) -> ProviderObservation:
         if not observation.provider_request_ref:
@@ -117,8 +117,8 @@ class CalendarAdapter:
         )
 
     @staticmethod
-    def _parse(result: McpCallResult, *, prior_ref: str | None = None) -> ProviderObservation:
-        common = initial_observation(result)
+    def _parse(result: McpCallResult, *, prior_ref: str | None = None, effect_call: bool = False) -> ProviderObservation:
+        common = initial_observation(result, effect_call=effect_call)
         if common is not None:
             if prior_ref and common.provider_request_ref is None:
                 return ProviderObservation(common.disposition, common.detail_code, provider_request_ref=prior_ref)
