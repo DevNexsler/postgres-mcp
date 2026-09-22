@@ -250,11 +250,26 @@ async def test_email_reconciliation_reads_queued_thread_result_text():
     assert reconciled.message_id == f"<outbound-action-{ACTION_UID}@pfg.example>"
 
 
+class FakeMonotonicClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 @pytest.mark.asyncio
 async def test_email_reconciliation_polls_bounded_pending_lookup_to_completion():
+    clock = FakeMonotonicClock()
     adapter = EmailAdapter(
         sender_domains={"nigel-zoho": "pfg.example"},
-        reconciliation_poll_attempts=3,
+        reconciliation_sleep=clock.sleep,
+        reconciliation_clock=clock,
     )
     unknown = ProviderObservation(
         ProviderDisposition.AMBIGUOUS,
@@ -292,6 +307,70 @@ async def test_email_reconciliation_polls_bounded_pending_lookup_to_completion()
         "request_status",
         "request_status",
     ]
+
+
+def running_thread_lookup():
+    return McpCallResult(structured_content={"status": "running", "request_id": "thread-lookup-1", "call_id": "thread-lookup-1"})
+
+
+def completed_thread_lookup():
+    return McpCallResult(
+        structured_content={
+            "status": "completed",
+            "request_id": "thread-lookup-1",
+            "result": {
+                "tool_name": "email_get_thread",
+                "structured_content": {"data": {"content": [{"type": "text", "text": "**Thread:** exact deterministic message"}]}},
+            },
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_email_reconciliation_waits_for_running_lookup_job_to_complete():
+    # Incident 2026-09-22 (#3241): the lookup job stayed `running` across
+    # several request_status polls issued back-to-back, and reconcile judged
+    # it inconclusive before the job finished.
+    clock = FakeMonotonicClock()
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        reconciliation_sleep=clock.sleep,
+        reconciliation_clock=clock,
+    )
+    unknown = ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous")
+    client = FakeClient(
+        pending("thread-lookup-1"),
+        *(running_thread_lookup() for _ in range(5)),
+        completed_thread_lookup(),
+    )
+
+    reconciled = await adapter.reconcile(client, context(), ACTION_UID, unknown)
+
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert reconciled.detail_code == "email_reconciled_by_message_id"
+    assert [call[1] for call in client.calls] == ["email_get_thread"] + ["request_status"] * 6
+    assert len(clock.sleeps) == 6
+    assert all(seconds > 0 for seconds in clock.sleeps)
+
+
+@pytest.mark.asyncio
+async def test_email_reconciliation_stops_waiting_for_lookup_job_at_the_wait_budget():
+    clock = FakeMonotonicClock()
+    adapter = EmailAdapter(
+        sender_domains={"nigel-zoho": "pfg.example"},
+        reconciliation_wait_seconds=2.0,
+        reconciliation_sleep=clock.sleep,
+        reconciliation_clock=clock,
+    )
+    unknown = ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous")
+    client = FakeClient(pending("thread-lookup-1"), *(running_thread_lookup() for _ in range(100)))
+
+    reconciled = await adapter.reconcile(client, context(), ACTION_UID, unknown)
+
+    assert reconciled.disposition is ProviderDisposition.AMBIGUOUS
+    assert reconciled.detail_code == "email_reconciliation_inconclusive"
+    assert clock.now == pytest.approx(2.0)
+    assert len(client.calls) < 100
 
 
 def test_email_adapter_applies_management_copy_only_to_configured_sources():

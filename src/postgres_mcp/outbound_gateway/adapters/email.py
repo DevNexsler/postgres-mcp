@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from typing import Awaitable
+from typing import Callable
 from typing import Mapping
 from uuid import UUID
 
@@ -27,14 +31,23 @@ class EmailAdapter:
         *,
         sender_domains: Mapping[str, str],
         cc_by_source: Mapping[str, str] | None = None,
-        reconciliation_poll_attempts: int = 3,
+        reconciliation_wait_seconds: float = 10.0,
+        reconciliation_poll_interval_seconds: float = 0.5,
+        reconciliation_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        reconciliation_clock: Callable[[], float] = time.monotonic,
     ):
         self._sender_domains = dict(sender_domains)
         self._cc_by_source = dict(cc_by_source or {})
-        self._reconciliation_poll_attempts = max(
-            1,
-            min(reconciliation_poll_attempts, 5),
-        )
+        # email_get_thread runs as an Agent Email queue job. Wait for it on
+        # the same budget a synchronous provider call gets (McpServerConfig's
+        # default timeout), well inside the reconcile lease; a job still
+        # running at the deadline stays inconclusive.
+        if reconciliation_wait_seconds < 0 or reconciliation_poll_interval_seconds <= 0:
+            raise ValueError("email reconciliation wait must be non-negative and its poll interval positive")
+        self._reconciliation_wait_seconds = reconciliation_wait_seconds
+        self._reconciliation_poll_interval_seconds = reconciliation_poll_interval_seconds
+        self._reconciliation_sleep = reconciliation_sleep
+        self._reconciliation_clock = reconciliation_clock
 
     def validate(self, context: ActionContext) -> None:
         if context.operation is not Operation.EMAIL_SEND:
@@ -110,11 +123,12 @@ class EmailAdapter:
             {"account_id": context.provider_account, "messageId": message_id, "folder": "Sent"},
         )
         first = initial_observation(lookup)
-        for _ in range(self._reconciliation_poll_attempts):
-            if not first or first.disposition is not ProviderDisposition.PENDING:
+        deadline = self._reconciliation_clock() + self._reconciliation_wait_seconds
+        while first and first.disposition is ProviderDisposition.PENDING and first.provider_request_ref:
+            remaining = deadline - self._reconciliation_clock()
+            if remaining <= 0:
                 break
-            if not first.provider_request_ref:
-                break
+            await self._reconciliation_sleep(min(self._reconciliation_poll_interval_seconds, remaining))
             lookup = await client.call(
                 "agent-email",
                 "request_status",
