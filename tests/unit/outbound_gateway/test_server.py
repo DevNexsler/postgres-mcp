@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
@@ -121,6 +123,43 @@ def test_loopback_http_health_and_metrics_routes_are_sanitized():
     assert metrics.status_code == 200
     assert 'outbound_gateway_actions_total{outcome="submitted"} 3' in metrics.text
     assert "recipient" not in metrics.text
+
+
+CREATE_OR_LOAD_ROLE_REFUSAL = (
+    "requires action_role provider_mutation and intent_kind tenantcloud_lead_status"
+)
+
+
+@pytest.mark.asyncio
+async def test_create_or_load_refusal_logs_mcp_error_and_http_status_before_reraise(caplog):
+    service = AsyncMock()
+    service.execute = AsyncMock(side_effect=Exception(CREATE_OR_LOAD_ROLE_REFUSAL))
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(Exception, match=CREATE_OR_LOAD_ROLE_REFUSAL):
+            await handle_outbound_action(service, policy, execute_payload())
+
+    refusal = [r.getMessage() for r in caplog.records if "outbound_action refused" in r.getMessage()]
+    assert len(refusal) == 1
+    assert "mcp_is_error=true" in refusal[0]
+    assert "http_status=200" in refusal[0]
+    assert CREATE_OR_LOAD_ROLE_REFUSAL in refusal[0]
+    service.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_load_refusal_still_survives_mcp_error_wrapper():
+    service = AsyncMock()
+    service.execute = AsyncMock(side_effect=Exception(CREATE_OR_LOAD_ROLE_REFUSAL))
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    with pytest.raises(ToolError) as exc:
+        await mcp.call_tool("outbound_action", {"request": execute_payload()})
+
+    message = str(exc.value)
+    assert message.startswith("Error executing tool outbound_action:")
+    assert CREATE_OR_LOAD_ROLE_REFUSAL in message
 
 
 @pytest.mark.asyncio

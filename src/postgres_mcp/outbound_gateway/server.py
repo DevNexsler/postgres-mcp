@@ -59,6 +59,14 @@ from .worker import OutboundWorker
 
 logger = logging.getLogger(__name__)
 
+# FastMCP streamable HTTP always answers tool failures with HTTP 200 and
+# isError: true. Operators need one gateway line that names both sides when
+# a pre-dispatch refusal (for example create_or_load_outbound_action) still
+# propagates as an MCP tool error for the reconciler.
+_OUTBOUND_ACTION_REFUSAL_LOG = (
+    "outbound_action refused mcp_is_error=true http_status=200: %s"
+)
+
 # TenantCloud's API origin is a fixed literal, never a runtime-configurable
 # value. Task 7's adapter and this module both depend on this exact string;
 # nothing in this file ever reads an environment variable to build it.
@@ -108,6 +116,10 @@ class GatewayRuntime:
     policy: FeaturePolicy
     observability: GatewayObservability
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None
+
+
+def _log_outbound_action_refusal(exc: BaseException) -> None:
+    logger.error(_OUTBOUND_ACTION_REFUSAL_LOG, exc)
 
 
 async def handle_outbound_action(
@@ -168,7 +180,11 @@ async def handle_outbound_action(
             )
         else:
             if parsed.operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None:
-                result = await service.enqueue(parsed)
+                try:
+                    result = await service.enqueue(parsed)
+                except Exception as exc:
+                    _log_outbound_action_refusal(exc)
+                    raise
                 if result.status is PublicStatus.PENDING:
                     try:
                         await tenantcloud_submitter.submit(result.action_id)
@@ -178,7 +194,11 @@ async def handle_outbound_action(
                             result.action_id,
                         )
             else:
-                result = await service.execute(parsed)
+                try:
+                    result = await service.execute(parsed)
+                except Exception as exc:
+                    _log_outbound_action_refusal(exc)
+                    raise
     payload = result.model_dump(mode="json")
     if result.detail is None:
         # Every result except a traffic-control block leaves detail unset --
