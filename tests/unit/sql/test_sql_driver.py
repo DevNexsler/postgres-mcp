@@ -5,9 +5,29 @@ from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
+from psycopg.errors import RaiseException
 
 from postgres_mcp.sql import DbConnPool
 from postgres_mcp.sql import SqlDriver
+
+
+@pytest.mark.asyncio
+async def test_sql_refusal_does_not_invalidate_shared_pool(mock_db_pool):
+    """A policy RAISE is a query result, not a broken connection."""
+    db_pool, _, _ = mock_db_pool
+    db_pool._last_error = None
+    driver = SqlDriver(conn=db_pool)
+    driver._execute_with_connection = AsyncMock(
+        side_effect=[RaiseException("expected policy refusal"), []]
+    )
+
+    with pytest.raises(RaiseException, match="expected policy refusal"):
+        await driver.execute_query("SELECT 1")
+
+    assert db_pool._is_valid is True
+    assert db_pool._last_error is None
+    assert await driver.execute_query("SELECT 1") == []
+    assert db_pool.pool_connect.await_count == 2
 
 
 class AsyncContextManagerMock(AsyncMock):

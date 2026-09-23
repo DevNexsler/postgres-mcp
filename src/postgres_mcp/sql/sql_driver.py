@@ -211,15 +211,13 @@ class SqlDriver:
             else:
                 # Direct connection approach
                 return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
-        except Exception as e:
-            # Mark pool as invalid if there was a connection issue
-            if self.conn and self.is_pool:
-                self.conn._is_valid = False  # type: ignore
-                self.conn._last_error = str(e)  # type: ignore
-            elif self.conn and not self.is_pool:
+        except Exception:
+            # The pool owns connection recovery. A SQL refusal must not make
+            # the next concurrent query close a healthy shared pool.
+            if self.conn and not self.is_pool:
                 self.conn = None
 
-            raise e
+            raise
 
     async def _execute_with_connection(self, connection, query, params, force_readonly) -> Optional[List[RowResult]]:
         """Execute query with the given connection."""
