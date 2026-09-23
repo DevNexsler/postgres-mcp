@@ -181,6 +181,43 @@ async def test_non_sms_channel_freshness_is_preserved(traffic, operation):
 
 
 @pytest.mark.asyncio
+async def test_cliq_internal_reply_ignores_cron_alert_but_blocks_new_human_message(traffic):
+    conn, repository = traffic
+    await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source) "
+        "VALUES (750824,18,%s,'outbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
+    )
+    alert_only = await verdict(repository)
+    assert alert_only.allowed and alert_only.reason == "pass"
+
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source) "
+        "VALUES (750825,18,%s,'inbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=11), "Could you call me?"),
+    )
+    human_followup = await verdict(repository)
+    assert not human_followup.allowed
+    assert human_followup.reason == "stale_context"
+    assert "message 750825" in human_followup.detail
+
+
+@pytest.mark.asyncio
+async def test_cliq_internal_reply_still_blocks_non_alert_outbound(traffic):
+    conn, repository = traffic
+    await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source) "
+        "VALUES (750825,18,%s,'outbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=10), "I already sent pong."),
+    )
+    result = await verdict(repository)
+    assert not result.allowed
+    assert result.reason == "stale_context"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("subject", "state", "dispatched", "reason"),
     [
