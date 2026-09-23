@@ -413,6 +413,7 @@ class PostgresActionStore:
                 'unknown', 'reconciling', 'retry_ready'
             )
               AND (lease_owner IS NULL OR lease_expires_at <= now())
+              AND next_attempt_at <= now()
               AND attempt_count >= {}
             ORDER BY updated_at, action_id
             LIMIT {}
