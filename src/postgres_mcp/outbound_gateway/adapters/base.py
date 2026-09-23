@@ -141,8 +141,13 @@ def mcp_text(result: McpCallResult) -> str:
     return "\n".join(mcp_text_parts(result))
 
 
-def transport_observation(result: McpCallResult) -> ProviderObservation | None:
-    if result.error_kind is TransportErrorKind.AUTH_REJECTED:
+def transport_observation(result: McpCallResult, *, effect_call: bool = False) -> ProviderObservation | None:
+    # A transport failure proves non-acceptance only of the request that
+    # failed. On the effect call (adapter.invoke) that is the send itself, so
+    # a rejected or never-written tool request is retryable. On a status poll
+    # or reconciliation lookup it says nothing about the original send, and a
+    # retry there could duplicate a delivered effect.
+    if effect_call and result.error_kind is TransportErrorKind.AUTH_REJECTED:
         return ProviderObservation(
             ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
             "provider_auth_rejected",
@@ -150,6 +155,16 @@ def transport_observation(result: McpCallResult) -> ProviderObservation | None:
             retryable=True,
             evidence={"kind": "http_auth_rejection"},
         )
+    if effect_call and result.error_kind is not None and result.before_tool_request:
+        return ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "provider_unavailable_before_tool_request",
+            category="provider_unavailable",
+            retryable=True,
+            evidence={"kind": "failed_before_tool_request", "error_kind": result.error_kind.value},
+        )
+    if result.error_kind is TransportErrorKind.AUTH_REJECTED:
+        return ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_auth_rejected")
     if result.error_kind is TransportErrorKind.TIMEOUT:
         return ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_timeout")
     if result.error_kind is TransportErrorKind.CONNECTION_LOST:
@@ -159,8 +174,8 @@ def transport_observation(result: McpCallResult) -> ProviderObservation | None:
     return None
 
 
-def initial_observation(result: McpCallResult) -> ProviderObservation | None:
-    transport = transport_observation(result)
+def initial_observation(result: McpCallResult, *, effect_call: bool = False) -> ProviderObservation | None:
+    transport = transport_observation(result, effect_call=effect_call)
     if transport is not None:
         return transport
     payload = result.structured_content

@@ -66,7 +66,7 @@ class EmailAdapter:
         )
 
     async def invoke(self, client: McpProviderClient, request: ProviderRequest) -> ProviderObservation:
-        return self._parse(await client.call(request.server_name, request.tool, request.arguments))
+        return self._parse(await client.call(request.server_name, request.tool, request.arguments), effect_call=True)
 
     async def poll(self, client: McpProviderClient, observation: ProviderObservation) -> ProviderObservation:
         if not observation.provider_request_ref:
@@ -135,8 +135,8 @@ class EmailAdapter:
         )
 
     @staticmethod
-    def _parse(result: McpCallResult, *, prior_ref: str | None = None) -> ProviderObservation:
-        common = initial_observation(result)
+    def _parse(result: McpCallResult, *, prior_ref: str | None = None, effect_call: bool = False) -> ProviderObservation:
+        common = initial_observation(result, effect_call=effect_call)
         if common is not None:
             if prior_ref and common.provider_request_ref is None:
                 return ProviderObservation(

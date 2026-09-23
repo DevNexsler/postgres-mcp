@@ -168,7 +168,8 @@ def test_auth_rejection_is_retryable_definitive_non_acceptance():
             error_kind=TransportErrorKind.AUTH_REJECTED,
             is_error=True,
             safe_detail="provider_auth_rejected",
-        )
+        ),
+        effect_call=True,
     )
 
     assert observation is not None
@@ -176,6 +177,95 @@ def test_auth_rejection_is_retryable_definitive_non_acceptance():
     assert observation.detail_code == "provider_auth_rejected"
     assert observation.category == "provider_authentication"
     assert observation.retryable is True
+
+
+def session_timeout_before_tool_request():
+    return McpCallResult(
+        error_kind=TransportErrorKind.TIMEOUT,
+        is_error=True,
+        safe_detail="provider_transport_timeout",
+        before_tool_request=True,
+    )
+
+
+def auth_rejected():
+    return McpCallResult(error_kind=TransportErrorKind.AUTH_REJECTED, is_error=True, safe_detail="provider_auth_rejected")
+
+
+MCP_EFFECT_ADAPTERS = [
+    (lambda: EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"}), Operation.EMAIL_SEND),
+    (lambda: CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"}), Operation.CALENDAR_CREATE),
+    (lambda: CliqAdapter(Operation.CLIQ_CHANNEL_POST), Operation.CLIQ_CHANNEL_POST),
+    (lambda: QuoSmsAdapter(user_id="user-1"), Operation.QUO_SMS_SEND),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("make_adapter", "operation"), MCP_EFFECT_ADAPTERS)
+async def test_effect_call_failing_before_tool_request_is_retryable_non_acceptance(make_adapter, operation):
+    adapter = make_adapter()
+    request = adapter.build_request(context(operation), ACTION_UID)
+
+    observation = await adapter.invoke(FakeClient(session_timeout_before_tool_request()), request)
+
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.detail_code == "provider_unavailable_before_tool_request"
+    assert observation.retryable is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("make_adapter", "operation"), MCP_EFFECT_ADAPTERS)
+async def test_effect_call_timeout_after_tool_request_stays_ambiguous(make_adapter, operation):
+    adapter = make_adapter()
+    request = adapter.build_request(context(operation), ACTION_UID)
+    timeout = McpCallResult(error_kind=TransportErrorKind.TIMEOUT, is_error=True, safe_detail="provider_transport_timeout")
+
+    observation = await adapter.invoke(FakeClient(timeout), request)
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "provider_timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_adapter",
+    [
+        lambda: EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"}),
+        lambda: CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"}),
+        lambda: CliqAdapter(Operation.CLIQ_CHANNEL_POST),
+    ],
+)
+@pytest.mark.parametrize("failure", [session_timeout_before_tool_request, auth_rejected])
+async def test_status_poll_failing_before_tool_request_stays_ambiguous(make_adapter, failure):
+    # A poll that never reached the provider says nothing about the send it
+    # asks about; treating it as non-acceptance would re-send a queued email.
+    adapter = make_adapter()
+
+    observation = await adapter.poll(
+        FakeClient(failure()),
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+    )
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.provider_request_ref == "req-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [session_timeout_before_tool_request, auth_rejected])
+async def test_email_reconciliation_lookups_failing_before_tool_request_stay_ambiguous(failure):
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.example"})
+    client = FakeClient(failure(), failure())
+
+    observation = await adapter.reconcile(
+        client,
+        context(),
+        ACTION_UID,
+        ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous", provider_request_ref="req-1"),
+    )
+
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "email_reconciliation_inconclusive"
+    assert [call[1] for call in client.calls] == ["request_status", "email_get_thread"]
 
 
 @pytest.mark.asyncio

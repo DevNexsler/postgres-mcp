@@ -50,7 +50,7 @@ class QuoSmsAdapter:
         )
 
     async def invoke(self, client: McpProviderClient, request: ProviderRequest) -> ProviderObservation:
-        return self._parse(await client.call(request.server_name, request.tool, request.arguments))
+        return self._parse(await client.call(request.server_name, request.tool, request.arguments), effect_call=True)
 
     async def poll(self, client: McpProviderClient, observation: ProviderObservation) -> ProviderObservation:
         return observation
@@ -126,8 +126,8 @@ class QuoSmsAdapter:
         return sent_at >= context.source_sent_at
 
     @classmethod
-    def _parse(cls, result: McpCallResult) -> ProviderObservation:
-        common = initial_observation(result)
+    def _parse(cls, result: McpCallResult, *, effect_call: bool = False) -> ProviderObservation:
+        common = initial_observation(result, effect_call=effect_call)
         if common is not None:
             return common
         payload = result.structured_content
