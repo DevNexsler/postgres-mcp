@@ -271,6 +271,15 @@ class OutboundGatewayRepository:
             LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
             WHERE message.channel_id = {}
               AND message.created_at > {}
+              AND NOT (
+                  -- Automated operations alerts share Nigel's Cliq DM with Dan.
+                  -- They do not answer an inbound DM and must not stale its
+                  -- internal_reply action. Keep human follow-ups in the probe.
+                  sending.operation = 'cliq.chat.post'
+                  AND message.source = 'zoho_cliq'
+                  AND message.direction = 'outbound'
+                  AND message.body LIKE '⚠️ Cron issue —%'
+              )
               AND (
                   sending.operation IS DISTINCT FROM 'quo.sms.send'
                   OR (
