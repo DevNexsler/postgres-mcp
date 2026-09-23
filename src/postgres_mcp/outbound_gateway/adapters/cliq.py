@@ -40,6 +40,10 @@ class CliqAdapter:
                 "channel_unique_name" if channel else "chat_id": context.target.target_id,
                 "text": str(context.arguments["text"]),
                 "sync_message": True,
+                "idempotency_key": (
+                    f"cliq-wake:{context.wakeup_event_id}:"
+                    f"{context.action_role.value}:{self._operation.value}"
+                ),
             },
         )
 
@@ -85,7 +89,7 @@ class CliqAdapter:
         for item in json_objects(payload):
             status = item.get("status")
             message_id = item.get("provider_message_id")
-            if status == "sent" and isinstance(message_id, str) and message_id.strip():
+            if status in {"sent", "duplicate_suppressed"} and isinstance(message_id, str) and message_id.strip():
                 return accepted_observation(request_ref_value=ref, message_id=message_id.strip())
         return ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
