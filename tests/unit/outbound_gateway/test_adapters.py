@@ -532,6 +532,9 @@ async def test_cliq_adapter_builds_only_derived_destination(operation, tool, tar
     assert request.tool == tool
     assert request.arguments[target_field] == ctx.target.target_id
     assert request.arguments["text"] == ctx.arguments["text"]
+    assert request.arguments["idempotency_key"] == (
+        f"cliq-wake:{ctx.wakeup_event_id}:{ctx.action_role.value}:{operation.value}"
+    )
 
 
 @pytest.mark.asyncio
@@ -565,6 +568,33 @@ async def test_cliq_chat_reply_uses_one_provider_call_and_polls_its_receipt():
     assert receipt is not None
     assert receipt.provider_message_id == "provider-cliq-message-1"
     assert [call[1] for call in client.calls] == ["cliq_chat_post", "request_status"]
+
+
+@pytest.mark.asyncio
+async def test_cliq_chat_shared_key_accepts_aes_duplicate_receipt():
+    adapter = CliqAdapter(Operation.CLIQ_CHAT_POST)
+    ctx = context(Operation.CLIQ_CHAT_POST, action_role=ActionRole.INTERNAL_REPLY, intent_kind=IntentKind.INTERNAL_REPLY)
+    client = FakeClient(
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": '{"status":"duplicate_suppressed","provider_message_id":"provider-cliq-message-1"}',
+                    }],
+                },
+            }
+        )
+    )
+
+    observed = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    receipt = adapter.parse_receipt(ctx, observed)
+
+    assert observed.disposition is ProviderDisposition.ACCEPTED
+    assert receipt is not None
+    assert receipt.provider_message_id == "provider-cliq-message-1"
+    assert [call[1] for call in client.calls] == ["cliq_chat_post"]
 
 
 @pytest.mark.asyncio
