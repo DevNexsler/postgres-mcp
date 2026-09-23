@@ -1687,6 +1687,63 @@ async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contamina
 
 
 @pytest.mark.asyncio
+async def test_cliq_wake_reply_targets_its_inbound_chat_without_property():
+    inbound = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="1424728044450751028",
+        channel_type="dm",
+        subject=None,
+        envelope={"identity": {}, "message": {}},
+        raw_payload={},
+    )
+    outbound = request(
+        action_role="internal_reply",
+        operation="cliq.chat.post",
+        intent_kind="internal_reply",
+        appointment_slot=None,
+        arguments={"channel_or_chat_id": "1424728044450751028", "text": "pong"},
+    )
+
+    context = await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
+
+    assert context.target.kind == "cliq_chat"
+    assert context.target.target_id == "1424728044450751028"
+    assert context.intent_kind == "internal_reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "target", "channel_type"),
+    [
+        ("zoho_cliq", "different-chat", "dm"),
+        ("zoho_mail", "1424728044450751028", "dm"),
+        ("zoho_cliq", "1424728044450751028", "channel"),
+    ],
+)
+async def test_cliq_wake_reply_rejects_wrong_chat_or_non_cliq_source(source, target, channel_type):
+    inbound = record(
+        event_source=source,
+        message_source=source,
+        source_channel_id="1424728044450751028",
+        channel_type=channel_type,
+        subject=None,
+        envelope={"identity": {}, "message": {}},
+        raw_payload={},
+    )
+    outbound = request(
+        action_role="internal_reply",
+        operation="cliq.chat.post",
+        intent_kind="internal_reply",
+        appointment_slot=None,
+        arguments={"channel_or_chat_id": target, "text": "pong"},
+    )
+
+    with pytest.raises(ContextDerivationError, match="Cliq reply target"):
+        await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
+
+
+@pytest.mark.asyncio
 async def test_internal_notification_prospect_id_keys_on_the_resolved_channel_not_a_shared_literal():
     """CRITICAL 2: before this fix every internal_notification without a
     TenantCloud claim shared the single literal prospect_id "internal:none"

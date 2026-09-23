@@ -275,16 +275,14 @@ class ActionContextLoader:
                 prospect_id = f"prospect:{self._preferred_alias(aliases)}"
             else:
                 prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
-        elif request.action_role is ActionRole.INTERNAL_NOTIFICATION or request.operation in _TENANTCLOUD_OPERATIONS:
+        elif request.action_role in {ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY} or request.operation in _TENANTCLOUD_OPERATIONS:
             if record.tenantcloud_claim_id is not None:
                 prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}"
-            elif request.action_role is ActionRole.INTERNAL_NOTIFICATION:
-                # CRITICAL 2 fix: every internal notification without a
-                # TenantCloud claim used to share the single literal
-                # "internal:none" as its traffic-control subject/lease key --
-                # one lease and one staleness watermark for every escalation
-                # across every wake, so concurrent escalations to *different*
-                # Cliq channels cross-blocked each other. The spec's internal
+            elif request.action_role in {ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY}:
+                # Internal actions without a TenantCloud claim must not use
+                # the shared "internal:none" traffic-control lease key.
+                # Concurrent actions to different Cliq chats then cannot
+                # cross-block each other. The spec's internal
                 # recipient key is the channel: key on the resolved Cliq
                 # channel/chat id (target.target_id for CLIQ_CHANNEL_POST/
                 # CLIQ_CHAT_POST already *is* arguments.channel_or_chat_id --
@@ -302,6 +300,7 @@ class ActionContextLoader:
 
         requires_property = request.intent_kind not in {
             IntentKind.INQUIRY_REPLY,
+            IntentKind.INTERNAL_REPLY,
             IntentKind.LEAD_ALERT,
             IntentKind.MANUAL_REVIEW_ALERT,
             IntentKind.TENANTCLOUD_LEAD_STATUS,
@@ -830,6 +829,16 @@ class ActionContextLoader:
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)
+            if request.intent_kind == IntentKind.INTERNAL_REPLY:
+                if (
+                    request.action_role is not ActionRole.INTERNAL_REPLY
+                    or request.operation is not Operation.CLIQ_CHAT_POST
+                    or record.message_source != "zoho_cliq"
+                    or record.channel_type != "dm"
+                    or not record.source_channel_id
+                    or request.arguments.channel_or_chat_id != record.source_channel_id
+                ):
+                    raise ContextDerivationError("Cliq reply target must match the inbound chat")
             kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
             return DerivedTarget(kind, request.arguments.channel_or_chat_id, True), request.arguments.channel_or_chat_id
         assert isinstance(request.arguments, (CalendarCreateArguments, CalendarUpdateArguments, CalendarDeleteArguments))
