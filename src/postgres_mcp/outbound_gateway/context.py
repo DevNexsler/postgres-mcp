@@ -37,6 +37,7 @@ from .repository import WakeEventRecord
 logger = logging.getLogger(__name__)
 
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
+INTERNAL_ACTION_NAMESPACE = UUID("9af724c8-470b-54be-a4cc-e77a159b49ae")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _SYSTEM_EMAIL_LOCAL_PARTS = frozenset({"mailer-daemon", "no-reply", "noreply", "do-not-reply", "donotreply", "postmaster"})
@@ -310,10 +311,21 @@ class ActionContextLoader:
         if requires_property and property_id is None:
             raise ContextDerivationError("verified property could not be derived")
 
-        action_id = uuid5(
-            ACTION_NAMESPACE,
-            f"v1:wakeup:{request.wakeup_event_id}:role:{request.action_role}:ordinal:0",
-        )
+        if record.provenance == "internal_test":
+            run_id = (record.qualification_run_id or "").strip()
+            if not run_id:
+                raise ContextDerivationError("internal qualification wake has no run identity")
+            action_id = uuid5(
+                INTERNAL_ACTION_NAMESPACE,
+                f"v2-internal:run:{run_id}:wakeup:{request.wakeup_event_id}:role:{request.action_role}:ordinal:0",
+            )
+        elif record.provenance == "customer":
+            action_id = uuid5(
+                ACTION_NAMESPACE,
+                f"v1:wakeup:{request.wakeup_event_id}:role:{request.action_role}:ordinal:0",
+            )
+        else:
+            raise ContextDerivationError("unsupported wake provenance")
         showing_lifecycle_id = (
             _nonblank(raw.get("showing_lifecycle_id")) or _nonblank(raw.get("booking_id")) or f"showing:wake:{request.wakeup_event_id}"
         )

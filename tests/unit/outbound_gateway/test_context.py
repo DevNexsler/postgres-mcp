@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
+from uuid import uuid5
 
 import pytest
 
@@ -112,6 +113,22 @@ def policy():
             "hotpads:zrm-thread-44": "conversation:zillow-amanda-bullman",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_qualification_action_id_matches_run_scoped_database_identity():
+    run_id = "qualification-3248"
+    values = dict(record().__dict__)
+    values.update(provenance="internal_test", qualification_run_id=run_id)
+    event = SimpleNamespace(**values)
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
+
+    expected = uuid5(
+        UUID("9af724c8-470b-54be-a4cc-e77a159b49ae"),
+        f"v2-internal:run:{run_id}:wakeup:{event.wakeup_event_id}:role:prospect_reply:ordinal:0",
+    )
+    assert context.action_id == expected
+    assert context.lock_holder == f"outbound-gateway:{expected}"
 
 
 def request(**overrides) -> ExecuteRequest:
