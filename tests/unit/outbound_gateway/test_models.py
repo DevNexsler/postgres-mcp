@@ -463,6 +463,41 @@ def test_cliq_arguments_carry_the_agent_supplied_channel_or_chat_id(operation):
     assert parsed.arguments.channel_or_chat_id == "tenant-leads-7"
 
 
+@pytest.mark.parametrize(
+    ("operation", "role", "arguments"),
+    [
+        ("cliq.channel.post", "internal_notification", {"channel_or_chat_id": "chat-42", "text": "pong"}),
+        ("cliq.chat.post", "prospect_reply", {"channel_or_chat_id": "chat-42", "text": "pong"}),
+        ("cliq.chat.post", "internal_notification", {"channel_or_chat_id": "chat-42", "text": "pong"}),
+        ("email.send", "internal_notification", {"to_address": "person@example.com", "text": "pong"}),
+    ],
+)
+def test_internal_reply_intent_is_only_for_internal_cliq_chat(operation, role, arguments):
+    with pytest.raises(ValidationError, match="internal_reply"):
+        parse_outbound_request(
+            execute_payload(
+                operation=operation,
+                action_role=role,
+                intent_kind="internal_reply",
+                appointment_slot=None,
+                arguments=arguments,
+            )
+        )
+
+
+def test_internal_reply_role_rejects_other_intent():
+    with pytest.raises(ValidationError, match="internal_reply"):
+        parse_outbound_request(
+            execute_payload(
+                operation="cliq.chat.post",
+                action_role="internal_reply",
+                intent_kind="manual_review_alert",
+                appointment_slot=None,
+                arguments={"channel_or_chat_id": "chat-42", "text": "alert"},
+            )
+        )
+
+
 @pytest.mark.parametrize("bad", ["", "   ", None, 5, True])
 def test_cliq_channel_or_chat_id_rejects_empty_or_wrong_type(bad):
     with pytest.raises(ValidationError):

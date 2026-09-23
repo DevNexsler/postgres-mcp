@@ -27,6 +27,7 @@ class ActionRole(StrEnum):
     PROSPECT_REPLY = "prospect_reply"
     CALENDAR_MUTATION = "calendar_mutation"
     INTERNAL_NOTIFICATION = "internal_notification"
+    INTERNAL_REPLY = "internal_reply"
     PROVIDER_MUTATION = "provider_mutation"
 
 
@@ -46,6 +47,7 @@ class Operation(StrEnum):
 
 class IntentKind(StrEnum):
     INQUIRY_REPLY = "inquiry_reply"
+    INTERNAL_REPLY = "internal_reply"
     SHOWING_OFFER = "showing_offer"
     SHOWING_CONFIRMATION = "showing_confirmation"
     SHOWING_RESCHEDULE = "showing_reschedule"
@@ -474,6 +476,13 @@ class ExecuteRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_matrix(self) -> ExecuteRequest:
+        if self.intent_kind == IntentKind.INTERNAL_REPLY or self.action_role is ActionRole.INTERNAL_REPLY:
+            if (
+                self.action_role is not ActionRole.INTERNAL_REPLY
+                or self.operation is not Operation.CLIQ_CHAT_POST
+                or self.intent_kind != IntentKind.INTERNAL_REPLY
+            ):
+                raise ValueError("internal_reply requires internal_reply cliq.chat.post")
         if self.intent_kind in SLOT_REQUIRED_INTENTS and self.appointment_slot is None:
             raise ValueError("appointment_slot is required for this intent")
         known_intent = self.intent_kind in _KNOWN_INTENT_KINDS

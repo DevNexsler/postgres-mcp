@@ -535,6 +535,58 @@ async def test_cliq_adapter_builds_only_derived_destination(operation, tool, tar
 
 
 @pytest.mark.asyncio
+async def test_cliq_chat_reply_uses_one_provider_call_and_polls_its_receipt():
+    adapter = CliqAdapter(Operation.CLIQ_CHAT_POST)
+    ctx = context(Operation.CLIQ_CHAT_POST, action_role=ActionRole.INTERNAL_REPLY, intent_kind=IntentKind.INTERNAL_REPLY)
+    client = FakeClient(
+        pending("cliq-request-1"),
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "request_id": "cliq-request-1",
+                "result": {
+                    "tool_name": "cliq_chat_post",
+                    "structured_content": {
+                        "status": "sent",
+                        "provider_message_id": "provider-cliq-message-1",
+                    },
+                },
+            }
+        ),
+    )
+
+    request = adapter.build_request(ctx, ACTION_UID)
+    pending_reply = await adapter.invoke(client, request)
+    accepted = await adapter.poll(client, pending_reply)
+    receipt = adapter.parse_receipt(ctx, accepted)
+
+    assert pending_reply.disposition is ProviderDisposition.PENDING
+    assert accepted.disposition is ProviderDisposition.ACCEPTED
+    assert receipt is not None
+    assert receipt.provider_message_id == "provider-cliq-message-1"
+    assert [call[1] for call in client.calls] == ["cliq_chat_post", "request_status"]
+
+
+@pytest.mark.asyncio
+async def test_cliq_chat_timeout_without_request_id_does_not_send_again():
+    adapter = CliqAdapter(Operation.CLIQ_CHAT_POST)
+    ctx = context(Operation.CLIQ_CHAT_POST, action_role=ActionRole.INTERNAL_REPLY, intent_kind=IntentKind.INTERNAL_REPLY)
+    client = FakeClient(
+        McpCallResult(
+            is_error=True,
+            error_kind=TransportErrorKind.TIMEOUT,
+            safe_detail="provider_transport_timeout",
+        )
+    )
+
+    uncertain = await adapter.invoke(client, adapter.build_request(ctx, ACTION_UID))
+    reconciled = await adapter.reconcile(client, ctx, ACTION_UID, uncertain)
+
+    assert reconciled.disposition is ProviderDisposition.AMBIGUOUS
+    assert [call[1] for call in client.calls] == ["cliq_chat_post"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "tool"),
     [
