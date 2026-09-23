@@ -59,6 +59,8 @@ class WakeEventRecord:
     tenantcloud_claim_state: str | None = None
     tenantcloud_action_owner: str | None = None
     tenantcloud_entity_scope_key: str | None = None
+    provenance: str = "customer"
+    qualification_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,8 @@ class OutboundGatewayRepository:
                 event_row.source AS event_source,
                 event_row.source_event_id,
                 event_row.created_at AS event_created_at,
+                event_row.provenance,
+                event_row.qualification_run_id,
                 message_row.id AS message_id,
                 message_row.canonical_message_id,
                 message_row.source AS message_source,
