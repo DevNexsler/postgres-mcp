@@ -290,6 +290,33 @@ class FakeStore:
         )
         return self.current
 
+    async def block_stale_context(self, action_id, expected_state, lease_owner, acknowledged_through):
+        self.calls.append(("block_stale", expected_state, lease_owner, acknowledged_through))
+        self.current = replace(
+            self.current,
+            state=ActionState.STALE,
+            detail_code="stale_context",
+            error_category=None,
+            stale_context_acknowledged_through=acknowledged_through,
+        )
+        return self.current
+
+    async def confirm_stale_context(self, action_id, *, wakeup_event_id, decision, actor, revision=None):
+        self.calls.append(("confirm_stale", action_id, decision, actor))
+        parent = self.current
+        if decision == "no":
+            self.current = replace(parent, stale_context_decision="no", detail_code="stale_context_declined")
+            return self.current
+        self.current = row(
+            ActionState.RECEIVED,
+            action_id=self.remediation_successor_id or uuid4(),
+            retry_of_action_id=parent.action_id,
+            remediation_reason="stale_context_confirmed",
+            detail_code="stale_context_confirmed",
+            payload_hash=parent.payload_hash,
+        )
+        return self.current
+
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code):
         self.calls.append(("schedule", expected_state, delay_seconds, detail_code))
         self.current = replace(
@@ -357,11 +384,12 @@ def service(store, adapter, *, proof=None, circuit_guard=None, traffic_mode="off
 
 
 class FakeProbe:
-    def __init__(self, *, in_flight=None, newer=None, watermark=NOW, raise_on_in_flight=False):
+    def __init__(self, *, in_flight=None, newer=None, watermark=NOW - timedelta(minutes=5), raise_on_in_flight=False, acknowledged=None):
         self.in_flight = in_flight or []
         self.newer = newer
         self.watermark = watermark
         self.raise_on_in_flight = raise_on_in_flight
+        self.acknowledged = acknowledged
         self.calls = []
 
     async def in_flight_actions(self, recipient_key, exclude_action_id):
@@ -370,13 +398,22 @@ class FakeProbe:
             raise RuntimeError("probe boom")
         return self.in_flight
 
-    async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
+    async def activity_after(self, recipient_key, channel_id, watermark, exclude_action_id, limit):
         self.calls.append(("newest_activity", recipient_key, channel_id, watermark, exclude_action_id))
-        return self.newer
+        if self.newer is None or self.newer.occurred_at <= watermark:
+            return []
+        return [self.newer]
 
     async def context_watermark(self, wakeup_event_id):
         self.calls.append(("watermark", wakeup_event_id))
         return self.watermark
+
+    async def acknowledged_through(self, wakeup_event_id, recipient_key):
+        self.calls.append(("acknowledged", wakeup_event_id, recipient_key))
+        return self.acknowledged
+
+    async def message_created_at(self, message_id):
+        return NOW
 
 
 @pytest.mark.asyncio
@@ -1628,26 +1665,30 @@ async def test_traffic_control_enforce_blocks_on_stale_context():
 
     result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
-    assert result.status is PublicStatus.FAILED
+    # A question, not a failure: a recorded no-send plus the newer context.
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION
+    assert result.retryable is True
     assert result.detail_code == "stale_context"
     assert result.detail is not None
     assert "Are you still available Friday?" in result.detail
-    assert "needs_human" in result.detail
-    assert "stale_context, reply still needed" in result.detail
     assert "override" not in result.detail.casefold()
+    assert [item.id for item in result.new_context] == ["message:999"]
+    assert result.question is not None and '"decision": "yes"' in result.question
     assert adapter.calls == []
-    definitive_calls = [call for call in store.calls if call[0] == "definitive_fail"]
-    assert len(definitive_calls) == 1
-    observation = definitive_calls[0][2]
-    assert observation.category == "traffic_blocked"
-    assert "Are you still available Friday?" in observation.evidence["detail"]
-    assert "needs_human" in observation.evidence["detail"]
-    assert "override" not in observation.evidence["detail"].casefold()
+    assert not any(call[0] in ("prepare", "claim", "definitive_fail") for call in store.calls)
+    blocks = [call for call in store.calls if call[0] == "block_stale"]
+    assert blocks == [("block_stale", ActionState.RECEIVED, None, NOW)]
+    assert store.current.state is ActionState.STALE
+    assert store.current.error_category is None
 
 
 @pytest.mark.asyncio
 async def test_traffic_control_override_bypasses_stale_context_block():
-    store = FakeStore()
+    """override=true is the historical spelling of "yes": the send still
+    happens, but through a recorded block + confirmed successor, never a
+    silent bypass."""
+    successor_id = uuid4()
+    store = FakeStore(remediation_successor_id=successor_id)
     adapter = FakeAdapter(_accepted_observation())
     probe = FakeProbe(
         newer=NewerActivity(
@@ -1659,12 +1700,23 @@ async def test_traffic_control_override_bypasses_stale_context_block():
             action_id=None,
         )
     )
+    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
+    svc._verified_context = AsyncMock(return_value=(replace(context(), action_id=successor_id), "context_verified"))
 
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request(override=True))
+    async def acknowledged(wakeup_event_id, recipient_key):
+        # What block_stale_context recorded, as the database reads it back.
+        return store.current.stale_context_acknowledged_through if store.current.retry_of_action_id is None else NOW
+
+    probe.acknowledged_through = acknowledged
+
+    result = await svc.execute(request(override=True))
 
     assert result.status is PublicStatus.SENT
+    assert result.action_id == successor_id
     assert adapter.calls
     assert not any(call[0] == "definitive_fail" for call in store.calls)
+    assert [call[0] for call in store.calls if call[0] in ("block_stale", "confirm_stale")] == ["block_stale", "confirm_stale"]
+    assert ("confirm_stale", ACTION_ID, "yes", "gateway-test") in store.calls
 
 
 @pytest.mark.asyncio
@@ -1806,67 +1858,43 @@ async def test_resume_shadow_mode_logs_would_block_and_dispatches(caplog):
     assert any("traffic control shadow" in message and "stale_context" in message for message in messages)
 
 
-@pytest.mark.asyncio
-async def test_override_resend_of_traffic_blocked_action_dispatches_a_successor():
-    """CRITICAL 2's red-green: block, then override-resend. The successor
-    action (next effect_ordinal, retry_of_action_id set -- via the same
-    create_outbound_remediation_context() operator remediation uses,
-    Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267)
-    must reach dispatch; the original blocked action_id is never reused
-    (it is permanently DEFINITIVE_FAILED and unclaimable)."""
-    successor_id = uuid4()
-    store = FakeStore(remediation_successor_id=successor_id)
-    adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
+def _legacy_traffic_blocked_row():
+    """A pre-migration-192 stale_context block: definitive_failed /
+    traffic_blocked. Those rows keep the operator-remediation override path."""
+    return row(
+        ActionState.DEFINITIVE_FAILED,
+        action_uid=ACTION_UID,
+        detail_code="stale_context",
+        error_category="traffic_blocked",
     )
-    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
 
-    blocked = await svc.execute(request())
-    assert blocked.status is PublicStatus.FAILED
-    assert blocked.detail_code == "stale_context"
-    assert blocked.action_id == ACTION_ID
+
+@pytest.mark.asyncio
+async def test_override_resend_of_legacy_traffic_blocked_action_dispatches_a_successor():
+    """A legacy definitive_failed traffic block still resends through
+    create_outbound_remediation_context() when an operator resolved it."""
+    successor_id = uuid4()
+    store = FakeStore(_legacy_traffic_blocked_row(), remediation_successor_id=successor_id)
+    adapter = FakeAdapter(_accepted_observation())
+    probe = FakeProbe()
+    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
 
     resent = await svc.execute(request(override=True))
 
     assert resent.status is PublicStatus.SENT
     assert resent.action_id == successor_id
-    assert resent.action_id != blocked.action_id
     assert adapter.calls
     assert any(call[0] == "remediate" and call[1] == ACTION_ID for call in store.calls)
 
 
 @pytest.mark.asyncio
-async def test_override_resend_without_operator_remediation_stays_blocked():
-    """create_outbound_remediation_context requires an evidence-resolved
-    outbound_action_resolutions row (067:1221-1228), which only
-    resolve_outbound_action_from_evidence (operator-only, never granted to
-    the gateway role) can write. Until an operator resolves the block,
-    override must fail soft -- stay on the original terminal result -- not
-    raise the DB's unhandled precondition-violation exception."""
-    store = FakeStore(remediation_error=RuntimeError("remediation requires evidence-resolved definitive failure"))
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
+async def test_override_resend_of_legacy_block_without_operator_remediation_stays_blocked():
+    store = FakeStore(
+        _legacy_traffic_blocked_row(),
+        remediation_error=RuntimeError("remediation requires evidence-resolved definitive failure"),
     )
-    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
-
-    blocked = await svc.execute(request())
-    assert blocked.status is PublicStatus.FAILED
+    adapter = FakeAdapter()
+    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=FakeProbe())
 
     resent = await svc.execute(request(override=True))
 
@@ -1878,16 +1906,11 @@ async def test_override_resend_without_operator_remediation_stays_blocked():
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_of_terminalizing():
-    """Residual Critical from re-review: outbound_action_transition_allowed()
-    has no ('dependency_wait', 'definitive_failed') edge (Comm-Data-Store
-    migrations/067_outbound_action_gateway.sql:346-389). A fresh RECEIVED row
-    whose prepare() hits a contended intent lock lands in DEPENDENCY_WAIT
-    (067:556-564) -- claim()+definitive_fail() on that state would raise the
-    DB's unhandled 'invalid outbound definitive failure state'. The gate must
-    defer (leave the row in DEPENDENCY_WAIT, return a PENDING blocked result)
-    instead, exactly like _preflight()'s READY branch already does for the
-    same lock-contention outcome."""
+async def test_agent_stale_block_never_prepares_so_lock_contention_cannot_strand_it():
+    """The pre-192 path prepared a fresh row first (to make it claimable for
+    definitive_fail) and a contended intent lock parked it in
+    dependency_wait. A confirmable stale block goes received -> stale
+    directly: no intent lock is taken for a message that was not sent."""
     store = FakeStore()
     adapter = FakeAdapter()
     probe = FakeProbe(
@@ -1901,27 +1924,10 @@ async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_
         )
     )
 
-    async def contended_prepare(ctx, expected_state):
-        store.calls.append(("prepare", expected_state))
-        store.current = replace(
-            store.current,
-            state=ActionState.DEPENDENCY_WAIT,
-            detail_code="intent_lock_contended",
-            next_attempt_at=NOW + timedelta(seconds=5),
-        )
-        return store.current
-
-    store.prepare = contended_prepare
-
     result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "stale_context"
-    assert result.detail is not None
-    assert "needs_human" in result.detail
-    assert "override" not in result.detail.casefold()
-    assert store.current.state is ActionState.DEPENDENCY_WAIT
-    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION
+    assert not any(call[0] in ("prepare", "claim", "definitive_fail") for call in store.calls)
     assert adapter.calls == []
 
 

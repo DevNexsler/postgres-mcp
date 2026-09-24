@@ -68,11 +68,13 @@ async def traffic(traffic_database):
                 sender_participant_id bigint, recipient_participant_id bigint
             );
             CREATE TEMP TABLE raw_events (id bigint PRIMARY KEY, payload jsonb);
-            CREATE TEMP TABLE participants (id bigint PRIMARY KEY, participant_key text, participant_type text);
+            CREATE TEMP TABLE participants (id bigint PRIMARY KEY, participant_key text, participant_type text, display_name text);
             CREATE TEMP TABLE outbound_actions (
                 action_id uuid PRIMARY KEY, subject_key text, operation text, state text,
                 created_at timestamptz, arguments jsonb, canonical_context jsonb,
-                dispatch_started_at timestamptz, retry_of_action_id uuid
+                dispatch_started_at timestamptz, retry_of_action_id uuid,
+                wakeup_event_id bigint DEFAULT 26817,
+                stale_context_acknowledged_through timestamptz
             );
             CREATE TEMP TABLE hermes_wakeup_events (
                 id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz
@@ -293,3 +295,49 @@ async def test_override_bypasses_real_staleness_but_never_recipient_lease(traffi
     leased = await verdict(repository, override=True)
     assert not leased.allowed
     assert leased.reason == "lease_held"
+
+
+
+@pytest.mark.asyncio
+async def test_needs_confirmation_lists_every_relevant_item_newest_first(traffic):
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
+    await add_message(conn, sender=GUNTHER, minute=11, message_id=11)
+    await add_message(conn, sender=LINE, recipient=JESSICA, direction="outbound", minute=12, message_id=12)
+    await conn.execute("INSERT INTO participants VALUES (7, 'phone:+12025550101', 'phone', 'Jessica')")
+    await conn.execute("UPDATE messages SET sender_participant_id = 7 WHERE id = 10")
+
+    result = await verdict(repository)
+
+    assert result.reason == "stale_context"
+    # Gunther shares the line but is not Jessica's context.
+    assert [item.message_id for item in result.newer] == [12, 10]
+    assert result.newer[1].sender == "Jessica"
+    assert result.acknowledged_through == WATERMARK.replace(minute=12)
+    assert not result.truncated
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_point_on_a_stale_row_waives_only_what_was_shown(traffic):
+    """The agent was shown Jessica's minute-10 text in a needs_confirmation.
+    Answering it must not be refused over that same text again -- but her
+    minute-11 text, which it never saw, still asks again."""
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
+    await conn.execute(
+        "INSERT INTO outbound_actions (action_id, subject_key, operation, state, created_at, arguments, "
+        "canonical_context, wakeup_event_id, stale_context_acknowledged_through) "
+        "VALUES (%s,%s,'quo.sms.send','stale',%s,'{}','{}',26817,%s)",
+        (UUID(int=3), SUBJECT, WATERMARK.replace(minute=9), WATERMARK.replace(minute=10)),
+    )
+    assert await repository.acknowledged_through(26817, SUBJECT) == WATERMARK.replace(minute=10)
+    assert await repository.acknowledged_through(26818, SUBJECT) is None
+    assert await repository.acknowledged_through(26817, "subject:gunther") is None
+
+    shown = await verdict(repository)
+    assert shown.allowed and shown.reason == "pass"
+
+    await add_message(conn, sender=JESSICA, minute=11, message_id=11)
+    unseen = await verdict(repository)
+    assert unseen.reason == "stale_context"
+    assert [item.message_id for item in unseen.newer] == [11]

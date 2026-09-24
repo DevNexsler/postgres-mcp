@@ -311,6 +311,19 @@ def test_focused_server_tool_description_mentions_suggest():
     assert "suggest" in (tools[0].description or "")
 
 
+def test_focused_server_tool_description_teaches_the_stale_context_confirm_answer():
+    service = AsyncMock()
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    tools = [tool for tool in mcp._tool_manager.list_tools() if tool.name == "outbound_action"]
+
+    description = tools[0].description or ""
+    assert "needs_confirmation" in description
+    assert '"op": "confirm"' in description
+    assert '"yes"|"no"|"revise"' in description
+    assert "override" not in description.casefold()
+
+
 @pytest.mark.asyncio
 async def test_suggest_returns_ids_the_wake_implies():
     service = AsyncMock()

@@ -91,11 +91,20 @@ class ContextRepository(Protocol):
         self, recipient_key: str, exclude_action_id: UUID
     ) -> list[InFlightAction]: ...
 
-    async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
-    ) -> NewerActivity | None: ...
+    async def activity_after(
+        self,
+        recipient_key: str,
+        channel_id: int,
+        watermark: datetime,
+        exclude_action_id: UUID,
+        limit: int,
+    ) -> list[NewerActivity]: ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
+
+    async def acknowledged_through(self, wakeup_event_id: int, recipient_key: str) -> datetime | None: ...
+
+    async def message_created_at(self, message_id: int) -> datetime | None: ...
 
 
 class OutboundGatewayRepository:
@@ -228,7 +237,28 @@ class OutboundGatewayRepository:
             for row in rows or []
         ]
 
-    async def newest_activity_after(self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID) -> NewerActivity | None:
+    async def newest_activity_after(
+        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
+    ) -> NewerActivity | None:
+        """The single newest item of activity_after (kept for callers that
+        only need to know whether anything is newer)."""
+        items = await self.activity_after(recipient_key, channel_id, watermark, exclude_action_id, 1)
+        return items[0] if items else None
+
+    async def activity_after(
+        self,
+        recipient_key: str,
+        channel_id: int,
+        watermark: datetime,
+        exclude_action_id: UUID,
+        limit: int,
+    ) -> list[NewerActivity]:
+        """Every ledger send and message newer than `watermark` that this
+        recipient's context depends on, newest first, at most `limit`. The
+        two arms apply the same exclusions the staleness gate always did;
+        what changed is that a needs_confirmation result lists them all
+        instead of naming only the newest."""
+        limit = max(1, int(limit))
         ledger_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -246,17 +276,18 @@ class OutboundGatewayRepository:
             )
             SELECT
                 action_id,
+                operation,
                 created_at,
-                left(coalesce(arguments::text,''), 120) AS preview
+                left(coalesce(arguments->>'text', arguments::text, ''), 300) AS preview
             FROM outbound_actions
             WHERE subject_key = {}
               AND action_id NOT IN (SELECT action_id FROM retry_lineage)
               AND created_at > {}
               AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
-            LIMIT 1
+            LIMIT {}
             """,
-            [exclude_action_id, recipient_key, watermark],
+            [exclude_action_id, recipient_key, watermark, limit],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -265,9 +296,12 @@ class OutboundGatewayRepository:
                 message.id AS message_id,
                 message.created_at,
                 message.direction,
-                left(coalesce(message.body,''), 120) AS preview
+                message.source,
+                sender.display_name AS sender_name,
+                left(coalesce(message.body,''), 300) AS preview
             FROM messages AS message
             LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
+            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
             LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
             WHERE message.channel_id = {}
               AND message.created_at > {}
@@ -306,13 +340,13 @@ class OutboundGatewayRepository:
                   )
               )
             ORDER BY message.created_at DESC
-            LIMIT 1
+            LIMIT {}
             """,
-            [exclude_action_id, channel_id, watermark],
+            [exclude_action_id, channel_id, watermark, limit],
         )
         candidates: list[NewerActivity] = []
-        if ledger_rows:
-            cells = ledger_rows[0].cells
+        for row in ledger_rows or []:
+            cells = row.cells
             candidates.append(
                 NewerActivity(
                     direction="outbound",
@@ -321,10 +355,11 @@ class OutboundGatewayRepository:
                     preview=str(cells.get("preview") or ""),
                     message_id=None,
                     action_id=UUID(str(cells["action_id"])),
+                    sender=f"outbound gateway ({cells.get('operation')})" if cells.get("operation") else None,
                 )
             )
-        if message_rows:
-            cells = message_rows[0].cells
+        for row in message_rows or []:
+            cells = row.cells
             candidates.append(
                 NewerActivity(
                     # NULL direction must not be silently reported as
@@ -332,16 +367,45 @@ class OutboundGatewayRepository:
                     # claim inbound activity that was never actually
                     # confirmed as such. "unknown" is the honest label.
                     direction=str(cells.get("direction") or "unknown"),
-                    source="messages",
+                    source=str(cells.get("source") or "messages"),
                     occurred_at=cells["created_at"],
                     preview=str(cells.get("preview") or ""),
                     message_id=int(cells["message_id"]),
                     action_id=None,
+                    sender=(str(cells["sender_name"]) if cells.get("sender_name") else None),
                 )
             )
-        if not candidates:
+        candidates.sort(key=lambda item: item.occurred_at, reverse=True)
+        return candidates[:limit]
+
+    async def acknowledged_through(self, wakeup_event_id: int, recipient_key: str) -> datetime | None:
+        """The newest stale context this wake's agent was shown for this
+        recipient: the acknowledgement point every needs_confirmation result
+        records on its blocked action (Comm-Data-Store migration 192)."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT max(stale_context_acknowledged_through) AS acknowledged_through
+            FROM outbound_actions
+            WHERE wakeup_event_id = {}
+              AND subject_key = {}
+              AND state = 'stale'
+            """,
+            [wakeup_event_id, recipient_key],
+        )
+        if not rows:
             return None
-        return max(candidates, key=lambda item: item.occurred_at)
+        return rows[0].cells.get("acknowledged_through")
+
+    async def message_created_at(self, message_id: int) -> datetime | None:
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "SELECT created_at FROM messages WHERE id = {}",
+            [message_id],
+        )
+        if not rows:
+            return None
+        return rows[0].cells.get("created_at")
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None:
         rows = await SafeSqlDriver.execute_param_query(

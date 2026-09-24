@@ -39,6 +39,7 @@ from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
 from .models import ActionRole
+from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
@@ -137,6 +138,8 @@ async def handle_outbound_action(
         }
     if isinstance(parsed, StatusRequest):
         result = await service.status(parsed.action_id)
+    elif isinstance(parsed, ConfirmRequest):
+        result = await _confirm(service, policy, parsed, tenantcloud_submitter=tenantcloud_submitter)
     else:
         assert isinstance(parsed, ExecuteRequest)
         if not policy.writes_enabled or policy.kill_switch:
@@ -180,13 +183,60 @@ async def handle_outbound_action(
             else:
                 result = await service.execute(parsed)
     payload = result.model_dump(mode="json")
-    if result.detail is None:
-        # Every result except a traffic-control block leaves detail unset --
-        # omit the key entirely so existing consumers see no new field on
-        # the wire, instead of a `detail: null` that would still be a shape
-        # change for strict clients.
-        payload.pop("detail", None)
+    # Every result except a traffic-control block leaves detail unset, and
+    # every result except needs_confirmation leaves new_context/question
+    # unset -- omit those keys entirely so existing consumers see no new
+    # field on the wire, instead of a `null` that would still be a shape
+    # change for strict clients.
+    for optional in ("detail", "new_context", "question"):
+        if payload.get(optional) is None:
+            payload.pop(optional, None)
     return payload
+
+
+async def _confirm(
+    service: OutboundActionService,
+    policy: FeaturePolicy,
+    request: ConfirmRequest,
+    *,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None,
+) -> PublicResult:
+    """Route a stale_context answer. A decline is a ledger write only and is
+    always accepted; a yes is a send and obeys the same write switches as
+    execute. TenantCloud sends are prepared here and handed to Restate, like
+    enqueue()."""
+    sends = request.decision.value != "no"
+    if sends:
+        if not policy.writes_enabled or policy.kill_switch:
+            return PublicResult(
+                status=PublicStatus.REJECTED,
+                action_id=request.action_id,
+                action_uid=None,
+                provider_request_ref=None,
+                retryable=False,
+                detail_code="kill_switch_open" if policy.kill_switch else "writes_disabled",
+            )
+    parent_operation = await service.action_operation(request.action_id)
+    if sends and parent_operation is not None and parent_operation not in policy.enabled_operations:
+        return PublicResult(
+            status=PublicStatus.REJECTED,
+            action_id=request.action_id,
+            action_uid=None,
+            provider_request_ref=None,
+            retryable=False,
+            detail_code="operation_disabled",
+        )
+    tenantcloud = parent_operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None
+    result = await service.confirm(request, dispatch=not tenantcloud)
+    if tenantcloud and result.status is PublicStatus.PENDING and tenantcloud_submitter is not None:
+        try:
+            await tenantcloud_submitter.submit(result.action_id)
+        except Exception:
+            logger.exception(
+                "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                result.action_id,
+            )
+    return result
 
 
 def create_server(
@@ -216,7 +266,11 @@ def create_server(
             "-- it returns advisory target ids drawn from the wake, never blocks, and "
             "stays reachable even when writes are disabled. Its answer is a suggestion "
             "only: you may pass any target id you like to execute, including ones that "
-            "disagree with suggest."
+            "disagree with suggest. If execute returns status needs_confirmation "
+            "(detail_code stale_context), nothing was sent: read new_context and answer "
+            "once with {\"op\": \"confirm\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
+            "exactly as its question shows (revise also carries arguments with only the "
+            "message content changed)."
         ),
         structured_output=True,
     )
