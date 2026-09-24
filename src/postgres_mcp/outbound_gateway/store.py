@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from hashlib import sha256
 from typing import Any
 from typing import Mapping
+from typing import Sequence
 from uuid import UUID
 
 from postgres_mcp.sql import SafeSqlDriver
@@ -368,16 +368,16 @@ class PostgresActionStore:
         action_id: UUID,
         expected_state: ActionState,
         lease_owner: str | None,
-        acknowledged_through: datetime,
+        shown_refs: Sequence[str],
     ) -> OutboundActionRecord:
         """Record a stale_context refusal as a deliberate no-send (`stale`,
-        detail_code `stale_context`, no error_category) and the newest context
-        item the agent is being shown. expected_state `stale` re-shows an
-        unanswered question and only advances the acknowledgement point.
+        detail_code `stale_context`, no error_category) and exactly which
+        context items the agent is being shown. expected_state `stale`
+        re-shows an unanswered question and only adds to the shown set.
         Comm-Data-Store migration 192."""
         return await self._one(
-            "SELECT * FROM record_outbound_stale_context_block({}, {}, {}, {})",
-            [action_id, expected_state.value, lease_owner, acknowledged_through],
+            "SELECT * FROM record_outbound_stale_context_block({}, {}, {}, {}::text[])",
+            [action_id, expected_state.value, lease_owner, list(shown_refs)],
         )
 
     async def confirm_stale_context(
@@ -389,16 +389,15 @@ class PostgresActionStore:
         actor: str,
         revision: ActionContext | None = None,
     ) -> OutboundActionRecord:
-        """Answer a stale_context question. `yes`/`revise` return the successor
-        action (minted once; repeating the same answer returns the same row),
-        `no` returns the blocked action with its decline recorded. `revise`
-        carries the revised context's arguments, payload hash and canonical
-        context; the database copies everything else from the blocked row and
-        refuses a revision that changes anything but content. Comm-Data-Store
-        migration 192 owns every guard: same wake, stale-context rows only,
-        one answer per blocked action."""
+        """Answer a stale_context question for the wake the caller named.
+        `yes`/`revise` return the successor action (minted once; repeating the
+        same answer returns the same row), `no` returns the blocked action with
+        its decline recorded. `revise` carries the revised context's arguments,
+        payload hash, canonical context and canonical scope; the database
+        compares them against the blocked row and refuses anything but a
+        content change. Comm-Data-Store migration 192 owns every guard."""
         return await self._one(
-            "SELECT * FROM confirm_outbound_stale_context({}, {}, {}, {}, {}::jsonb, {}, {}::jsonb)",
+            "SELECT * FROM confirm_outbound_stale_context({}, {}, {}, {}, {}::jsonb, {}, {}::jsonb, {}::jsonb)",
             [
                 action_id,
                 wakeup_event_id,
@@ -407,6 +406,7 @@ class PostgresActionStore:
                 _json(tenantcloud_persisted_arguments(revision)) if revision is not None else None,
                 revision.payload_hash if revision is not None else None,
                 _json(revision.canonical_context) if revision is not None else None,
+                _json(revision.canonical_scope) if revision is not None else None,
             ],
         )
 
@@ -514,6 +514,6 @@ class PostgresActionStore:
                 else None
             ),
             remediation_reason=cells.get("remediation_reason"),
-            stale_context_acknowledged_through=cells.get("stale_context_acknowledged_through"),
+            stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
         )

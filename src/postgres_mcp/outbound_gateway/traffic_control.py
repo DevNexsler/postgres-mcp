@@ -35,7 +35,13 @@ class NewerActivity:
 
     @property
     def ref(self) -> str:
+        """Stable identity of this item: what a stale_context question records
+        as shown, and the only thing a later answer can waive."""
         return f"message:{self.message_id}" if self.message_id else f"action:{self.action_id}"
+
+    @property
+    def arm(self) -> str:
+        return "messages" if self.message_id else "outbound_actions"
 
 
 @dataclass(frozen=True)
@@ -44,15 +50,15 @@ class TrafficVerdict:
     reason: str  # pass | lease_held | stale_context | gate_check_failed
     detail: str
     check_failed: bool
-    # stale_context only: every newer item (newest FIRST, capped at
-    # CONTEXT_ITEM_LIMIT) and whether older ones were left out. The newest
-    # item's occurred_at is the point the agent acknowledges by answering.
+    # stale_context only: newer items not yet shown to this wake's agent for
+    # this recipient (newest FIRST, capped at CONTEXT_ITEM_LIMIT) and whether
+    # more were left out. Only these refs become "shown" when asked.
     newer: tuple[NewerActivity, ...] = ()
     truncated: bool = False
 
     @property
-    def acknowledged_through(self) -> datetime | None:
-        return self.newer[0].occurred_at if self.newer else None
+    def shown_refs(self) -> tuple[str, ...]:
+        return tuple(item.ref for item in self.newer)
 
 
 class TrafficProbe(Protocol):
@@ -65,19 +71,22 @@ class TrafficProbe(Protocol):
         watermark: datetime,
         exclude_action_id: UUID,
         limit: int,
+        exclude_refs: frozenset[str] = frozenset(),
     ) -> list[NewerActivity]:
-        """Activity newer than `watermark`, newest first, at most `limit`."""
+        """Activity newer than `watermark`, newest first, at most `limit`,
+        never an item whose ref is in `exclude_refs`."""
         ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
 
-    async def acknowledged_through(self, wakeup_event_id: int, recipient_key: str) -> datetime | None:
-        """Newest point of stale context this wake's agent was already shown
-        for this recipient (a needs_confirmation it received), or None."""
+    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]:
+        """Refs of every item this wake's agent was shown for this recipient
+        in a stale_context question (Comm-Data-Store migration 192)."""
         ...
 
-    async def message_created_at(self, message_id: int) -> datetime | None:
-        """When CDS stored one message (the clock activity_after compares)."""
+    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]:
+        """The given messages as context items (for inbound the staleness probe
+        cannot see, e.g. another channel of the same prospect)."""
         ...
 
 
@@ -86,10 +95,31 @@ class TrafficProbe(Protocol):
 # copy of the literal set).
 VALID_TRAFFIC_MODES = frozenset({"off", "shadow", "enforce"})
 
-# How many newer items a needs_confirmation result lists. Newest are kept;
-# anything older is summarized as a count-free "older items omitted" flag.
+# How many newer items a needs_confirmation result lists. The newest are
+# shown; anything older is left unshown, so it asks again after the answer.
 CONTEXT_ITEM_LIMIT = 10
 CONTEXT_PREVIEW_CHARS = 300
+
+
+# Agent-facing close of a stale_context block while stale-context
+# confirmation is disabled (OUTBOUND_STALE_CONFIRM_ENABLED unset/false): the
+# pre-192 contract, byte for byte. Override remains an operator remediation and
+# is not named here: wake 27138 followed the old sentence, then sent through
+# the provider directly.
+STALE_CONTEXT_AGENT_INSTRUCTION = (
+    "Re-read the thread and skip if your message is now redundant. "
+    "If the reply is still needed, record needs_human with the reason "
+    '"stale_context, reply still needed". '
+    "A gateway refusal is final. Circumventing the outbound gateway is never an option."
+)
+
+# Every refused confirm says this. A refused answer is a decision about the
+# message, never a gateway outage: it must not open the guarded Cliq DM
+# fallback or any other route around the gateway.
+CONFIRM_REFUSAL_NOTICE = (
+    "This refusal is not a gateway infrastructure failure: it does not permit the direct "
+    "Cliq fallback or any other route around the outbound gateway."
+)
 
 
 def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
@@ -107,7 +137,7 @@ def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
         f'NO - send nothing (the new context makes it redundant or wrong): {{{base}, "decision": "no"}}. '
         f'REVISE - send a corrected message instead: {{{base}, "decision": "revise", '
         '"arguments": {<the same arguments with only the message content changed>}}; '
-        "the operation, recipient and target must stay the same. "
+        "the operation, intent, slot, recipient and target must stay the same. "
         "One answer per action. Never send it any other way: circumventing the outbound gateway is never an option."
     )
 
@@ -115,7 +145,7 @@ def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
 def stale_context_detail(newer: tuple[NewerActivity, ...], *, truncated: bool) -> str:
     newest = newer[0]
     more = f" and {len(newer) - 1} more" if len(newer) > 1 else ""
-    omitted = " (older items omitted)" if truncated else ""
+    omitted = " (older items omitted; you will be asked about them next)" if truncated else ""
     return (
         f"Refused - stale context: new {newest.direction} activity since your context was built: "
         f'{newest.ref.replace(":", " ")} via {newest.source} at {newest.occurred_at.isoformat()}: "{newest.preview}"'
@@ -123,35 +153,36 @@ def stale_context_detail(newer: tuple[NewerActivity, ...], *, truncated: bool) -
     )
 
 
+def legacy_stale_context_detail(newest: NewerActivity) -> str:
+    """The pre-192 detail text, used while confirmation is disabled."""
+    return (
+        f"New {newest.direction} activity since your context was built: {newest.ref.replace(':', ' ')} via "
+        f'{newest.arm} at {newest.occurred_at.isoformat()}: "{newest.preview[:120]}". ' + STALE_CONTEXT_AGENT_INSTRUCTION
+    )
+
+
 _PASS = TrafficVerdict(allowed=True, reason="pass", detail="", check_failed=False)
 _FAIL_OPEN = TrafficVerdict(allowed=True, reason="gate_check_failed", detail="", check_failed=True)
 
 
-async def _effective_watermark(
-    probe: TrafficProbe,
-    *,
-    wakeup_event_id: int,
-    recipient_key: str,
-    watermark: datetime,
-    logger: logging.Logger,
-) -> datetime:
-    """The wake's context watermark, advanced to whatever stale context this
-    wake's agent was already shown for this recipient. Only activity NEWER
-    than a question the agent answered can raise another one. A failed read
-    falls back to the wake watermark: that can only ask again, never send
-    past unseen context."""
-    try:
-        acknowledged = await probe.acknowledged_through(wakeup_event_id, recipient_key)
-    except Exception:
-        logger.warning(
-            "traffic control acknowledged-context read failed for wake %s; using the wake watermark",
-            wakeup_event_id,
-            exc_info=True,
-        )
-        return watermark
-    if acknowledged is not None and acknowledged > watermark:
-        return acknowledged
-    return watermark
+def _stale_verdict(found: list[NewerActivity], *, legacy: bool) -> TrafficVerdict:
+    ordered = tuple(sorted(found, key=lambda item: item.occurred_at, reverse=True))
+    newer = ordered[:CONTEXT_ITEM_LIMIT]
+    truncated = len(ordered) > CONTEXT_ITEM_LIMIT
+    return TrafficVerdict(
+        allowed=False,
+        reason="stale_context",
+        detail=legacy_stale_context_detail(newer[0]) if legacy else stale_context_detail(newer, truncated=truncated),
+        check_failed=False,
+        newer=newer,
+        truncated=truncated,
+    )
+
+
+def stale_context_verdict(items: list[NewerActivity]) -> TrafficVerdict | None:
+    """A stale_context verdict over items found outside the probe (the
+    preflight's cross-channel newer inbound)."""
+    return _stale_verdict(items, legacy=False) if items else None
 
 
 async def check_traffic(
@@ -163,7 +194,14 @@ async def check_traffic(
     action_id: UUID,
     override: bool,
     logger: logging.Logger,
+    acknowledged: bool = False,
 ) -> TrafficVerdict:
+    """acknowledged=True (stale-context confirmation enabled): items this
+    wake's agent was already SHOWN for this recipient are waived -- by
+    identity, never by timestamp. Messages are stored with the provider's send
+    time and ingested minutes to hours later, so "older than what was shown"
+    is not "was shown". Everything else newer than the wake's watermark still
+    counts, including items ingested late and items past the display cap."""
     try:
         in_flight = await probe.in_flight_actions(recipient_key, action_id)
     except Exception:
@@ -187,9 +225,8 @@ async def check_traffic(
         # still be auditable. Still read the newer activity purely for the
         # audit trail; a probe failure here must not degrade the override
         # itself (fail-open, log-only), so any exception is swallowed after
-        # logging. service.py no longer passes override=True for agent
-        # requests (an agent's override is routed through the confirm
-        # successor path instead); this branch stays for direct callers.
+        # logging. With confirmation enabled service.py never passes
+        # override=True (an agent's override is the "yes" answer instead).
         try:
             watermark = await probe.context_watermark(wakeup_event_id)
             if watermark is not None:
@@ -215,32 +252,28 @@ async def check_traffic(
         if watermark is None:
             logger.warning("traffic control check failed (no watermark) for wake %s", wakeup_event_id)
             return _FAIL_OPEN
-        effective = await _effective_watermark(
-            probe,
-            wakeup_event_id=wakeup_event_id,
-            recipient_key=recipient_key,
-            watermark=watermark,
-            logger=logger,
-        )
+        shown: frozenset[str] = frozenset()
+        if acknowledged:
+            try:
+                shown = frozenset(await probe.acknowledged_refs(wakeup_event_id, recipient_key))
+            except Exception:
+                # Waiving nothing can only ask again; it never sends past
+                # unseen context.
+                logger.warning(
+                    "traffic control acknowledged-context read failed for wake %s; waiving nothing",
+                    wakeup_event_id,
+                    exc_info=True,
+                )
         found = await probe.activity_after(
-            recipient_key, channel_id, effective, action_id, CONTEXT_ITEM_LIMIT + 1
+            recipient_key, channel_id, watermark, action_id, CONTEXT_ITEM_LIMIT + 1, shown
         )
     except Exception:
         logger.warning("traffic control check failed (staleness) for %s", recipient_key, exc_info=True)
         return _FAIL_OPEN
+    found = [item for item in found if item.ref not in shown]
     if not found:
         return _PASS
-    ordered = tuple(sorted(found, key=lambda item: item.occurred_at, reverse=True))
-    newer = ordered[:CONTEXT_ITEM_LIMIT]
-    truncated = len(ordered) > CONTEXT_ITEM_LIMIT
-    return TrafficVerdict(
-        allowed=False,
-        reason="stale_context",
-        detail=stale_context_detail(newer, truncated=truncated),
-        check_failed=False,
-        newer=newer,
-        truncated=truncated,
-    )
+    return _stale_verdict(found, legacy=not acknowledged)
 
 
 async def list_stale_context(
@@ -253,8 +286,7 @@ async def list_stale_context(
     logger: logging.Logger,
 ) -> TrafficVerdict | None:
     """Everything newer than the wake's own context watermark, for re-asking
-    an unanswered stale_context question. Unlike check_traffic this ignores
-    the acknowledgement point on purpose: the agent re-sent the message
+    an unanswered stale_context question: the agent re-sent the message
     without answering, so it is shown the whole picture again. None when the
     probe cannot answer."""
     try:
@@ -267,14 +299,4 @@ async def list_stale_context(
         return None
     if not found:
         return None
-    ordered = tuple(sorted(found, key=lambda item: item.occurred_at, reverse=True))
-    newer = ordered[:CONTEXT_ITEM_LIMIT]
-    truncated = len(ordered) > CONTEXT_ITEM_LIMIT
-    return TrafficVerdict(
-        allowed=False,
-        reason="stale_context",
-        detail=stale_context_detail(newer, truncated=truncated),
-        check_failed=False,
-        newer=newer,
-        truncated=truncated,
-    )
+    return _stale_verdict(found, legacy=False)

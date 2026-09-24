@@ -538,13 +538,13 @@ class ConfirmRequest(StrictModel):
     action_id) that still passes every other gateway check. `no` records the
     decline and sends nothing. One answer per blocked action: repeating it
     returns the recorded result, a different answer is refused.
-    wakeup_event_id is optional; when given it must be the blocked action's
-    own wake -- a confirmation never crosses wakes."""
+    wakeup_event_id is REQUIRED and must be the blocked action's own wake --
+    a confirmation never crosses wakes."""
 
     op: Literal["confirm"]
+    wakeup_event_id: PositiveBigInt
     action_id: UUID
     decision: StaleContextDecision
-    wakeup_event_id: PositiveBigInt | None = None
     arguments: dict[str, Any] | None = None
 
     @field_validator("decision", mode="before")

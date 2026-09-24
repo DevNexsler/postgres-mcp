@@ -60,6 +60,10 @@ class PreflightEvidence:
     overlapping_showing_prospect_ids: tuple[str, ...]
     refresh_required_through: datetime
     refresh: RefreshEvidence | None
+    # Every inbound newer than the source message (later_inbound_message_id is
+    # the max of these). Empty from callers that only know the max: readers
+    # treat that as {later_inbound_message_id}.
+    later_inbound_message_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

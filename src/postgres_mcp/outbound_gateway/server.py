@@ -268,7 +268,7 @@ def create_server(
             "only: you may pass any target id you like to execute, including ones that "
             "disagree with suggest. If execute returns status needs_confirmation "
             "(detail_code stale_context), nothing was sent: read new_context and answer "
-            "once with {\"op\": \"confirm\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
+            "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
             "message content changed)."
         ),
@@ -672,6 +672,9 @@ async def build_runtime() -> GatewayRuntime:
         retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
         traffic_mode=_traffic_mode(),
         traffic_probe=context_repository,
+        # Off by default: the pre-192 terminal stale_context block. Enable only
+        # after Comm-Data-Store's reconciler is live and migration 192 applied.
+        stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
     )
     return GatewayRuntime(
         pool=pool,

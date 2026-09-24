@@ -147,6 +147,23 @@ class DatabasePreflightEvidenceLoader:
                               ''
                           )) IN ('inbound', 'incoming', 'received', 'prospect')
                     ) AS later_inbound_message_id,
+                    array_agg(related.id ORDER BY related.id) FILTER (
+                        WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
+                          AND NOT (
+                              coalesce(related.canonical_message_id, related.id)
+                              = ANY({}::bigint[])
+                          )
+                          AND NOT (
+                              lower(related.source) = 'zillow_rm_web_extract'
+                              AND related.id = ANY({}::bigint[])
+                          )
+                          AND lower(coalesce(
+                              related.direction,
+                              related.payload->>'direction',
+                              related.payload#>>'{{data,object,direction}}',
+                              ''
+                          )) IN ('inbound', 'incoming', 'received', 'prospect')
+                    ) AS later_inbound_message_ids,
                     max(related.sent_at) AS latest_sent_at
                 FROM related_messages AS related
             ), verified_outbound AS (
@@ -232,6 +249,7 @@ class DatabasePreflightEvidenceLoader:
             )
             SELECT
                 conversation.later_inbound_message_id,
+                conversation.later_inbound_message_ids,
                 verified_outbound.verified_outbound_message_id,
                 verified_outbound.verified_outbound_request_ref,
                 coalesce(conversation.latest_sent_at, {}::timestamptz) AS latest_sent_at,
@@ -259,6 +277,10 @@ class DatabasePreflightEvidenceLoader:
                 certified_older_message_ids,
                 context.source_sent_at,
                 context.source_message_id,
+                equivalent_inbound_ids,
+                certified_older_message_ids,
+                context.source_sent_at,
+                context.source_message_id,
                 provider_family,
                 provider_family,
                 provider_family,
@@ -279,6 +301,7 @@ class DatabasePreflightEvidenceLoader:
             current_property_id=context.property_id,
             current_appointment_slot=context.appointment_slot,
             later_inbound_message_id=cells.get("later_inbound_message_id"),
+            later_inbound_message_ids=tuple(int(item) for item in (cells.get("later_inbound_message_ids") or ())),
             verified_outbound_message_id=verified_id,
             verified_outbound_request_ref=verified_ref,
             verified_outbound_covers_source=bool(verified_id and verified_ref),

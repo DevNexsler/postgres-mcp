@@ -116,7 +116,10 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     assert "related.payload->'provider_ids'->>'message'" in query
     assert "related.source_message_id" in query
     assert "recipient.value->>'address'" in query
-    assert query.count("(related.sent_at, related.id) > (") == 2
+    # max and array_agg of later inbound share one filter; the third is the
+    # verified-outbound window.
+    assert query.count("(related.sent_at, related.id) > (") == 3
+    assert "as later_inbound_message_ids" in query
     assert "related.id = any({}::bigint[])" in query
     assert calls[0][1] == [
         "zillow",
@@ -130,6 +133,10 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
         "",
         "zillow",
         44,
+        NOW,
+        700,
+        [700],
+        [],
         NOW,
         700,
         [700],
@@ -339,3 +346,34 @@ async def test_evidence_query_survives_literal_json_path_braces():
     proof = await DatabasePreflightEvidenceLoader(Driver()).load(context())
 
     assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED
+
+
+
+@pytest.mark.asyncio
+async def test_every_later_inbound_id_is_returned_not_only_the_newest():
+    """The stale_context waiver must see every newer inbound, not just max(id):
+    one shown and one unseen must not be waived as a set."""
+
+    async def execute(_driver, _query, _params):
+        return [
+            Row(
+                {
+                    "later_inbound_message_id": 902,
+                    "later_inbound_message_ids": [901, 902],
+                    "verified_outbound_message_id": None,
+                    "verified_outbound_request_ref": None,
+                    "latest_sent_at": NOW,
+                    "calendar_dependency_state": "not_required",
+                    "calendar_already_applied": False,
+                }
+            )
+        ]
+
+    with patch(
+        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        evidence = await DatabasePreflightEvidenceLoader(object()).load(context())
+
+    assert evidence.later_inbound_message_id == 902
+    assert evidence.later_inbound_message_ids == (901, 902)

@@ -16,6 +16,7 @@ from hashlib import sha256
 from typing import Any
 from typing import Mapping
 from typing import Protocol
+from typing import Sequence
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -52,6 +53,7 @@ from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
+from .traffic_control import CONFIRM_REFUSAL_NOTICE
 from .traffic_control import CONTEXT_PREVIEW_CHARS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .traffic_control import TrafficProbe
@@ -59,6 +61,7 @@ from .traffic_control import TrafficVerdict
 from .traffic_control import check_traffic
 from .traffic_control import list_stale_context
 from .traffic_control import stale_context_question
+from .traffic_control import stale_context_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,15 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # States with a legal edge into `stale` (outbound_action_transition_allowed,
 # Comm-Data-Store migration 153): a stale_context refusal can become a
 # confirmable no-send only from these. retry_ready has no such edge.
+_STALE_CONTEXT_SUCCESSOR_REASONS = frozenset({"stale_context_confirmed", "stale_context_revised"})
+
+
+def _refusal(message: str) -> ValueError:
+    """Every refused stale_context answer names itself as a decision, not an
+    outage, so no agent reads it as leave to use a direct provider route."""
+    return ValueError(f"{message} {CONFIRM_REFUSAL_NOTICE}")
+
+
 _STALE_BLOCKABLE_STATES = frozenset(
     {ActionState.RECEIVED, ActionState.PREPARED, ActionState.DEPENDENCY_WAIT}
 )
@@ -125,9 +137,10 @@ class OutboundActionRecord:
     retry_of_action_id: UUID | None = None
     remediation_reason: str | None = None
     # Comm-Data-Store migration 192: the stale-context question's durable
-    # half. acknowledged_through is the newest context item the agent was
-    # shown; decision is its answer (yes | no | revised), NULL while unanswered.
-    stale_context_acknowledged_through: datetime | None = None
+    # half. shown_refs are the exact context items the agent was shown
+    # (message:<id> / action:<uuid>); decision is its answer (yes | no |
+    # revise), NULL while unanswered.
+    stale_context_shown_refs: tuple[str, ...] = ()
     stale_context_decision: str | None = None
 
     def execute_request(self) -> ExecuteRequest:
@@ -216,7 +229,7 @@ class ActionStore(Protocol):
         action_id: UUID,
         expected_state: ActionState,
         lease_owner: str | None,
-        acknowledged_through: datetime,
+        shown_refs: Sequence[str],
     ) -> OutboundActionRecord: ...
 
     async def confirm_stale_context(
@@ -279,6 +292,7 @@ class OutboundActionService:
         retry_max_seconds: int = 900,
         traffic_mode: str = "shadow",
         traffic_probe: TrafficProbe | None = None,
+        stale_confirm_enabled: bool = False,
     ):
         if traffic_mode not in VALID_TRAFFIC_MODES:
             raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
@@ -307,6 +321,12 @@ class OutboundActionService:
         self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
         self._traffic_mode = traffic_mode
         self._traffic_probe = traffic_probe
+        # OUTBOUND_STALE_CONFIRM_ENABLED. Off (default) is the pre-192 gateway:
+        # a stale_context block is the terminal traffic_blocked failure and
+        # confirm is refused. Turn it on only after Comm-Data-Store's reconciler
+        # (which reads a confirmed successor's outcome) is live and migration
+        # 192 is applied; before that a successor's failure would be invisible.
+        self._stale_confirm_enabled = stale_confirm_enabled
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         return await self._execute(request, dispatch=True)
@@ -321,9 +341,12 @@ class OutboundActionService:
 
     async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
         context = await self._context_loader.load(request)
+        enabled = self._stale_confirm_enabled
         action = None
-        existing = await self._store.get(context.action_id)
-        if existing is not None:
+        existing = None
+        if enabled or (dispatch and context.prospect_id.startswith("subject:")):
+            existing = await self._store.get(context.action_id)
+        if enabled and existing is not None:
             answered = await self._execute_after_stale_context(existing, request, context, dispatch=dispatch)
             if answered is not None:
                 return answered
@@ -336,16 +359,24 @@ class OutboundActionService:
             return self._result(action, repeated=True)
         if not self._is_due(action):
             return self._result(action)
-        if self._awaits_stale_confirmation(action):
+        if enabled and self._awaits_stale_confirmation(action):
             # The same message again after a needs_confirmation. override=true
             # is the historical spelling of "yes"; anything else re-asks.
             if request.override:
-                return await self._confirm_successor(action, StaleContextDecision.YES, None, dispatch=dispatch)
+                return await self._confirm_successor(
+                    action, StaleContextDecision.YES, None, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
+                )
             return await self._reask_stale_context(action, context)
-        if action.state is ActionState.STALE and action.stale_context_decision == StaleContextDecision.YES.value:
+        if (
+            enabled
+            and action.state is ActionState.STALE
+            and action.stale_context_decision == StaleContextDecision.YES.value
+        ):
             # A repeated execute of a message already confirmed: report the
             # successor that carries it (idempotent, never a second send).
-            return await self._confirm_successor(action, StaleContextDecision.YES, None, dispatch=dispatch)
+            return await self._confirm_successor(
+                action, StaleContextDecision.YES, None, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
+            )
         if (
             dispatch
             and action.state is ActionState.DEFINITIVE_FAILED
@@ -366,20 +397,22 @@ class OutboundActionService:
                 )
         elif action.state in (_EXECUTE_TERMINAL_STATES if dispatch else _ENQUEUE_TERMINAL_STATES):
             return self._result(action)
-        # An agent's override never bypasses staleness silently any more: it
-        # is the "yes" of a stale_context question, recorded as one (blocked
-        # row + successor) so the ledger shows what was overridden.
+        # With confirmation enabled an agent's override never bypasses
+        # staleness silently: it is the "yes" of a stale_context question,
+        # recorded as one (blocked row + successor). Disabled, it is the
+        # pre-192 bypass, unchanged.
         blocked = await self._check_traffic(
             action,
             context,
             agent_facing=True,
-            confirm_stale=request.override,
+            confirm_stale=enabled and request.override,
+            override=not enabled and request.override,
             dispatch=dispatch,
         )
         if blocked is not None:
             return blocked
         if not dispatch:
-            return await self._preflight_without_dispatch(action, context)
+            return await self._preflight_without_dispatch(action, context, agent_facing=True)
 
         async def _preflight_fallback() -> PublicResult:
             return await self._preflight(action, context)
@@ -395,14 +428,38 @@ class OutboundActionService:
         dispatch: bool,
     ) -> PublicResult | None:
         """A DIFFERENT message executed for a wake role whose first message is
-        waiting on a stale_context answer is that answer's `revise`: the same
-        target, new content, the same acknowledged context. Deterministic
-        action ids would otherwise refuse it as an immutable-context mismatch.
+        waiting on a stale_context answer is that answer's `revise` -- and a
+        revise changes message content only. Operation, role, intent and
+        appointment slot must be the refused message's own; anything else is
+        refused rather than silently sent with the refused message's values.
         None means "not this case": the ordinary execute path continues."""
         if not self._awaits_stale_confirmation(existing) or existing.payload_hash == context.payload_hash:
             return None
+        differing = [
+            name
+            for name, asked, refused in (
+                ("operation", request.operation, existing.operation),
+                ("action_role", request.action_role, existing.action_role),
+                ("intent_kind", request.intent_kind, str(existing.intent_kind)),
+                ("appointment_slot", request.appointment_slot, existing.appointment_slot),
+            )
+            if asked != refused
+        ]
+        if differing:
+            raise _refusal(
+                f"execute refused: action {existing.action_id} is awaiting your stale_context answer, and a "
+                "different message for it counts as its revise, which may change message content only; "
+                f"{', '.join(differing)} differ from the refused message. Answer the question with "
+                'op "confirm" (yes, no, or revise with the same operation, intent, slot and target).'
+            )
         arguments = dict(request.arguments.model_dump(mode="json", exclude_none=True))
-        return await self._confirm_successor(existing, StaleContextDecision.REVISE, arguments, dispatch=dispatch)
+        return await self._confirm_successor(
+            existing,
+            StaleContextDecision.REVISE,
+            arguments,
+            wakeup_event_id=request.wakeup_event_id,
+            dispatch=dispatch,
+        )
 
     async def confirm(self, request: ConfirmRequest, *, dispatch: bool = True) -> PublicResult:
         """Answer a needs_confirmation (stale_context) result.
@@ -411,41 +468,50 @@ class OutboundActionService:
         successor carrying the same payload; `revise` mints one carrying the
         revised content to the same target. Either successor is driven through
         the same gate every execute passes -- in-flight lease, recipient
-        safety, intent lock, preflight -- with staleness waived only up to the
-        context the agent was shown. With dispatch=False (TenantCloud) the
-        successor is preflighted and prepared for Restate instead of
-        dispatched inline."""
+        safety, intent lock, preflight -- with only the context items the agent
+        was SHOWN waived. With dispatch=False (TenantCloud) the successor is
+        preflighted and prepared for Restate instead of dispatched inline."""
+        if not self._stale_confirm_enabled:
+            raise _refusal(
+                "confirm refused: stale_context confirmation is not enabled on this gateway; "
+                "a stale_context refusal from it is final."
+            )
         parent = await self._require_action(request.action_id)
-        if request.wakeup_event_id is not None and parent.wakeup_event_id != request.wakeup_event_id:
-            raise ValueError(
+        if parent.wakeup_event_id != request.wakeup_event_id:
+            raise _refusal(
                 f"confirm refused: action {parent.action_id} belongs to wake {parent.wakeup_event_id}, "
-                f"not wake {request.wakeup_event_id}"
+                f"not wake {request.wakeup_event_id}; a confirmation never crosses wakes."
             )
         if parent.state is not ActionState.STALE or parent.detail_code not in STALE_CONTEXT_DETAILS:
-            raise ValueError(
+            raise _refusal(
                 f"confirm refused: action {parent.action_id} is not awaiting a stale_context "
-                f"confirmation (state {parent.state.value}, detail {parent.detail_code})"
+                f"confirmation (state {parent.state.value}, detail {parent.detail_code})."
             )
         if request.decision is StaleContextDecision.NO:
-            declined = await self._answer_stale_context(parent, StaleContextDecision.NO)
+            declined = await self._answer_stale_context(
+                parent, StaleContextDecision.NO, wakeup_event_id=request.wakeup_event_id
+            )
             return self._result(
                 declined,
                 detail="Declined: nothing was sent for this action. This is a recorded no-send, not a failure.",
             )
-        return await self._confirm_successor(parent, request.decision, request.arguments, dispatch=dispatch)
+        return await self._confirm_successor(
+            parent, request.decision, request.arguments, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
+        )
 
     async def _revision_context(
         self,
         parent: OutboundActionRecord,
         arguments: Mapping[str, Any],
     ) -> ActionContext:
-        """Validate a `revise` answer and derive its context. Only the
-        operation's content keys may differ from the refused message; any
-        other difference is a new target or a new effect, never a revision."""
+        """Validate a `revise` answer and derive its context. The request is
+        rebuilt from the refused row -- same operation, role, intent and slot --
+        with only `arguments` replaced, and only the operation's content keys
+        may differ from the refused arguments."""
         revisable = REVISABLE_ARGUMENT_KEYS[parent.operation]
         if not revisable:
-            raise ValueError(
-                f"revise refused: {parent.operation.value} has no message content to revise; answer yes or no"
+            raise _refusal(
+                f"revise refused: {parent.operation.value} has no message content to revise; answer yes or no."
             )
         original = dict(strip_tenantcloud_persisted_argument_keys(parent.operation, parent.arguments))
         try:
@@ -456,7 +522,7 @@ class OutboundActionService:
         except ValidationError as exc:
             first = exc.errors()[0]
             location = ".".join(str(part) for part in first["loc"]) or "arguments"
-            raise ValueError(f"revise refused: invalid arguments: {location}: {first['msg']}") from exc
+            raise _refusal(f"revise refused: invalid arguments: {location}: {first['msg']}.") from exc
         normalized = revised.arguments.model_dump(mode="json", exclude_none=True)
         comparable_original = {key: value for key, value in original.items() if value is not None}
         changed = sorted(
@@ -465,12 +531,12 @@ class OutboundActionService:
             if key not in revisable and comparable_original.get(key) != normalized.get(key)
         )
         if changed:
-            raise ValueError(
+            raise _refusal(
                 "revise refused: only the message content ("
                 + ", ".join(sorted(revisable))
                 + ") may change; "
                 + ", ".join(changed)
-                + " must stay exactly as refused (same operation, recipient and target)"
+                + " must stay exactly as refused (same operation, recipient and target)."
             )
         return await self._context_loader.load(revised)
 
@@ -479,18 +545,20 @@ class OutboundActionService:
         parent: OutboundActionRecord,
         decision: StaleContextDecision,
         revision: ActionContext | None = None,
+        *,
+        wakeup_event_id: int,
     ) -> OutboundActionRecord:
         try:
             return await self._store.confirm_stale_context(
                 parent.action_id,
-                wakeup_event_id=parent.wakeup_event_id,
+                wakeup_event_id=wakeup_event_id,
                 decision=decision.value,
                 actor=self._lease_owner,
                 revision=revision,
             )
         except Exception as exc:
             reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-            raise ValueError(f"confirm refused for action {parent.action_id}: {reason}") from exc
+            raise _refusal(f"confirm refused for action {parent.action_id}: {reason}.") from exc
 
     async def _confirm_successor(
         self,
@@ -498,16 +566,20 @@ class OutboundActionService:
         decision: StaleContextDecision,
         arguments: Mapping[str, Any] | None,
         *,
+        wakeup_event_id: int,
         dispatch: bool,
     ) -> PublicResult:
         revision = None
         if decision is StaleContextDecision.REVISE:
             revision = await self._revision_context(parent, arguments or {})
-        successor = await self._answer_stale_context(parent, decision, revision)
+        successor = await self._answer_stale_context(parent, decision, revision, wakeup_event_id=wakeup_event_id)
         if successor.state is ActionState.COMPLETED:
             return self._result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
             return self._result(successor)
+        # Re-derives payload hash, canonical context and scope from the
+        # successor's own arguments: a successor whose stored hash or context
+        # does not match what the gateway computes never dispatches.
         context, context_detail = await self._verified_context(successor)
         if context is None:
             return self._result(successor, detail=context_detail)
@@ -521,7 +593,7 @@ class OutboundActionService:
         if blocked is not None:
             return blocked
         if not dispatch:
-            return await self._preflight_without_dispatch(successor, context)
+            return await self._preflight_without_dispatch(successor, context, agent_facing=True)
 
         async def _preflight_fallback() -> PublicResult:
             return await self._preflight(successor, context)
@@ -535,7 +607,7 @@ class OutboundActionService:
     ) -> PublicResult:
         """The agent re-executed a message whose stale_context question is
         still unanswered. Ask again, listing everything newer than the wake's
-        context, and advance the acknowledgement point to what it now saw."""
+        context, and add what it now saw to the shown set."""
         verdict = None
         if self._traffic_probe is not None:
             verdict = await list_stale_context(
@@ -546,17 +618,17 @@ class OutboundActionService:
                 action_id=action.action_id,
                 logger=logger,
             )
-        if verdict is not None and verdict.acknowledged_through is not None:
+        if verdict is not None and verdict.shown_refs:
             try:
                 action = await self._store.block_stale_context(
                     action.action_id,
                     ActionState.STALE,
                     None,
-                    verdict.acknowledged_through,
+                    verdict.shown_refs,
                 )
             except Exception:
                 logger.warning(
-                    "stale-context acknowledgement could not be advanced for action %s",
+                    "stale-context shown set could not be extended for action %s",
                     action.action_id,
                     exc_info=True,
                 )
@@ -570,49 +642,97 @@ class OutboundActionService:
             and action.stale_context_decision is None
         )
 
+    @staticmethod
+    def _is_stale_context_successor(action: OutboundActionRecord) -> bool:
+        return action.remediation_reason in _STALE_CONTEXT_SUCCESSOR_REASONS
+
     async def _preflight_without_dispatch(
         self,
         action: OutboundActionRecord,
         context: ActionContext,
+        *,
+        agent_facing: bool = False,
     ) -> PublicResult:
         evidence = await self._evidence_loader.load(context)
-        evidence = await self._waive_acknowledged_inbound(context, evidence)
+        evidence, unshown = await self._waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             return self._result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+        asked = await self._ask_about_unshown_inbound(action, context, decision, unshown, agent_facing, dispatch=False)
+        if asked is not None:
+            return asked
         return await self._apply_preflight_decision(action, evidence, decision)
 
-    async def _waive_acknowledged_inbound(
+    async def _waive_shown_inbound(
         self,
         context: ActionContext,
         evidence: PreflightEvidence,
-    ) -> PreflightEvidence:
-        """A prospect reply's preflight declines to send over any inbound
-        newer than its source message (`newer_inbound`). After the agent was
-        shown that inbound in a stale_context question and answered, it is no
-        longer unseen context: waive it, and only it. A newer inbound the
-        agent has NOT seen still makes the send stale."""
-        later_id = evidence.later_inbound_message_id
-        if later_id is None or self._traffic_probe is None:
-            return evidence
+    ) -> tuple[PreflightEvidence, tuple[int, ...]]:
+        """A prospect reply's preflight declines to send over ANY inbound newer
+        than its source message (`newer_inbound`), across channels. An inbound
+        this wake's agent was SHOWN in a stale_context question -- by message
+        id, never by timestamp -- is no longer unseen context and is waived;
+        every other one still counts. Returns the evidence restricted to the
+        unshown inbound, and those ids."""
+        later = evidence.later_inbound_message_ids or (
+            (evidence.later_inbound_message_id,) if evidence.later_inbound_message_id is not None else ()
+        )
+        if not later or not self._stale_confirm_enabled or self._traffic_probe is None:
+            return evidence, tuple(later)
         try:
-            acknowledged = await self._traffic_probe.acknowledged_through(
-                context.wakeup_event_id, context.prospect_id
-            )
-            if acknowledged is None:
-                return evidence
-            created_at = await self._traffic_probe.message_created_at(later_id)
+            shown = await self._traffic_probe.acknowledged_refs(context.wakeup_event_id, context.prospect_id)
         except Exception:
             logger.warning(
-                "acknowledged-inbound read failed on wake %s; keeping the newer_inbound check",
+                "shown-context read failed on wake %s; waiving no newer inbound",
                 context.wakeup_event_id,
                 exc_info=True,
             )
-            return evidence
-        if created_at is not None and created_at <= acknowledged:
-            return dataclass_replace(evidence, later_inbound_message_id=None)
-        return evidence
+            return evidence, tuple(later)
+        unshown = tuple(message_id for message_id in later if f"message:{message_id}" not in shown)
+        return (
+            dataclass_replace(
+                evidence,
+                later_inbound_message_id=max(unshown) if unshown else None,
+                later_inbound_message_ids=unshown,
+            ),
+            unshown,
+        )
+
+    async def _ask_about_unshown_inbound(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        decision: PreflightDecision,
+        unshown: tuple[int, ...],
+        agent_facing: bool,
+        *,
+        dispatch: bool,
+    ) -> PublicResult | None:
+        """After the agent answered a stale_context question, an inbound it
+        was never shown (another channel of the same prospect, ingested late,
+        or past the display cap) asks again -- on the successor -- instead of
+        silently suppressing the send it just confirmed."""
+        if not (
+            agent_facing
+            and self._stale_confirm_enabled
+            and self._traffic_probe is not None
+            and decision.outcome is PreflightOutcome.STALE
+            and decision.detail_code == "newer_inbound"
+            and unshown
+            and self._is_stale_context_successor(action)
+            and action.state in _STALE_BLOCKABLE_STATES
+        ):
+            return None
+        try:
+            items = await self._traffic_probe.messages_by_id(list(unshown))
+        except Exception:
+            logger.warning("unshown-inbound read failed for action %s", action.action_id, exc_info=True)
+            return None
+        verdict = stale_context_verdict(items)
+        if verdict is None:
+            return None
+        return await self._block_stale_context(action, context, verdict, confirm=False, dispatch=dispatch)
 
     async def prepare(self, action_id: UUID) -> PublicResult:
         """Preflight a persisted remediation successor without provider I/O."""
@@ -754,6 +874,7 @@ class OutboundActionService:
         *,
         agent_facing: bool = False,
         confirm_stale: bool = False,
+        override: bool = False,
         dispatch: bool = True,
     ) -> PublicResult | None:
         """Per-recipient traffic gate. Returns a blocking PublicResult when
@@ -761,13 +882,15 @@ class OutboundActionService:
         including shadow mode (which only logs) and off mode (no probe call
         at all).
 
-        agent_facing: the caller is the agent's own execute/confirm, so a
-        stale_context block becomes a needs_confirmation question (a `stale`
-        no-send row plus the newer context) instead of a terminal failure.
-        Worker-driven resume()/prepare() have nobody to ask and keep the
-        definitive traffic_blocked failure. confirm_stale: the request said
-        override=true, the historical spelling of "yes" -- the block is still
-        recorded, then answered yes through the successor path."""
+        With stale-context confirmation enabled (OUTBOUND_STALE_CONFIRM_ENABLED)
+        and agent_facing -- the agent's own execute/confirm -- a stale_context
+        block becomes a needs_confirmation question (a `stale` no-send row plus
+        the newer context) instead of a terminal failure, and items already
+        shown to this wake's agent are waived by identity. Worker-driven
+        resume()/prepare() have nobody to ask and keep the definitive
+        traffic_blocked failure. confirm_stale: override=true, the historical
+        spelling of "yes" -- the block is still recorded, then answered yes.
+        Disabled, everything is the pre-192 contract (override bypasses)."""
         if self._traffic_mode == "off" or self._traffic_probe is None:
             return None
         verdict = await check_traffic(
@@ -776,15 +899,17 @@ class OutboundActionService:
             channel_id=context.channel_id,
             wakeup_event_id=context.wakeup_event_id,
             action_id=context.action_id,
-            override=False,
+            override=override,
             logger=logger,
+            acknowledged=self._stale_confirm_enabled,
         )
         if not verdict.allowed:
             if self._traffic_mode == "enforce":
                 if (
-                    agent_facing
+                    self._stale_confirm_enabled
+                    and agent_facing
                     and verdict.reason == "stale_context"
-                    and verdict.acknowledged_through is not None
+                    and verdict.shown_refs
                     and action.state in _STALE_BLOCKABLE_STATES
                 ):
                     return await self._block_stale_context(
@@ -815,16 +940,15 @@ class OutboundActionService:
         confirm: bool,
         dispatch: bool,
     ) -> PublicResult:
-        assert verdict.acknowledged_through is not None
         try:
             blocked = await self._store.block_stale_context(
                 action.action_id,
                 action.state,
                 None if action.state is ActionState.RECEIVED else self._lease_owner,
-                verdict.acknowledged_through,
+                verdict.shown_refs,
             )
         except Exception:
-            # Migration 192 not applied yet (or a concurrent writer moved the
+            # Migration 192 not applied (or a concurrent writer moved the
             # row): keep the pre-192 contract rather than dispatching.
             logger.error(
                 "stale_context block for action %s on wake %s could not be recorded as a "
@@ -837,12 +961,18 @@ class OutboundActionService:
             return await self._terminal_traffic_block(current, context, verdict)
         if confirm:
             logger.warning(
-                "override=true answered stale_context yes: wake=%s action=%s acknowledged_through=%s",
+                "override=true answered stale_context yes: wake=%s action=%s shown=%s",
                 context.wakeup_event_id,
                 blocked.action_id,
-                verdict.acknowledged_through.isoformat(),
+                ",".join(verdict.shown_refs),
             )
-            return await self._confirm_successor(blocked, StaleContextDecision.YES, None, dispatch=dispatch)
+            return await self._confirm_successor(
+                blocked,
+                StaleContextDecision.YES,
+                None,
+                wakeup_event_id=context.wakeup_event_id,
+                dispatch=dispatch,
+            )
         return self._needs_confirmation(blocked, verdict)
 
     @staticmethod
@@ -1181,8 +1311,9 @@ class OutboundActionService:
         return self._result(completed)
 
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
+        """The agent-facing preflight (execute and confirm)."""
         evidence = await self._evidence_loader.load(context)
-        evidence = await self._waive_acknowledged_inbound(context, evidence)
+        evidence, unshown = await self._waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
@@ -1191,6 +1322,9 @@ class OutboundActionService:
             if prepared.state is ActionState.DEPENDENCY_WAIT:
                 return self._result(prepared)
             return await self._dispatch(prepared, context)
+        asked = await self._ask_about_unshown_inbound(action, context, decision, unshown, True, dispatch=True)
+        if asked is not None:
+            return asked
         return await self._apply_preflight_decision(action, evidence, decision)
 
     async def _resume_dependency(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
@@ -1201,7 +1335,7 @@ class OutboundActionService:
             self._lease_seconds,
         )
         evidence = await self._evidence_loader.load(context)
-        evidence = await self._waive_acknowledged_inbound(context, evidence)
+        evidence, _unshown = await self._waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)

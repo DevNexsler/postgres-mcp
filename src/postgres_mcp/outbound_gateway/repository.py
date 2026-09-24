@@ -98,13 +98,14 @@ class ContextRepository(Protocol):
         watermark: datetime,
         exclude_action_id: UUID,
         limit: int,
+        exclude_refs: frozenset[str] = frozenset(),
     ) -> list[NewerActivity]: ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
 
-    async def acknowledged_through(self, wakeup_event_id: int, recipient_key: str) -> datetime | None: ...
+    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]: ...
 
-    async def message_created_at(self, message_id: int) -> datetime | None: ...
+    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]: ...
 
 
 class OutboundGatewayRepository:
@@ -252,6 +253,7 @@ class OutboundGatewayRepository:
         watermark: datetime,
         exclude_action_id: UUID,
         limit: int,
+        exclude_refs: frozenset[str] = frozenset(),
     ) -> list[NewerActivity]:
         """Every ledger send and message newer than `watermark` that this
         recipient's context depends on, newest first, at most `limit`. The
@@ -259,6 +261,10 @@ class OutboundGatewayRepository:
         what changed is that a needs_confirmation result lists them all
         instead of naming only the newest."""
         limit = max(1, int(limit))
+        excluded_actions = sorted(ref.removeprefix("action:") for ref in exclude_refs if ref.startswith("action:"))
+        excluded_messages = sorted(
+            int(ref.removeprefix("message:")) for ref in exclude_refs if ref.startswith("message:")
+        )
         ledger_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -282,12 +288,13 @@ class OutboundGatewayRepository:
             FROM outbound_actions
             WHERE subject_key = {}
               AND action_id NOT IN (SELECT action_id FROM retry_lineage)
+              AND NOT (action_id::text = ANY({}::text[]))
               AND created_at > {}
               AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
             LIMIT {}
             """,
-            [exclude_action_id, recipient_key, watermark, limit],
+            [exclude_action_id, recipient_key, excluded_actions, watermark, limit],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -305,6 +312,7 @@ class OutboundGatewayRepository:
             LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
             WHERE message.channel_id = {}
               AND message.created_at > {}
+              AND NOT (message.id = ANY({}::bigint[]))
               AND NOT (
                   -- Automated operations alerts share Nigel's Cliq DM with Dan.
                   -- They do not answer an inbound DM and must not stale its
@@ -312,10 +320,21 @@ class OutboundGatewayRepository:
                   -- Direction is not part of the test: the same bot-posted
                   -- alerts are stored `outbound` or `inbound` (14 days to
                   -- 2026-09-24: 101 vs 37, all from Nigel's own account), and
-                  -- wake 27164's refusal was one labelled `inbound`.
+                  -- wake 27164's refusal was one labelled `inbound`. The
+                  -- SENDER is: only Nigel's own Cliq user (agency_identifiers
+                  -- cliq_user_id labelled nigel-zoho, the gateway's Nigel
+                  -- account) posts these. A human pasting an alert still counts.
                   sending.operation = 'cliq.chat.post'
                   AND message.source = 'zoho_cliq'
                   AND message.body LIKE '⚠️ Cron issue —%'
+                  -- coalesce: an unknown sender must never make NOT(...) NULL
+                  -- and silently drop the row.
+                  AND coalesce(sender.participant_key, '') IN (
+                      SELECT agency.value
+                      FROM agency_identifiers AS agency
+                      WHERE agency.kind = 'cliq_user_id'
+                        AND agency.label = 'nigel-zoho'
+                  )
               )
               AND (
                   sending.operation IS DISTINCT FROM 'quo.sms.send'
@@ -345,7 +364,7 @@ class OutboundGatewayRepository:
             ORDER BY message.created_at DESC
             LIMIT {}
             """,
-            [exclude_action_id, channel_id, watermark, limit],
+            [exclude_action_id, channel_id, watermark, excluded_messages, limit],
         )
         candidates: list[NewerActivity] = []
         for row in ledger_rows or []:
@@ -381,34 +400,57 @@ class OutboundGatewayRepository:
         candidates.sort(key=lambda item: item.occurred_at, reverse=True)
         return candidates[:limit]
 
-    async def acknowledged_through(self, wakeup_event_id: int, recipient_key: str) -> datetime | None:
-        """The newest stale context this wake's agent was shown for this
-        recipient: the acknowledgement point every needs_confirmation result
-        records on its blocked action (Comm-Data-Store migration 192)."""
+    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]:
+        """Every item this wake's agent was shown for this recipient in a
+        stale_context question (Comm-Data-Store migration 192). Identity, not
+        time: an inbound stored with an earlier send time but ingested after
+        the question was asked was never shown and is never in this set."""
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
-            SELECT max(stale_context_acknowledged_through) AS acknowledged_through
-            FROM outbound_actions
-            WHERE wakeup_event_id = {}
-              AND subject_key = {}
-              AND state = 'stale'
+            SELECT DISTINCT shown.ref
+            FROM outbound_actions AS action
+            CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref)
+            WHERE action.wakeup_event_id = {}
+              AND action.subject_key = {}
+              AND action.state = 'stale'
             """,
             [wakeup_event_id, recipient_key],
         )
-        if not rows:
-            return None
-        return rows[0].cells.get("acknowledged_through")
+        return frozenset(str(row.cells["ref"]) for row in rows or [])
 
-    async def message_created_at(self, message_id: int) -> datetime | None:
+    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]:
+        if not message_ids:
+            return []
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
-            "SELECT created_at FROM messages WHERE id = {}",
-            [message_id],
+            """
+            SELECT
+                message.id AS message_id,
+                message.created_at,
+                message.direction,
+                message.source,
+                sender.display_name AS sender_name,
+                left(coalesce(message.body,''), 300) AS preview
+            FROM messages AS message
+            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
+            WHERE message.id = ANY({}::bigint[])
+            ORDER BY message.created_at DESC
+            """,
+            [sorted(message_ids)],
         )
-        if not rows:
-            return None
-        return rows[0].cells.get("created_at")
+        return [
+            NewerActivity(
+                direction=str(row.cells.get("direction") or "unknown"),
+                source=str(row.cells.get("source") or "messages"),
+                occurred_at=row.cells["created_at"],
+                preview=str(row.cells.get("preview") or ""),
+                message_id=int(row.cells["message_id"]),
+                action_id=None,
+                sender=(str(row.cells["sender_name"]) if row.cells.get("sender_name") else None),
+            )
+            for row in rows or []
+        ]
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None:
         rows = await SafeSqlDriver.execute_param_query(
