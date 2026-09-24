@@ -309,9 +309,12 @@ class OutboundGatewayRepository:
                   -- Automated operations alerts share Nigel's Cliq DM with Dan.
                   -- They do not answer an inbound DM and must not stale its
                   -- internal_reply action. Keep human follow-ups in the probe.
+                  -- Direction is not part of the test: the same bot-posted
+                  -- alerts are stored `outbound` or `inbound` (14 days to
+                  -- 2026-09-24: 101 vs 37, all from Nigel's own account), and
+                  -- wake 27164's refusal was one labelled `inbound`.
                   sending.operation = 'cliq.chat.post'
                   AND message.source = 'zoho_cliq'
-                  AND message.direction = 'outbound'
                   AND message.body LIKE '⚠️ Cron issue —%'
               )
               AND (

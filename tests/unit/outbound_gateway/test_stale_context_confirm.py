@@ -1,15 +1,20 @@
 # pyright: reportArgumentType=false, reportOptionalMemberAccess=false, reportOptionalIterable=false, reportOptionalSubscript=false, reportOperatorIssue=false
 """stale_context as a question: needs_confirmation -> confirm yes | no | revise.
 
-Replays wake 27164 (2026-09-23): Dan asked Nigel in the Cliq DM to "reply pong
-once"; an automated cron alert landed in the same DM after the wake's context
+Built on wake 27164 (2026-09-23): Dan asked Nigel in the Cliq DM to "reply
+pong once"; newer activity landed in the same DM after the wake's context
 watermark; the gateway refused `pong` as stale_context and wrote it
 definitive_failed/traffic_blocked, the envelope called that refusal final, and
-the reconciler paged delivery_failed. The fake ledger below enforces the same
-guards Comm-Data-Store migration 192 enforces in SQL (one answer per blocked
-action, same wake, successor minted once, revise may change content only), so
-these tests exercise the service's real control flow end to end.
+the reconciler paged delivery_failed. (That particular activity was a cron
+alert, which the probe's Cliq exemption now ignores in either direction label;
+here the newer activity is a human message in the same DM, the case the
+question exists for. The fake probe stands in for the SQL.) The fake ledger
+below enforces the same guards Comm-Data-Store migration 192 enforces in SQL
+(one answer per blocked action, same wake, successor minted once, revise may
+change content only), so these tests exercise the service's real control flow
+end to end.
 """
+
 
 from __future__ import annotations
 
@@ -57,9 +62,10 @@ CRON_ALERT = NewerActivity(
     direction="inbound",
     source="zoho_cliq",
     occurred_at=CRON_ALERT_AT,
-    preview="⚠️ Cron issue — comms-review-stall-watch",
+    preview="wait, is that cron alert about the gateway you are testing?",
     message_id=750824,
     action_id=None,
+    sender="Dan Park",
 )
 DAN_FOLLOW_UP = NewerActivity(
     direction="inbound",
@@ -804,9 +810,9 @@ async def test_wire_shape_of_needs_confirmation_and_of_an_ordinary_result():
             "id": "message:750824",
             "source": "zoho_cliq",
             "direction": "inbound",
-            "sender": None,
+            "sender": "Dan Park",
             "occurred_at": CRON_ALERT_AT.isoformat().replace("+00:00", "Z"),
-            "preview": "⚠️ Cron issue — comms-review-stall-watch",
+            "preview": "wait, is that cron alert about the gateway you are testing?",
         }
     ]
     assert '"decision": "revise"' in asked["question"]

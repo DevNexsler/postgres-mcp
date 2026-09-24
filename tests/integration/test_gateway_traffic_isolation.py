@@ -341,3 +341,23 @@ async def test_acknowledged_point_on_a_stale_row_waives_only_what_was_shown(traf
     unseen = await verdict(repository)
     assert unseen.reason == "stale_context"
     assert [item.message_id for item in unseen.newer] == [11]
+
+
+
+@pytest.mark.asyncio
+async def test_cliq_internal_reply_ignores_a_cron_alert_stored_as_inbound(traffic):
+    """Wake 27164: the alert that refused `pong` was stored direction
+    `inbound` (37 of 138 alerts in the 14 days before 2026-09-24 were). The
+    exemption is about the alert, not its direction label."""
+    conn, repository = traffic
+    await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source) "
+        "VALUES (750824,18,%s,'inbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
+    )
+    assert (await verdict(repository)).reason == "pass"
+
+    await conn.execute("UPDATE outbound_actions SET operation='email.send'")
+    # The exemption is Cliq-internal-reply only: other operations still see it.
+    assert (await verdict(repository)).reason == "stale_context"
