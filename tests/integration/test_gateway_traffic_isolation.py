@@ -68,17 +68,29 @@ async def traffic(traffic_database):
                 sender_participant_id bigint, recipient_participant_id bigint
             );
             CREATE TEMP TABLE raw_events (id bigint PRIMARY KEY, payload jsonb);
-            CREATE TEMP TABLE participants (id bigint PRIMARY KEY, participant_key text, participant_type text);
+            CREATE TEMP TABLE participants (id bigint PRIMARY KEY, participant_key text, participant_type text, display_name text);
             CREATE TEMP TABLE outbound_actions (
                 action_id uuid PRIMARY KEY, subject_key text, operation text, state text,
                 created_at timestamptz, arguments jsonb, canonical_context jsonb,
-                dispatch_started_at timestamptz, retry_of_action_id uuid
+                dispatch_started_at timestamptz, retry_of_action_id uuid,
+                wakeup_event_id bigint DEFAULT 26817,
+                stale_context_shown_refs text[]
             );
+            CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
             CREATE TEMP TABLE hermes_wakeup_events (
                 id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz
             );
         """)
         await conn.execute("INSERT INTO hermes_wakeup_events VALUES (26817, %s, %s)", (WATERMARK, WATERMARK))
+        # Production seed (Comm-Data-Store migration 146): Nigel's own Cliq user.
+        await conn.execute(
+            "INSERT INTO agency_identifiers VALUES ('cliq_user_id','918334727','nigel-zoho'),"
+            "('cliq_user_id','720844989','dan-zoho')"
+        )
+        await conn.execute(
+            "INSERT INTO participants VALUES (918, '918334727', 'user', 'Nigel Pine'),"
+            "(720, '720844989', 'user', 'Dan Park')"
+        )
         await conn.execute(
             "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}',%s,NULL,NULL)",
             (ACTION, SUBJECT, WATERMARK, Jsonb({"recipient_phone": JESSICA})),
@@ -97,7 +109,7 @@ async def add_message(conn, *, sender=GUNTHER, recipient=LINE, direction="inboun
     )
 
 
-async def verdict(repository, *, override=False):
+async def verdict(repository, *, override=False, acknowledged=False):
     return await check_traffic(
         repository,
         recipient_key=SUBJECT,
@@ -106,6 +118,7 @@ async def verdict(repository, *, override=False):
         action_id=ACTION,
         override=override,
         logger=logging.getLogger(__name__),
+        acknowledged=acknowledged,
     )
 
 
@@ -185,8 +198,8 @@ async def test_cliq_internal_reply_ignores_cron_alert_but_blocks_new_human_messa
     conn, repository = traffic
     await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,direction,body,source) "
-        "VALUES (750824,18,%s,'outbound',%s,'zoho_cliq')",
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source,sender_participant_id) "
+        "VALUES (750824,18,%s,'outbound',%s,'zoho_cliq',918)",
         (WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
     )
     alert_only = await verdict(repository)
@@ -293,3 +306,107 @@ async def test_override_bypasses_real_staleness_but_never_recipient_lease(traffi
     leased = await verdict(repository, override=True)
     assert not leased.allowed
     assert leased.reason == "lease_held"
+
+
+
+@pytest.mark.asyncio
+async def test_needs_confirmation_lists_every_relevant_item_newest_first(traffic):
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
+    await add_message(conn, sender=GUNTHER, minute=11, message_id=11)
+    await add_message(conn, sender=LINE, recipient=JESSICA, direction="outbound", minute=12, message_id=12)
+    await conn.execute("INSERT INTO participants VALUES (7, 'phone:+12025550101', 'phone', 'Jessica')")
+    await conn.execute("UPDATE messages SET sender_participant_id = 7 WHERE id = 10")
+
+    result = await verdict(repository, acknowledged=True)
+
+    assert result.reason == "stale_context"
+    # Gunther shares the line but is not Jessica's context.
+    assert [item.message_id for item in result.newer] == [12, 10]
+    assert result.newer[1].sender == "Jessica"
+    assert result.shown_refs == ("message:12", "message:10")
+    assert not result.truncated
+
+
+@pytest.mark.asyncio
+async def test_shown_refs_on_a_stale_row_waive_only_what_was_shown(traffic):
+    """The agent was shown Jessica's minute-11 text in a needs_confirmation.
+    Answering it must not be refused over that same text again -- but a text
+    it never saw still asks again, INCLUDING one sent earlier (minute 10,
+    before anything shown) that was ingested only after the question: a
+    timestamp waiver would have hidden it."""
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=11, message_id=11)
+    await conn.execute(
+        "INSERT INTO outbound_actions (action_id, subject_key, operation, state, created_at, arguments, "
+        "canonical_context, wakeup_event_id, stale_context_shown_refs) "
+        "VALUES (%s,%s,'quo.sms.send','stale',%s,'{}','{}',26817,ARRAY['message:11'])",
+        (UUID(int=3), SUBJECT, WATERMARK.replace(minute=9)),
+    )
+    assert await repository.acknowledged_refs(26817, SUBJECT) == frozenset({"message:11"})
+    assert await repository.acknowledged_refs(26818, SUBJECT) == frozenset()
+    assert await repository.acknowledged_refs(26817, "subject:gunther") == frozenset()
+
+    shown = await verdict(repository, acknowledged=True)
+    assert shown.allowed and shown.reason == "pass"
+    # Disabled, nothing is waived (the pre-192 contract).
+    assert (await verdict(repository)).reason == "stale_context"
+
+    # Sent at minute 10 -- before the shown text -- but ingested only now.
+    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
+    late = await verdict(repository, acknowledged=True)
+    assert late.reason == "stale_context"
+    assert [item.message_id for item in late.newer] == [10]
+
+    await add_message(conn, sender=JESSICA, minute=12, message_id=12)
+    unseen = await verdict(repository, acknowledged=True)
+    assert [item.message_id for item in unseen.newer] == [12, 10]
+
+
+@pytest.mark.asyncio
+async def test_messages_by_id_reads_context_items_for_the_preflights_inbound(traffic):
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
+    items = await repository.messages_by_id([10, 999])
+    assert [(item.ref, item.source, item.direction) for item in items] == [("message:10", "quo", "inbound")]
+
+
+@pytest.mark.asyncio
+async def test_cliq_internal_reply_ignores_a_cron_alert_stored_as_inbound(traffic):
+    """Wake 27164: the alert that refused `pong` was stored direction
+    `inbound` (37 of 138 alerts in the 14 days before 2026-09-24 were). The
+    exemption is about the alert, not its direction label."""
+    conn, repository = traffic
+    await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source,sender_participant_id) "
+        "VALUES (750824,18,%s,'inbound',%s,'zoho_cliq',918)",
+        (WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
+    )
+    assert (await verdict(repository)).reason == "pass"
+
+    await conn.execute("UPDATE outbound_actions SET operation='email.send'")
+    # The exemption is Cliq-internal-reply only: other operations still see it.
+    assert (await verdict(repository)).reason == "stale_context"
+
+
+
+@pytest.mark.asyncio
+async def test_a_human_pasting_a_cron_alert_is_not_exempt(traffic):
+    """The exemption is for Nigel's own alert posts (agency_identifiers
+    cliq_user_id labelled nigel-zoho), not for any message with that prefix:
+    Dan pasting an alert into the DM is exactly the context a reply needs."""
+    conn, repository = traffic
+    await conn.execute("UPDATE outbound_actions SET operation='cliq.chat.post'")
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,direction,body,source,sender_participant_id) "
+        "VALUES (750830,18,%s,'inbound',%s,'zoho_cliq',720)",
+        (WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch\nis this the gateway?"),
+    )
+    pasted = await verdict(repository)
+    assert pasted.reason == "stale_context"
+    assert "message 750830" in pasted.detail
+
+    await conn.execute("UPDATE messages SET sender_participant_id = NULL WHERE id = 750830")
+    unknown_sender = await verdict(repository)
+    assert unknown_sender.reason == "stale_context"

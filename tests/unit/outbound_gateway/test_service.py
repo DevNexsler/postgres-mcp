@@ -1,4 +1,8 @@
 # pyright: reportArgumentType=false, reportOptionalMemberAccess=false
+# The service's pre-192 contract. OUTBOUND_STALE_CONFIRM_ENABLED defaults off,
+# and every test here runs with it off, unchanged from before the stale-context
+# confirmation work: that is the proof that "off" behaves exactly as today.
+# The enabled behaviour is tests/unit/outbound_gateway/test_stale_context_confirm.py.
 
 from __future__ import annotations
 
@@ -370,9 +374,15 @@ class FakeProbe:
             raise RuntimeError("probe boom")
         return self.in_flight
 
-    async def newest_activity_after(self, recipient_key, channel_id, watermark, exclude_action_id):
+    async def activity_after(self, recipient_key, channel_id, watermark, exclude_action_id, limit, exclude_refs=frozenset()):
         self.calls.append(("newest_activity", recipient_key, channel_id, watermark, exclude_action_id))
-        return self.newer
+        return [self.newer] if self.newer is not None else []
+
+    async def acknowledged_refs(self, wakeup_event_id, recipient_key):
+        raise AssertionError("with stale-context confirmation disabled the probe never reads shown context")
+
+    async def messages_by_id(self, message_ids):
+        raise AssertionError("with stale-context confirmation disabled the probe never reads shown context")
 
     async def context_watermark(self, wakeup_event_id):
         self.calls.append(("watermark", wakeup_event_id))

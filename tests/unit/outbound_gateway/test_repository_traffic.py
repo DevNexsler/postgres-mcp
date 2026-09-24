@@ -137,15 +137,18 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
     assert "dispatch_started_at" in ledger_query
     assert "completed" in ledger_query
     assert "ORDER BY created_at DESC" in ledger_query
-    assert "LIMIT 1" in ledger_query
-    assert ledger_params == [ACTION_ID, "email:amanda@example.com", watermark]
+    # newest_activity_after is activity_after(limit=1): the limit is a parameter.
+    assert "LIMIT {}" in ledger_query
+    # [exclude lineage root, recipient, excluded (shown) action ids, watermark, limit]
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", [], watermark, 1]
 
     messages_query, messages_params = calls[1]
     assert "messages" in messages_query
     assert "channel_id" in messages_query
     assert "ORDER BY message.created_at DESC" in messages_query
-    assert "LIMIT 1" in messages_query
-    assert messages_params == [ACTION_ID, 44, watermark]
+    assert "LIMIT {}" in messages_query
+    # [sending action, channel, watermark, excluded (shown) message ids, limit]
+    assert messages_params == [ACTION_ID, 44, watermark, [], 1]
 
     assert result == NewerActivity(
         direction="inbound",
@@ -278,7 +281,8 @@ async def test_newest_activity_after_excludes_retry_ancestors_from_the_ledger_qu
     assert "JOIN retry_lineage AS child" in ledger_query
     assert "ancestor.action_id = child.retry_of_action_id" in ledger_query
     assert "SELECT action_id FROM retry_lineage" in ledger_query
-    assert ledger_params == [ACTION_ID, "email:amanda@example.com", watermark]
+    # [exclude lineage root, recipient, excluded (shown) action ids, watermark, limit]
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", [], watermark, 1]
 
 
 @pytest.mark.asyncio
@@ -336,3 +340,129 @@ async def test_context_watermark_returns_none_when_no_row():
         result = await repository.context_watermark(12345)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_activity_after_lists_both_arms_newest_first_with_sender_and_limit():
+    watermark = datetime(2026, 9, 23, 19, 36, 29, tzinfo=timezone.utc)
+    ledger_rows = [
+        Row(
+            {
+                "action_id": OTHER_ACTION_ID,
+                "operation": "cliq.chat.post",
+                "created_at": datetime(2026, 9, 23, 19, 36, 40, tzinfo=timezone.utc),
+                "preview": "earlier reply",
+            }
+        )
+    ]
+    message_rows = [
+        Row(
+            {
+                "message_id": 750825,
+                "created_at": datetime(2026, 9, 23, 19, 38, 56, tzinfo=timezone.utc),
+                "direction": "inbound",
+                "source": "zoho_cliq",
+                "sender_name": "Nigel",
+                "preview": "second alert",
+            }
+        ),
+        Row(
+            {
+                "message_id": 750824,
+                "created_at": datetime(2026, 9, 23, 19, 36, 56, tzinfo=timezone.utc),
+                "direction": "inbound",
+                "source": "zoho_cliq",
+                "sender_name": None,
+                "preview": "first alert",
+            }
+        ),
+    ]
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return ledger_rows if "subject_key = {}" in query else message_rows
+
+    repository = OutboundGatewayRepository(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        items = await repository.activity_after("internal:1424728044450751028", 417, watermark, ACTION_ID, 2)
+
+    assert [item.ref for item in items] == ["message:750825", "message:750824"]
+    assert items[0].sender == "Nigel" and items[0].source == "zoho_cliq"
+    assert items[1].sender is None
+    assert calls[0][1][-1] == 2 and calls[1][1][-1] == 2
+    assert "left(coalesce(message.body,''), 300)" in calls[1][0]
+    assert "participants AS sender" in calls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_activity_after_excludes_exactly_the_shown_refs():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return []
+
+    repository = OutboundGatewayRepository(object())
+    other = UUID("11111111-2222-5333-8444-555555555555")
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await repository.activity_after(
+            "internal:1", 417, datetime(2026, 9, 23, tzinfo=timezone.utc), ACTION_ID, 11,
+            frozenset({"message:750824", "message:12", f"action:{other}"}),
+        )
+
+    (ledger_query, ledger_params), (message_query, message_params) = calls
+    assert "NOT (action_id::text = ANY({}::text[]))" in ledger_query
+    assert ledger_params[2] == [str(other)]
+    assert "NOT (message.id = ANY({}::bigint[]))" in message_query
+    assert message_params[3] == [12, 750824]
+
+
+@pytest.mark.asyncio
+async def test_cron_exemption_requires_nigels_own_cliq_account_not_just_the_body():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append(query)
+        return []
+
+    repository = OutboundGatewayRepository(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await repository.activity_after("internal:1", 417, datetime(2026, 9, 23, tzinfo=timezone.utc), ACTION_ID, 11)
+
+    message_query = calls[1]
+    assert "message.body LIKE '⚠️ Cron issue —%'" in message_query
+    assert "coalesce(sender.participant_key, '') IN" in message_query
+    assert "agency.kind = 'cliq_user_id'" in message_query and "agency.label = 'nigel-zoho'" in message_query
+    assert "message.direction = 'outbound'" not in message_query
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_refs_reads_the_shown_set_of_this_wake_and_recipient():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row({"ref": "message:750824"}), Row({"ref": "action:x"})]
+
+    repository = OutboundGatewayRepository(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        refs = await repository.acknowledged_refs(27164, "internal:1424728044450751028")
+
+    assert refs == frozenset({"message:750824", "action:x"})
+    query, params = calls[0]
+    assert "unnest(action.stale_context_shown_refs)" in query
+    assert "action.state = 'stale'" in query
+    assert params == [27164, "internal:1424728044450751028"]

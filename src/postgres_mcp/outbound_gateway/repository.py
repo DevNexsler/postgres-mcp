@@ -91,11 +91,21 @@ class ContextRepository(Protocol):
         self, recipient_key: str, exclude_action_id: UUID
     ) -> list[InFlightAction]: ...
 
-    async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
-    ) -> NewerActivity | None: ...
+    async def activity_after(
+        self,
+        recipient_key: str,
+        channel_id: int,
+        watermark: datetime,
+        exclude_action_id: UUID,
+        limit: int,
+        exclude_refs: frozenset[str] = frozenset(),
+    ) -> list[NewerActivity]: ...
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
+
+    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]: ...
+
+    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]: ...
 
 
 class OutboundGatewayRepository:
@@ -228,7 +238,33 @@ class OutboundGatewayRepository:
             for row in rows or []
         ]
 
-    async def newest_activity_after(self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID) -> NewerActivity | None:
+    async def newest_activity_after(
+        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
+    ) -> NewerActivity | None:
+        """The single newest item of activity_after (kept for callers that
+        only need to know whether anything is newer)."""
+        items = await self.activity_after(recipient_key, channel_id, watermark, exclude_action_id, 1)
+        return items[0] if items else None
+
+    async def activity_after(
+        self,
+        recipient_key: str,
+        channel_id: int,
+        watermark: datetime,
+        exclude_action_id: UUID,
+        limit: int,
+        exclude_refs: frozenset[str] = frozenset(),
+    ) -> list[NewerActivity]:
+        """Every ledger send and message newer than `watermark` that this
+        recipient's context depends on, newest first, at most `limit`. The
+        two arms apply the same exclusions the staleness gate always did;
+        what changed is that a needs_confirmation result lists them all
+        instead of naming only the newest."""
+        limit = max(1, int(limit))
+        excluded_actions = sorted(ref.removeprefix("action:") for ref in exclude_refs if ref.startswith("action:"))
+        excluded_messages = sorted(
+            int(ref.removeprefix("message:")) for ref in exclude_refs if ref.startswith("message:")
+        )
         ledger_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -246,17 +282,19 @@ class OutboundGatewayRepository:
             )
             SELECT
                 action_id,
+                operation,
                 created_at,
-                left(coalesce(arguments::text,''), 120) AS preview
+                left(coalesce(arguments->>'text', arguments::text, ''), 300) AS preview
             FROM outbound_actions
             WHERE subject_key = {}
               AND action_id NOT IN (SELECT action_id FROM retry_lineage)
+              AND NOT (action_id::text = ANY({}::text[]))
               AND created_at > {}
               AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
-            LIMIT 1
+            LIMIT {}
             """,
-            [exclude_action_id, recipient_key, watermark],
+            [exclude_action_id, recipient_key, excluded_actions, watermark, limit],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -265,20 +303,38 @@ class OutboundGatewayRepository:
                 message.id AS message_id,
                 message.created_at,
                 message.direction,
-                left(coalesce(message.body,''), 120) AS preview
+                message.source,
+                sender.display_name AS sender_name,
+                left(coalesce(message.body,''), 300) AS preview
             FROM messages AS message
             LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
+            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
             LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
             WHERE message.channel_id = {}
               AND message.created_at > {}
+              AND NOT (message.id = ANY({}::bigint[]))
               AND NOT (
                   -- Automated operations alerts share Nigel's Cliq DM with Dan.
                   -- They do not answer an inbound DM and must not stale its
                   -- internal_reply action. Keep human follow-ups in the probe.
+                  -- Direction is not part of the test: the same bot-posted
+                  -- alerts are stored `outbound` or `inbound` (14 days to
+                  -- 2026-09-24: 101 vs 37, all from Nigel's own account), and
+                  -- wake 27164's refusal was one labelled `inbound`. The
+                  -- SENDER is: only Nigel's own Cliq user (agency_identifiers
+                  -- cliq_user_id labelled nigel-zoho, the gateway's Nigel
+                  -- account) posts these. A human pasting an alert still counts.
                   sending.operation = 'cliq.chat.post'
                   AND message.source = 'zoho_cliq'
-                  AND message.direction = 'outbound'
                   AND message.body LIKE '⚠️ Cron issue —%'
+                  -- coalesce: an unknown sender must never make NOT(...) NULL
+                  -- and silently drop the row.
+                  AND coalesce(sender.participant_key, '') IN (
+                      SELECT agency.value
+                      FROM agency_identifiers AS agency
+                      WHERE agency.kind = 'cliq_user_id'
+                        AND agency.label = 'nigel-zoho'
+                  )
               )
               AND (
                   sending.operation IS DISTINCT FROM 'quo.sms.send'
@@ -306,13 +362,13 @@ class OutboundGatewayRepository:
                   )
               )
             ORDER BY message.created_at DESC
-            LIMIT 1
+            LIMIT {}
             """,
-            [exclude_action_id, channel_id, watermark],
+            [exclude_action_id, channel_id, watermark, excluded_messages, limit],
         )
         candidates: list[NewerActivity] = []
-        if ledger_rows:
-            cells = ledger_rows[0].cells
+        for row in ledger_rows or []:
+            cells = row.cells
             candidates.append(
                 NewerActivity(
                     direction="outbound",
@@ -321,10 +377,11 @@ class OutboundGatewayRepository:
                     preview=str(cells.get("preview") or ""),
                     message_id=None,
                     action_id=UUID(str(cells["action_id"])),
+                    sender=f"outbound gateway ({cells.get('operation')})" if cells.get("operation") else None,
                 )
             )
-        if message_rows:
-            cells = message_rows[0].cells
+        for row in message_rows or []:
+            cells = row.cells
             candidates.append(
                 NewerActivity(
                     # NULL direction must not be silently reported as
@@ -332,16 +389,68 @@ class OutboundGatewayRepository:
                     # claim inbound activity that was never actually
                     # confirmed as such. "unknown" is the honest label.
                     direction=str(cells.get("direction") or "unknown"),
-                    source="messages",
+                    source=str(cells.get("source") or "messages"),
                     occurred_at=cells["created_at"],
                     preview=str(cells.get("preview") or ""),
                     message_id=int(cells["message_id"]),
                     action_id=None,
+                    sender=(str(cells["sender_name"]) if cells.get("sender_name") else None),
                 )
             )
-        if not candidates:
-            return None
-        return max(candidates, key=lambda item: item.occurred_at)
+        candidates.sort(key=lambda item: item.occurred_at, reverse=True)
+        return candidates[:limit]
+
+    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]:
+        """Every item this wake's agent was shown for this recipient in a
+        stale_context question (Comm-Data-Store migration 192). Identity, not
+        time: an inbound stored with an earlier send time but ingested after
+        the question was asked was never shown and is never in this set."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT DISTINCT shown.ref
+            FROM outbound_actions AS action
+            CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref)
+            WHERE action.wakeup_event_id = {}
+              AND action.subject_key = {}
+              AND action.state = 'stale'
+            """,
+            [wakeup_event_id, recipient_key],
+        )
+        return frozenset(str(row.cells["ref"]) for row in rows or [])
+
+    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]:
+        if not message_ids:
+            return []
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT
+                message.id AS message_id,
+                message.created_at,
+                message.direction,
+                message.source,
+                sender.display_name AS sender_name,
+                left(coalesce(message.body,''), 300) AS preview
+            FROM messages AS message
+            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
+            WHERE message.id = ANY({}::bigint[])
+            ORDER BY message.created_at DESC
+            """,
+            [sorted(message_ids)],
+        )
+        return [
+            NewerActivity(
+                direction=str(row.cells.get("direction") or "unknown"),
+                source=str(row.cells.get("source") or "messages"),
+                occurred_at=row.cells["created_at"],
+                preview=str(row.cells.get("preview") or ""),
+                message_id=int(row.cells["message_id"]),
+                action_id=None,
+                sender=(str(row.cells["sender_name"]) if row.cells.get("sender_name") else None),
+            )
+            for row in rows or []
+        ]
 
     async def context_watermark(self, wakeup_event_id: int) -> datetime | None:
         rows = await SafeSqlDriver.execute_param_query(

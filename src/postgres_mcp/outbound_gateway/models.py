@@ -93,6 +93,34 @@ class PublicStatus(StrEnum):
     FAILED = "failed"
     UNKNOWN = "unknown"
     MANUAL_REVIEW = "manual_review"
+    # A stale_context traffic block is a question to the agent, not a failure:
+    # the action is durably recorded as a deliberate no-send (state `stale`)
+    # and the result carries the newer context plus a yes/no confirm prompt.
+    NEEDS_CONFIRMATION = "needs_confirmation"
+
+
+class StaleContextDecision(StrEnum):
+    YES = "yes"
+    NO = "no"
+    REVISE = "revise"
+
+
+# The stale-context family of `detail_code`s on a `stale` row. Every one of
+# them is a deliberate no-send, never a failure:
+#   stale_context            -- refused, question asked, no answer (yet)
+#   stale_context_confirmed  -- agent answered yes; a successor carries the send
+#   stale_context_declined   -- agent answered no; nothing is sent
+#   stale_context_revised    -- agent answered revise; a successor carries
+#                               the revised content to the same target
+STALE_CONTEXT_DETAIL = "stale_context"
+STALE_CONTEXT_DETAILS = frozenset(
+    {
+        "stale_context",
+        "stale_context_confirmed",
+        "stale_context_declined",
+        "stale_context_revised",
+    }
+)
 
 
 class StrictModel(BaseModel):
@@ -501,7 +529,63 @@ class SuggestRequest(StrictModel):
     wakeup_event_id: PositiveBigInt
 
 
-OutboundRequest: TypeAlias = Annotated[ExecuteRequest | StatusRequest | SuggestRequest, Field(discriminator="op")]
+class ConfirmRequest(StrictModel):
+    """Answer to a needs_confirmation (stale_context) result.
+
+    `yes` sends the blocked message unchanged, `revise` sends `arguments`
+    instead (same operation, role, intent and target -- only content fields
+    may change), each through a successor action (retry_of_action_id =
+    action_id) that still passes every other gateway check. `no` records the
+    decline and sends nothing. One answer per blocked action: repeating it
+    returns the recorded result, a different answer is refused.
+    wakeup_event_id is REQUIRED and must be the blocked action's own wake --
+    a confirmation never crosses wakes."""
+
+    op: Literal["confirm"]
+    wakeup_event_id: PositiveBigInt
+    action_id: UUID
+    decision: StaleContextDecision
+    arguments: dict[str, Any] | None = None
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def normalize_decision(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().casefold()
+        return value
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> ConfirmRequest:
+        if self.decision is StaleContextDecision.REVISE:
+            if not self.arguments:
+                raise ValueError("decision revise requires arguments with the revised message")
+        elif self.arguments is not None:
+            raise ValueError("arguments are only accepted with decision revise")
+        return self
+
+
+# The argument keys a `revise` answer may change, per operation: content only.
+# Every other key names the target (recipient, chat, thread, calendar, lead,
+# request) or the effect itself, and must stay exactly as it was refused.
+REVISABLE_ARGUMENT_KEYS: dict[Operation, frozenset[str]] = {
+    Operation.EMAIL_SEND: frozenset({"text"}),
+    Operation.QUO_SMS_SEND: frozenset({"text"}),
+    Operation.CLIQ_CHANNEL_POST: frozenset({"text"}),
+    Operation.CLIQ_CHAT_POST: frozenset({"text"}),
+    Operation.CALENDAR_CREATE: frozenset({"description"}),
+    Operation.CALENDAR_UPDATE: frozenset({"description"}),
+    Operation.CALENDAR_DELETE: frozenset(),
+    Operation.TENANTCLOUD_MESSAGE_SEND: frozenset({"text"}),
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: frozenset(),
+    Operation.TENANTCLOUD_MAINTENANCE_CREATE: frozenset({"title", "text"}),
+    Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: frozenset(),
+}
+
+
+OutboundRequest: TypeAlias = Annotated[
+    ExecuteRequest | StatusRequest | SuggestRequest | ConfirmRequest,
+    Field(discriminator="op"),
+]
 _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 
@@ -509,12 +593,25 @@ def parse_outbound_request(payload: Any) -> OutboundRequest:
     return _REQUEST_ADAPTER.validate_python(payload)
 
 
+class ContextItem(StrictModel):
+    """One piece of activity newer than the agent's context watermark."""
+
+    id: str
+    source: str
+    direction: str
+    sender: str | None = None
+    occurred_at: datetime
+    preview: Annotated[str, Field(max_length=300)]
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
     action_uid: UUID | None
     provider_request_ref: str | None
-    retryable: Literal[False] = False
+    # True only for needs_confirmation: the agent may answer with op=confirm.
+    # Every other result keeps the historical False.
+    retryable: bool = False
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
     # Human-readable elaboration of detail_code. None everywhere except traffic-control
     # blocks: that is the one path where the calling agent must read *why* (which
@@ -524,3 +621,8 @@ class PublicResult(StrictModel):
     # for every other result so existing consumers see no new key on the wire
     # (server.py omits it from the response payload when None).
     detail: str | None = None
+    # needs_confirmation only: every item newer than the context the agent
+    # was shown (newest last, capped) and the exact yes/no question. None
+    # everywhere else, and omitted from the wire like `detail`.
+    new_context: tuple[ContextItem, ...] | None = None
+    question: str | None = None
