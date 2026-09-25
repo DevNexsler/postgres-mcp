@@ -222,10 +222,16 @@ class OutboundGatewayRepository:
             FROM outbound_actions
             WHERE subject_key = {}
               AND action_id <> {}
+              -- The wake's own other actions are its agent's work, not
+              -- someone else's send racing this one (CDS migration 204).
+              AND wakeup_event_id IS DISTINCT FROM (
+                  SELECT own.wakeup_event_id FROM outbound_actions AS own
+                  WHERE own.action_id = {}
+              )
               AND state = ANY({})
             ORDER BY created_at
             """,
-            [recipient_key, exclude_action_id, list(NON_TERMINAL_STATES)],
+            [recipient_key, exclude_action_id, exclude_action_id, list(NON_TERMINAL_STATES)],
         )
         return [
             InFlightAction(
@@ -288,13 +294,19 @@ class OutboundGatewayRepository:
             FROM outbound_actions
             WHERE subject_key = {}
               AND action_id NOT IN (SELECT action_id FROM retry_lineage)
+              -- The wake's own earlier actions: its agent sent them, so they
+              -- are not newer context it has not seen (wake 27235).
+              AND wakeup_event_id IS DISTINCT FROM (
+                  SELECT own.wakeup_event_id FROM outbound_actions AS own
+                  WHERE own.action_id = {}
+              )
               AND NOT (action_id::text = ANY({}::text[]))
               AND created_at > {}
               AND (dispatch_started_at IS NOT NULL OR state = 'completed')
             ORDER BY created_at DESC
             LIMIT {}
             """,
-            [exclude_action_id, recipient_key, excluded_actions, watermark, limit],
+            [exclude_action_id, recipient_key, exclude_action_id, excluded_actions, watermark, limit],
         )
         message_rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -313,6 +325,22 @@ class OutboundGatewayRepository:
             WHERE message.channel_id = {}
               AND message.created_at > {}
               AND NOT (message.id = ANY({}::bigint[]))
+              -- A message the wake's own sends produced (the gateway records
+              -- a TenantCloud send as a CDS message; a Cliq post is ingested
+              -- back) is the agent's own work. Providers spell the id
+              -- differently in the two places ("tenantcloud-message:1" vs
+              -- "tenantcloud:thread-message:1", "a%20b" vs "a_b"), so compare
+              -- the id after its last colon with punctuation removed.
+              AND NOT EXISTS (
+                  SELECT 1 FROM outbound_actions AS own
+                  WHERE own.wakeup_event_id = sending.wakeup_event_id
+                    AND nullif(regexp_replace(replace(regexp_replace(
+                            own.provider_message_id, '^.*:', ''), '%20', ''),
+                            '[^0-9A-Za-z]', '', 'g'), '')
+                        = regexp_replace(replace(regexp_replace(
+                            message.source_message_id, '^.*:', ''), '%20', ''),
+                            '[^0-9A-Za-z]', '', 'g')
+              )
               AND NOT (
                   -- Automated operations alerts share Nigel's Cliq DM with Dan.
                   -- They do not answer an inbound DM and must not stale its
