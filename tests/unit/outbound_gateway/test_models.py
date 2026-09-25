@@ -706,3 +706,25 @@ def test_slot_still_required_for_showing_offer():
     req.pop("appointment_slot", None)
     with pytest.raises(ValidationError, match="appointment_slot is required"):
         ExecuteRequest.model_validate(req)
+
+
+# TenantCloud stores text only up to the first 4-byte character (2026-09-25:
+# a live probe kept "é — ✓ ✅" and cut at "🦊", while returning 201 Accepted).
+@pytest.mark.parametrize("emoji", ["\U0001f98a", "\U0001f44d", "\U0001f600", "\U0001d11e"])
+def test_tenantcloud_text_with_a_4byte_character_is_refused_before_sending(emoji):
+    from postgres_mcp.outbound_gateway.models import MaintenanceCreateArguments, TenantCloudMessageArguments
+
+    with pytest.raises(ValueError, match="TenantCloud silently drops everything from the first emoji"):
+        TenantCloudMessageArguments(thread_id=1270770, text=f"The lazy dog. {emoji} received")
+    with pytest.raises(ValueError, match="remove them and send again"):
+        MaintenanceCreateArguments(
+            property_id=1, unit_id=1, category_id=13, title=f"Leak {emoji}", priority="normal",
+            initiated_at="2026-09-25", text="Kitchen sink", entry_allowed=False,
+        )
+
+
+def test_tenantcloud_text_keeps_the_characters_tenantcloud_stores():
+    from postgres_mcp.outbound_gateway.models import TenantCloudMessageArguments
+
+    text = "Café — check ✓ box ✅ ½ “quoted” €5"
+    assert TenantCloudMessageArguments(thread_id=1, text=text).text == text

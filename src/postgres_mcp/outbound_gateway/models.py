@@ -334,6 +334,18 @@ def normalize_tenantcloud_text(value: Any, *, field: str, maximum: int) -> str:
         raise ValueError(f"{field} must not have surrounding whitespace")
     if any(category(character) == "Cc" and character not in {"\n", "\t"} for character in normalized):
         raise ValueError(f"{field} contains unsupported control characters")
+    # TenantCloud accepts the write (201) and stores the text only up to the
+    # first character outside the Basic Multilingual Plane -- most emoji. Wake
+    # 27226 (2026-09-25) sent "... the lazy dog. \U0001f98a\U0001f415 ..." and the
+    # tenant received "... the lazy dog. ". Refuse before anything is sent.
+    wide = next((character for character in normalized if ord(character) > 0xFFFF), None)
+    if wide is not None:
+        raise ValueError(
+            f"{field} contains {wide!r} (U+{ord(wide):X}); TenantCloud silently drops "
+            "everything from the first emoji or other 4-byte character on, so remove "
+            "them and send again (accented letters, dashes, and symbols such as "
+            "\u2713 and \u2705 are fine)"
+        )
     return normalized
 
 
