@@ -728,3 +728,20 @@ def test_tenantcloud_text_keeps_the_characters_tenantcloud_stores():
 
     text = "Café — check ✓ box ✅ ½ “quoted” €5"
     assert TenantCloudMessageArguments(thread_id=1, text=text).text == text
+
+
+def test_a_stored_action_with_old_emoji_text_still_rebuilds_so_it_can_settle():
+    """Action c3df14e3 (wake 27226) was stored before the rule. Refusing it on
+    every reconcile left it in flight forever, and its lease then held every
+    later send to the same tenant (wake 27230). Only new requests are refused."""
+    from postgres_mcp.outbound_gateway.models import STORED_ACTION_CONTEXT
+
+    raw = {
+        "op": "execute", "wakeup_event_id": 27226, "action_role": "prospect_reply",
+        "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+        "arguments": {"thread_id": 1270770, "text": "The lazy dog. \U0001f98a\U0001f415 received"},
+    }
+    rebuilt = ExecuteRequest.model_validate(raw, context=STORED_ACTION_CONTEXT)
+    assert "\U0001f98a" in rebuilt.arguments.text
+    with pytest.raises(ValidationError, match="TenantCloud silently drops"):
+        ExecuteRequest.model_validate(raw)
