@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Awaitable
@@ -13,7 +12,6 @@ from dataclasses import field as dataclass_field
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
-from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
 from typing import Mapping
@@ -32,6 +30,7 @@ from .context import ActionContextLoader
 from .context import ContextDerivationError
 from .context import DerivedTarget
 from .context import canonical_payload_hash
+from .identity import same_request
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .models import REVISABLE_ARGUMENT_KEYS
@@ -443,7 +442,9 @@ class OutboundActionService:
         appointment slot must be the refused message's own; anything else is
         refused rather than silently sent with the refused message's values.
         None means "not this case": the ordinary execute path continues."""
-        if not self._awaits_stale_confirmation(existing) or existing.payload_hash == context.payload_hash:
+        # The same message again is not an answer; only a different message is
+        # its revise. "Same" is what was asked, not the derived context hash.
+        if not self._awaits_stale_confirmation(existing) or same_request(existing.execute_request(), request):
             return None
         differing = [
             name
@@ -587,9 +588,7 @@ class OutboundActionService:
             return self._result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
             return self._result(successor)
-        # Re-derives payload hash, canonical context and scope from the
-        # successor's own arguments: a successor whose stored hash or context
-        # does not match what the gateway computes never dispatches.
+        # The successor executes its own saved record, like any action.
         context, context_detail = await self._verified_context(successor)
         if context is None:
             return self._result(successor, detail=context_detail)
@@ -857,10 +856,6 @@ class OutboundActionService:
         intent_kind/appointment_slot/arguments/payload_hash verbatim from the
         parent row (067:1247-1264), so nothing about the wake-derived context
         actually changed -- only `action_id` (next effect_ordinal) did.
-        `_verified_context()` would be the wrong tool here: it re-derives
-        action_id from the wake via the client-side uid formula, which is
-        always ordinal 0 (context.py:299), so it would report every
-        successor as a context mismatch.
         """
         try:
             successor = await self._store.remediate_traffic_block(
@@ -1181,15 +1176,11 @@ class OutboundActionService:
         return await self._finish_observation(reconciling, context, adapter, observation)
 
     async def _provider_outcome(self, action: OutboundActionRecord) -> PublicResult | None:
-        """Ask the provider about a send it already has, before judging the
-        wake's context. "Did job X finish?" needs only the job id; the context
-        check guards against sending with the wrong details, and this send has
-        already been made. Wake 27244: a transient context mismatch parked an
-        email for review 4 seconds before its job reported "sent".
-
-        The loaded context must still name the same action, account and
-        recipient (it builds the receipt). None means the provider could not
-        say, or the identity differs: the ordinary reconcile path decides."""
+        """Ask the provider about a send it already has before anything else.
+        "Did job X finish?" needs only the job id; this send has already been
+        made (wake 27244 parked an email for review 4 seconds before its job
+        reported "sent"). None means the provider could not say, or the saved
+        record cannot be executed: the ordinary reconcile path decides."""
         if not action.provider_request_ref or action.action_uid is None:
             return None
         if action.operation in TENANTCLOUD_OPERATIONS:
@@ -1739,10 +1730,6 @@ class OutboundActionService:
 
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return action.next_attempt_at <= self._clock()
-
-    @staticmethod
-    def evidence_hash(evidence: Mapping[str, Any] | None) -> str:
-        return sha256(json.dumps(evidence or {}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
     def _verified_tenantcloud_evidence(action: OutboundActionRecord) -> bool:
