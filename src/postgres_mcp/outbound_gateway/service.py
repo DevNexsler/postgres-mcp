@@ -9,8 +9,8 @@ import re
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import fields as dataclass_fields
 from dataclasses import field as dataclass_field
+from dataclasses import fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from hashlib import sha256
