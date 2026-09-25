@@ -221,18 +221,26 @@ class _LogTap(logging.Handler):
 
 
 class tapped_logs:  # noqa: N801 -- used as a context manager
-    def __init__(self, trace: Trace) -> None:
+    """Record every gateway log record that is emitted at the configured
+    level (the gateway logs warnings and errors)."""
+
+    def __init__(self, trace: Trace, *, isolate: bool = False) -> None:
         self._tap = _LogTap(trace)
         self._logger = logging.getLogger("postgres_mcp.outbound_gateway")
-        self._level = self._logger.level
+        self._isolate = isolate
+        self._propagate = self._logger.propagate
 
     def __enter__(self) -> None:
         self._logger.addHandler(self._tap)
-        self._logger.setLevel(logging.DEBUG)
+        if self._isolate:
+            # Generated scenarios: keep thousands of expected error tracebacks
+            # out of the console handler. Replayed tests keep propagation
+            # (their caplog assertions read the root logger).
+            self._logger.propagate = False
 
     def __exit__(self, *exc: object) -> None:
         self._logger.removeHandler(self._tap)
-        self._logger.setLevel(self._level)
+        self._logger.propagate = self._propagate
 
 
 SIDES: tuple[type, type] = (LegacyOutboundActionService, OutboundActionService)
@@ -242,7 +250,7 @@ async def run_side(service_cls: type, scenario: Callable[[type], Any]) -> Trace:
     """Run one scenario against one side. `scenario(ServiceClass)` builds its
     fakes, constructs the service with keyword arguments and drives it."""
     trace = Trace()
-    with tapped_logs(trace):
+    with tapped_logs(trace, isolate=True):
         try:
             outcome = scenario(recording(service_cls, trace))
             if inspect.isawaitable(outcome):

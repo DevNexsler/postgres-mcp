@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import fields as dataclass_fields
@@ -43,12 +42,11 @@ from .record import OutboundActionRecord as OutboundActionRecord
 from .record import action_result
 from .record import is_due
 from .record import require_action
+from .recovery import ActionRecovery
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
 from .stale_context import asks_on_block
 from .stale_context import execute_answer
-from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
-from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .traffic_control import TrafficProbe
@@ -56,8 +54,6 @@ from .traffic_control import TrafficVerdict
 from .traffic_control import check_traffic
 
 logger = logging.getLogger(__name__)
-
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
@@ -157,6 +153,17 @@ class OutboundActionService:
             enabled=stale_confirm_enabled,
             drive_answered=self._drive_answered,
             terminal_block=self._terminal_traffic_block,
+        )
+        self._recovery = ActionRecovery(
+            store=store,
+            provider_client=provider_client,
+            adapter_for=self._adapter,
+            verified_context=self._verified_context,
+            finish_observation=self._finish_observation,
+            schedule=self._schedule,
+            clock=clock,
+            actor=lease_owner,
+            lease_seconds=lease_seconds,
         )
 
     @property
@@ -571,7 +578,7 @@ class OutboundActionService:
             return action_result(action)
         context, context_detail = await self._verified_context(action)
         if context is None:
-            return await self._manual_review(action, context_detail)
+            return await self._recovery.manual_review(action, context_detail)
         # Worker-driven resume (worker.py's list_work -> resume for
         # dependency_wait/prepared/retry_ready) has no ExecuteRequest and
         # therefore no caller-supplied override -- a long-waited action
@@ -587,255 +594,11 @@ class OutboundActionService:
         return await self._dispatch_stage(action, context, otherwise=_unchanged_fallback)
 
     async def reconcile(self, action_id: UUID) -> PublicResult:
-        action = await self._require_action(action_id)
-        if not self._is_due(action):
-            return action_result(action)
-        recovered = await self._recover_persisted_acceptance(action)
-        if recovered is not None:
-            return recovered
-        if action.state in {
-            ActionState.DISPATCHING,
-            ActionState.PROVIDER_ACCEPTED,
-            ActionState.RECONCILING,
-        }:
-            await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.UNKNOWN,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "expired_dispatch_requires_reconciliation",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-        if action.state is not ActionState.UNKNOWN:
-            return action_result(action)
-        answered = await self._provider_outcome(action)
-        if answered is not None:
-            return answered
-        context, context_detail = await self._verified_context(action)
-        if context is None:
-            return await self._manual_review(action, context_detail)
-        adapter = self._adapter(context.operation)
-        await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-        reconciling = await self._store.transition(
-            action.action_id,
-            ActionState.UNKNOWN,
-            ActionState.RECONCILING,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "reconciliation_started",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        if reconciling.action_uid is None:
-            raise RuntimeError("reconciling action has no deterministic action UID")
-        observation = await adapter.reconcile(
-            self._provider_client,
-            context,
-            reconciling.action_uid,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "prior_dispatch_ambiguous",
-                provider_request_ref=reconciling.provider_request_ref,
-            ),
-        )
-        return await self._finish_observation(reconciling, context, adapter, observation)
-
-    async def _provider_outcome(self, action: OutboundActionRecord) -> PublicResult | None:
-        """Ask the provider about a send it already has before anything else.
-        "Did job X finish?" needs only the job id; this send has already been
-        made (wake 27244 parked an email for review 4 seconds before its job
-        reported "sent"). None means the provider could not say, or the saved
-        record cannot be executed: the ordinary reconcile path decides."""
-        if not action.provider_request_ref or action.action_uid is None:
-            return None
-        if action.operation in TENANTCLOUD_OPERATIONS:
-            # TenantCloud writes are synchronous: no provider job to ask
-            # about, and its reconcile is a readback of the record itself.
-            return None
-        context, _detail = await self._verified_context(action)
-        if context is None:
-            return None
-        adapter = self._adapter(context.operation)
-        observation = await adapter.poll(
-            self._provider_client,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "prior_dispatch_ambiguous",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        if observation.disposition is ProviderDisposition.PENDING:
-            # The job is still running: look again later, as the ordinary
-            # path does for a pending poll. Claiming spends one attempt, so a
-            # job that never finishes still reaches the retry budget.
-            claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-            return action_result(await self._schedule(claimed, observation.detail_code))
-        if observation.disposition not in {
-            ProviderDisposition.ACCEPTED,
-            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-        }:
-            return None
-        await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-        reconciling = await self._store.transition(
-            action.action_id,
-            ActionState.UNKNOWN,
-            ActionState.RECONCILING,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "reconciliation_started",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        return await self._finish_observation(reconciling, context, adapter, observation)
+        return await self._recovery.reconcile(action_id)
 
     async def exhaust(self, action_id: UUID) -> PublicResult:
         """Close exhausted work without another provider invocation."""
-        action = await self._require_action(action_id)
-        recovered = await self._recover_persisted_acceptance(action)
-        if recovered is not None:
-            return recovered
-        lease_held = False
-        observation = ProviderObservation(
-            ProviderDisposition.AMBIGUOUS,
-            "retry_budget_exhausted",
-            provider_request_ref=action.provider_request_ref,
-        )
-        if action.state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            lease_held = True
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.UNKNOWN,
-                self._lease_owner,
-                observation,
-            )
-            lease_held = False
-        if action.state is ActionState.UNKNOWN:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            lease_held = True
-            action = await self._store.transition(
-                action.action_id,
-                ActionState.UNKNOWN,
-                ActionState.RECONCILING,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "retry_budget_exhausted_reconciliation",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-        if action.state in {ActionState.RECONCILING, ActionState.DEPENDENCY_WAIT}:
-            if not lease_held:
-                await self._store.claim(
-                    action.action_id,
-                    action.state,
-                    self._lease_owner,
-                    self._lease_seconds,
-                )
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.DEAD_LETTER,
-                self._lease_owner,
-                observation,
-            )
-            action = await self._store.transition(
-                action.action_id,
-                ActionState.DEAD_LETTER,
-                ActionState.MANUAL_REVIEW,
-                None,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "retry_budget_exhausted_manual_review",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-            return action_result(action)
-        if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            failed = await self._store.definitive_fail(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-                    "retry_budget_exhausted",
-                    provider_request_ref=action.provider_request_ref,
-                    category="retry_budget_exhausted",
-                    retryable=False,
-                    evidence={"kind": "retry_budget"},
-                ),
-            )
-            return action_result(failed)
-        return action_result(action)
-
-    async def _recover_persisted_acceptance(
-        self,
-        action: OutboundActionRecord,
-    ) -> PublicResult | None:
-        """Complete a durable provider acceptance without provider I/O."""
-        if not (
-            action.state is ActionState.PROVIDER_ACCEPTED
-            and action.provider_request_ref
-            and action.provider_message_id
-            and action.provider_accepted_at
-        ):
-            return None
-        if action.operation in TENANTCLOUD_OPERATIONS and not self._verified_tenantcloud_evidence(action):
-            # TenantCloud writes are irreversible provider-side actions
-            # (lead status, maintenance requests). The generic ref/id/accepted_at
-            # heuristic above is not proof enough here: only durable evidence
-            # that says "verified readback" AND whose hash matches the
-            # persisted canonical state may complete without provider I/O.
-            # Anything else -- including a crash between the PROVIDER_ACCEPTED
-            # transition and the evidence write -- must go through bounded
-            # reconciliation instead of being trusted blindly.
-            return None
-        provider_request_ref = action.provider_request_ref
-        provider_message_id = action.provider_message_id
-        provider_accepted_at = action.provider_accepted_at
-        action = await self._store.claim(
-            action.action_id,
-            action.state,
-            self._lease_owner,
-            self._lease_seconds,
-        )
-        completed = await self._store.complete(
-            action.action_id,
-            ActionState.PROVIDER_ACCEPTED,
-            self._lease_owner,
-            ProviderReceipt(
-                provider_request_ref=provider_request_ref,
-                provider_message_id=provider_message_id,
-                accepted_at=provider_accepted_at,
-                evidence={"kind": "persisted_provider_acceptance"},
-            ),
-            CompletionKind.SENT,
-            "persisted_provider_acceptance_recovered",
-        )
-        return action_result(completed)
+        return await self._recovery.exhaust(action_id)
 
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         """The agent-facing preflight (execute and confirm)."""
@@ -1160,76 +923,8 @@ class OutboundActionService:
         )
         return normalized_hash == action.payload_hash
 
-    async def _manual_review(
-        self,
-        action: OutboundActionRecord,
-        detail_code: str,
-    ) -> PublicResult:
-        claimed = await self._store.claim(
-            action.action_id,
-            action.state,
-            self._lease_owner,
-            self._lease_seconds,
-        )
-        dead_letter = await self._store.transition(
-            claimed.action_id,
-            claimed.state,
-            ActionState.DEAD_LETTER,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                detail_code,
-                provider_request_ref=claimed.provider_request_ref,
-            ),
-        )
-        manual = await self._store.transition(
-            dead_letter.action_id,
-            ActionState.DEAD_LETTER,
-            ActionState.MANUAL_REVIEW,
-            None,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                detail_code,
-                provider_request_ref=dead_letter.provider_request_ref,
-            ),
-        )
-        return action_result(manual)
-
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return is_due(action, self._clock())
-
-    @staticmethod
-    def _verified_tenantcloud_evidence(action: OutboundActionRecord) -> bool:
-        """Migration 118's transition_outbound_action already enforced the
-        full acceptance guard (evidence_kind literal, six-key observation
-        shape, per-key type/format checks, and equality against the
-        persisted arguments' desired_state/target_reference/operation)
-        atomically, in the same statement that wrote evidence_kind =
-        'verified_provider_readback'. So a row bearing that literal is only
-        reachable through that guarded write. This re-checks the literal,
-        the evidence_hash's own format, and structural completeness of the
-        persisted six-key observation -- defense against a corrupted or
-        partial read, not a re-derivation of the facade's own opaque hash
-        (which, for maintenance create, is computed over a target_reference
-        that differs by design from what is persisted here -- see
-        tenantcloud_shared.py)."""
-        if action.provider_evidence_kind != EVIDENCE_KIND_VERIFIED_READBACK:
-            return False
-        if not action.provider_evidence_hash or not _HEX64.fullmatch(action.provider_evidence_hash):
-            return False
-        evidence = dict(action.provider_readback_evidence)
-        if set(evidence) != READBACK_OBSERVATION_KEYS:
-            return False
-        if not isinstance(evidence.get("canonical_observed_state"), Mapping):
-            return False
-        if evidence.get("readback_verified") is not True:
-            return False
-        for key in ("operation", "provider_object_id", "target_reference", "readback_timestamp"):
-            if not isinstance(evidence.get(key), str) or not evidence[key]:
-                return False
-        return True
-
-    _result = staticmethod(action_result)
 
 
 _RECORDED_ID_LISTS = frozenset({"cross_channel_duplicate_message_ids", "certified_older_message_ids"})
