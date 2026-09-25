@@ -51,17 +51,22 @@ class CalendarAdapter:
         self.validate(context)
         calendar = context.target.target_id
         common = {"account_id": self._accounts[calendar], "calendar": calendar}
+        minutes = context.arguments.get("duration_minutes")
+        duration = timedelta(minutes=minutes) if minutes else self._duration
+        location = context.arguments.get("location") or context.property_label
+        attendees = [{"email": address} for address in context.arguments.get("attendees") or ()] or None
         if context.operation is Operation.CALENDAR_CREATE:
             assert context.appointment_slot is not None
             arguments = {
                 **common,
                 "uid": str(action_uid),
-                "summary": f"Tour — {context.prospect_name or context.prospect_id}",
+                "summary": context.arguments.get("title") or f"Tour — {context.prospect_name or context.prospect_id}",
                 "description": context.arguments.get("description"),
-                "location": context.property_label,
+                "location": location,
                 "start": _rfc3339(context.appointment_slot),
-                "end": _rfc3339(context.appointment_slot + self._duration),
+                "end": _rfc3339(context.appointment_slot + duration),
                 "all_day": False,
+                "attendees": attendees,
             }
             tool = "calendar_create_event"
         elif context.operation is Operation.CALENDAR_UPDATE:
@@ -70,11 +75,13 @@ class CalendarAdapter:
                 **common,
                 "event_url": context.calendar_event_url,
                 "etag": context.calendar_event_etag,
+                "summary": context.arguments.get("title"),
                 "description": context.arguments.get("description"),
-                "location": context.property_label,
+                "location": location,
                 "start": _rfc3339(context.appointment_slot),
-                "end": _rfc3339(context.appointment_slot + self._duration),
+                "end": _rfc3339(context.appointment_slot + duration),
                 "all_day": False,
+                "attendees": attendees,
             }
             tool = "calendar_update_event"
         else:

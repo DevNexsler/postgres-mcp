@@ -202,14 +202,51 @@ def normalize_event_url(value: Any, *, field: str) -> str | None:
     return candidate
 
 
+def normalize_email_list(value: Any, *, field: str, maximum: int) -> tuple[str, ...] | None:
+    """Optional list of addresses (Cc, attendees): each format-checked, order
+    kept, duplicates dropped. None means omitted."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be a list of email addresses")
+    addresses: list[str] = []
+    for item in value:
+        address = normalize_target_email(item, field=field)
+        if address.casefold() not in {existing.casefold() for existing in addresses}:
+            addresses.append(address)
+    if not 1 <= len(addresses) <= maximum:
+        raise ValueError(f"{field} must list between 1 and {maximum} addresses")
+    return tuple(addresses)
+
+
+def normalize_optional_title(value: Any, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return normalize_public_text(value, field=field, minimum=1, maximum=255).strip() or None
+
+
 class EmailArguments(StrictModel):
     to_address: str
     text: str
+    # Optional: the subject defaults to "Re: <the wake's subject>"; cc is
+    # added to the source's configured copy address (management@pfg.io).
+    subject: str | None = None
+    cc: tuple[str, ...] | None = None
 
     @field_validator("to_address", mode="before")
     @classmethod
     def normalize_to_address(cls, value: Any) -> str:
         return normalize_target_email(value, field="to_address")
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def normalize_subject(cls, value: Any) -> str | None:
+        return normalize_optional_title(value, field="subject")
+
+    @field_validator("cc", mode="before")
+    @classmethod
+    def normalize_cc(cls, value: Any) -> tuple[str, ...] | None:
+        return normalize_email_list(value, field="cc", maximum=10)
 
     @field_validator("text", mode="before")
     @classmethod
@@ -250,6 +287,27 @@ class CliqArguments(StrictModel):
 class CalendarCreateArguments(StrictModel):
     calendar_id: str
     description: str | None = None
+    # Optional event details. Defaults suit a tour: "Tour — <prospect>", 30
+    # minutes, at the property. A maintenance visit sets its own.
+    title: str | None = None
+    duration_minutes: int | None = Field(default=None, strict=True, ge=1, le=480)
+    location: str | None = None
+    attendees: tuple[str, ...] | None = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: Any) -> str | None:
+        return normalize_optional_title(value, field="title")
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def normalize_location(cls, value: Any) -> str | None:
+        return normalize_optional_title(value, field="location")
+
+    @field_validator("attendees", mode="before")
+    @classmethod
+    def normalize_attendees(cls, value: Any) -> tuple[str, ...] | None:
+        return normalize_email_list(value, field="attendees", maximum=20)
 
     @field_validator("calendar_id", mode="before")
     @classmethod
@@ -270,6 +328,27 @@ class CalendarUpdateArguments(StrictModel):
     etag: str | None = None
     event_uid: str | None = None
     description: str | None = None
+    # Optional event details. Defaults suit a tour: "Tour — <prospect>", 30
+    # minutes, at the property. A maintenance visit sets its own.
+    title: str | None = None
+    duration_minutes: int | None = Field(default=None, strict=True, ge=1, le=480)
+    location: str | None = None
+    attendees: tuple[str, ...] | None = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: Any) -> str | None:
+        return normalize_optional_title(value, field="title")
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def normalize_location(cls, value: Any) -> str | None:
+        return normalize_optional_title(value, field="location")
+
+    @field_validator("attendees", mode="before")
+    @classmethod
+    def normalize_attendees(cls, value: Any) -> tuple[str, ...] | None:
+        return normalize_email_list(value, field="attendees", maximum=20)
 
     @field_validator("calendar_id", mode="before")
     @classmethod
@@ -468,6 +547,53 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: MaintenanceCreateArguments,
     Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: MaintenanceStatusArguments,
 }
+
+
+# How an agent calls each operation: the role and intent it goes with, and
+# what it is for. The tool description is generated from this and from
+# ARGUMENT_MODELS, so every profile sees the same exact request shapes and
+# they cannot drift from what the gateway accepts.
+OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
+    Operation.EMAIL_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "email anyone; sent from Nigel's mailbox"),
+    Operation.QUO_SMS_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "text anyone (to_phone E.164)"),
+    Operation.CLIQ_CHAT_POST: (ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),
+    Operation.CLIQ_CHANNEL_POST: (
+        ActionRole.INTERNAL_NOTIFICATION,
+        IntentKind.MANUAL_REVIEW_ALERT,
+        "post to a Cliq channel (lead_alert for a new lead)",
+    ),
+    Operation.CALENDAR_CREATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),
+    Operation.CALENDAR_UPDATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),
+    Operation.CALENDAR_DELETE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),
+    Operation.TENANTCLOUD_MESSAGE_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "reply in a TenantCloud thread"),
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_LEAD_STATUS, "mark a lead working"),
+    Operation.TENANTCLOUD_MAINTENANCE_CREATE: (
+        ActionRole.PROVIDER_MUTATION,
+        IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+        "open a maintenance request",
+    ),
+    Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: (
+        ActionRole.PROVIDER_MUTATION,
+        IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+        "status 1 New, 2 In progress, 3 Resolved",
+    ),
+}
+
+
+def operation_catalog() -> str:
+    """One line per operation: the exact role, intent and argument names
+    (optional ones marked ?), drawn from the argument models themselves."""
+    lines = []
+    for operation, model in ARGUMENT_MODELS.items():
+        role, intent, purpose = OPERATION_USAGE[operation]
+        fields = ", ".join(
+            name if field.is_required() else f"{name}?" for name, field in model.model_fields.items()
+        )
+        lines.append(
+            f'{operation.value}: action_role "{role.value}", intent_kind "{intent.value}", '
+            f"arguments {{{fields}}} -- {purpose}"
+        )
+    return "\n".join(lines)
 
 
 SLOT_REQUIRED_INTENTS = frozenset(

@@ -758,3 +758,40 @@ def test_a_stored_action_with_old_emoji_text_still_rebuilds_so_it_can_settle():
     rebuilt = ExecuteRequest.model_validate(raw, context=STORED_ACTION_CONTEXT)
     assert "\U0001f98a" in rebuilt.arguments.text
     assert "\U0001f98a" not in ExecuteRequest.model_validate(raw).arguments.text
+
+
+SAMPLE_ARGUMENTS = {
+    Operation.EMAIL_SEND: {"to_address": "dan@pfg.io", "text": "hi"},
+    Operation.QUO_SMS_SEND: {"to_phone": "+12015756789", "text": "hi"},
+    Operation.CLIQ_CHANNEL_POST: {"channel_or_chat_id": "tenant-leads", "text": "hi"},
+    Operation.CLIQ_CHAT_POST: {"channel_or_chat_id": "CT_1", "text": "hi"},
+    Operation.CALENDAR_CREATE: {"calendar_id": "nigel"},
+    Operation.CALENDAR_UPDATE: {"calendar_id": "nigel"},
+    Operation.CALENDAR_DELETE: {"calendar_id": "nigel"},
+    Operation.TENANTCLOUD_MESSAGE_SEND: {"thread_id": 1270770, "text": "hi"},
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"lead_id": 1803629, "status": "working"},
+    Operation.TENANTCLOUD_MAINTENANCE_CREATE: {
+        "property_id": 621905, "unit_id": 1035381, "category_id": 13, "title": "Faucet",
+        "priority": "normal", "initiated_at": "2026-09-25", "text": "Dripping", "entry_allowed": False,
+    },
+    Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"request_id": 1569606, "status": 3},
+}
+
+
+@pytest.mark.parametrize("operation", list(Operation))
+def test_every_catalog_line_is_a_request_the_gateway_accepts(operation):
+    """The tool description tells every profile how to call each operation;
+    a line that the parser rejects would teach agents a broken request."""
+    from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS, OPERATION_USAGE, operation_catalog
+
+    role, intent, _purpose = OPERATION_USAGE[operation]
+    payload = {
+        "op": "execute", "wakeup_event_id": 1, "action_role": role.value, "operation": operation.value,
+        "intent_kind": intent.value, "arguments": SAMPLE_ARGUMENTS[operation],
+    }
+    if operation in {Operation.CALENDAR_CREATE, Operation.CALENDAR_UPDATE}:
+        payload["appointment_slot"] = "2026-09-28T10:00:00-04:00"
+    assert parse_outbound_request(payload).operation is operation
+    line = next(line for line in operation_catalog().splitlines() if line.startswith(f"{operation.value}:"))
+    for name, field in ARGUMENT_MODELS[operation].model_fields.items():
+        assert (name if field.is_required() else f"{name}?") in line

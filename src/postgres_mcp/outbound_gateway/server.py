@@ -46,6 +46,7 @@ from .models import PublicResult
 from .models import PublicStatus
 from .models import StatusRequest
 from .models import SuggestRequest
+from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
@@ -270,7 +271,12 @@ def create_server(
             "(detail_code stale_context), nothing was sent: read new_context and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
-            "message content changed)."
+            "message content changed). Every send, from any wake, goes through this tool: "
+            "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
+            "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
+            "The identical request again is the same action (never a second send); a "
+            "different one is a new action. Ids are integers where the provider uses "
+            "numbers. Operations (? = optional):\n" + operation_catalog()
         ),
         structured_output=True,
     )
@@ -580,6 +586,7 @@ async def build_runtime() -> GatewayRuntime:
             "OUTBOUND_QUO_LINES_JSON",
             {provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "") for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")},
         ),
+        email_default_account=os.environ.get("OUTBOUND_EMAIL_DEFAULT_ACCOUNT", "nigel-zoho"),
         calendar_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_NAME", "nigel")},
         calendar_account_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_ACCOUNT", "nigel-zoho")},
         cliq_target_by_intent=_json_mapping(

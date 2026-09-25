@@ -1664,3 +1664,56 @@ async def test_email_reconcile_terminalizes_unconfigured_sender_account():
     assert reconciled.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
     assert reconciled.detail_code == "email_sender_account_unconfigured"
     assert client.calls == []
+
+
+def test_email_adapter_uses_the_agents_subject_and_adds_its_cc_to_the_management_copy():
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.io"}, cc_by_source={"zillow": "management@pfg.io"})
+    request = adapter.build_request(
+        context(arguments=MappingProxyType({
+            "text": "Ticket #1569606 is open.",
+            "subject": "Maintenance ticket #1569606",
+            "cc": ["dan@pfg.io", "MANAGEMENT@pfg.io"],
+        })),
+        ACTION_UID,
+    )
+    assert request.arguments["subject"] == "Maintenance ticket #1569606"
+    assert request.arguments["cc"] == [{"address": "management@pfg.io"}, {"address": "dan@pfg.io"}]
+
+
+def test_email_adapter_without_a_subject_still_replies_on_the_wakes_thread():
+    adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.io"})
+    request = adapter.build_request(context(), ACTION_UID)
+    assert request.arguments["subject"] == "Re: Zillow inquiry for 138 Bullman St #144-A"
+    assert "cc" not in request.arguments
+
+
+@pytest.mark.parametrize(("operation", "tool"), [
+    (Operation.CALENDAR_CREATE, "calendar_create_event"),
+    (Operation.CALENDAR_UPDATE, "calendar_update_event"),
+])
+def test_calendar_adapter_builds_a_maintenance_visit_from_the_agents_details(operation, tool):
+    adapter = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"})
+    request = adapter.build_request(
+        context(operation, arguments=MappingProxyType({
+            "description": "Replace bathroom faucet cartridge",
+            "title": "Repair — 163 Washington St Unit 1",
+            "duration_minutes": 120,
+            "location": "163 Washington St Unit 1",
+            "attendees": ["gunther@pfg.io", "rafael@pfg.io"],
+        })),
+        ACTION_UID,
+    )
+    assert request.tool == tool
+    assert request.arguments["summary"] == "Repair — 163 Washington St Unit 1"
+    assert request.arguments["end"] == "2026-07-17T16:30:00Z"
+    assert request.arguments["location"] == "163 Washington St Unit 1"
+    assert request.arguments["attendees"] == [{"email": "gunther@pfg.io"}, {"email": "rafael@pfg.io"}]
+
+
+def test_calendar_adapter_defaults_still_make_a_tour():
+    request = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"}).build_request(
+        context(Operation.CALENDAR_CREATE), ACTION_UID
+    )
+    assert request.arguments["summary"] == "Tour — Amanda Snyder"
+    assert request.arguments["end"] == "2026-07-17T15:00:00Z"
+    assert "attendees" not in request.arguments

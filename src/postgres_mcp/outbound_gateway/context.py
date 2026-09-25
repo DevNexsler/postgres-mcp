@@ -82,6 +82,9 @@ class DerivedTarget:
     verified: bool
 
 
+_LATER_OPTIONAL_ARGUMENTS = frozenset({"subject", "cc", "title", "duration_minutes", "location", "attendees"})
+
+
 @dataclass(frozen=True)
 class RoutingPolicy:
     version: str
@@ -92,6 +95,9 @@ class RoutingPolicy:
     property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
     calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
+    # Sender for an email from a wake whose source has no mailbox of its own
+    # (a Quo text, a Cliq message): Nigel's mailbox.
+    email_default_account: str = ""
 
 
 @dataclass(frozen=True)
@@ -311,6 +317,10 @@ class ActionContextLoader:
             raise ContextDerivationError("verified property could not be derived")
 
         if record.provenance == "internal_test":
+            # A qualification send reaches only its dedicated test target;
+            # extra recipients would slip past that check.
+            if getattr(request.arguments, "cc", None) or getattr(request.arguments, "attendees", None):
+                raise ContextDerivationError("internal qualification sends cannot add cc or attendees")
             run_id = (record.qualification_run_id or "").strip()
             if not run_id:
                 raise ContextDerivationError("internal qualification wake has no run identity")
@@ -375,7 +385,16 @@ class ActionContextLoader:
             refresh_evidence,
         )
 
-        arguments = MappingProxyType(request.arguments.model_dump(mode="json", exclude_none=False))
+        # Optional fields added after actions were already stored are left
+        # out when omitted, so every existing action keeps its payload hash
+        # (dedupe and the worker's context check compare it).
+        arguments = MappingProxyType(
+            {
+                key: value
+                for key, value in request.arguments.model_dump(mode="json", exclude_none=False).items()
+                if not (value is None and key in _LATER_OPTIONAL_ARGUMENTS)
+            }
+        )
         if request.operation in _TENANTCLOUD_OPERATIONS:
             desired_state_hash = canonical_payload_hash(dict(arguments))
             canonical_scope = {
@@ -793,7 +812,7 @@ class ActionContextLoader:
             return DerivedTarget("tenantcloud_maintenance_request", str(request.arguments.request_id), True), "tenantcloud"
         if request.operation is Operation.EMAIL_SEND:
             assert isinstance(request.arguments, EmailArguments)
-            account = self._policy.email_account_by_provider.get(provider, "")
+            account = self._policy.email_account_by_provider.get(provider, "") or self._policy.email_default_account
             if not account:
                 # An empty account used to slip through: the row was created,
                 # the worker's reconcile step then raised KeyError on the
