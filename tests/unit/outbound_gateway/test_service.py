@@ -1419,23 +1419,44 @@ async def test_due_dependency_terminal_preflight_uses_held_lease():
 
 
 @pytest.mark.asyncio
-async def test_worker_resume_rejects_mutated_persisted_context_before_provider_io():
+async def test_worker_executes_the_saved_record_when_live_context_has_drifted():
+    """The worker used to re-derive the context and park the action when it
+    differed from the saved one; live data moves (a sender name flips, a
+    message is re-threaded), so real sends were parked (wake 27244). It now
+    executes the saved record -- Comm-Data-Store migration 206 makes the
+    record immutable, which is what the comparison used to guard."""
+    recorded_target = "saved-recipient@convo.zillow.com"
     store = FakeStore(
         row(
             ActionState.PREPARED,
             action_uid=ACTION_UID,
-            payload_hash="f" * 64,
+            payload_hash="f" * 64,  # the live derivation now hashes differently
             provider_account="nigel-zoho",
+            routing_policy_version="appointment-v1",
+            recipient_scope={"kind": "email_thread", "target_id": recorded_target, "verified": True},
+            # The real record shape: the saved context repeats the account and
+            # routing (a replay of 310 real actions caught this collision).
+            canonical_context={
+                "prospect_name": "Ytry Nationn", "source_subject": "Re: Your tour",
+                "provider_account": "nigel-zoho", "routing_policy_version": "appointment-v1",
+                "target": {"kind": "email_thread", "target_id": recorded_target},
+                "identity_version": "v1", "channel_id": 866870,
+            },
         )
     )
-    adapter = FakeAdapter()
+    adapter = FakeAdapter(
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1", provider_call_id="req-1"),
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED, "provider_accepted", provider_request_ref="req-1",
+            message_id="mail-1", accepted_at=NOW, evidence={"kind": "provider_message_id"},
+        ),
+    )
 
     result = await service(store, adapter).resume(ACTION_ID)
 
-    assert result.status is PublicStatus.MANUAL_REVIEW
-    assert store.current.state is ActionState.MANUAL_REVIEW
-    assert adapter.calls == []
-    assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls[0] == ("build", recorded_target, ACTION_UID)
+    assert not any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
 
 
 @pytest.mark.asyncio
@@ -2130,11 +2151,15 @@ async def test_a_job_still_running_is_looked_at_again_not_parked():
 
 
 @pytest.mark.asyncio
-async def test_when_the_provider_cannot_say_a_context_mismatch_still_parks_the_action():
+async def test_when_the_provider_cannot_say_reconcile_proceeds_from_the_saved_record():
     store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1"))
-    adapter = FakeAdapter()
+    sent = ProviderObservation(
+        ProviderDisposition.ACCEPTED, "email_reconciled_by_message_id", provider_request_ref="req-1",
+        message_id="mail-1", accepted_at=NOW, evidence={"kind": "exact_message_id"},
+    )
+    adapter = FakeAdapter(sent)
 
     result = await service(store, adapter).reconcile(ACTION_ID)
 
-    assert result.status is PublicStatus.MANUAL_REVIEW
-    assert adapter.calls == [("poll", "req-1")]
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == [("poll", "req-1"), ("reconcile",)]
