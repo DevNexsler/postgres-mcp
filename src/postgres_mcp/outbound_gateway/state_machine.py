@@ -145,16 +145,37 @@ def public_result(
     repeated_execute: bool = False,
     detail: str | None = None,
 ) -> PublicResult:
+    status = public_status(
+        state,
+        completion_kind,
+        repeated_execute=repeated_execute,
+    )
     return PublicResult(
-        status=public_status(
-            state,
-            completion_kind,
-            repeated_execute=repeated_execute,
-        ),
+        status=status,
         action_id=action_id,
         action_uid=action_uid,
         provider_request_ref=provider_request_ref,
         retryable=False,
         detail_code=detail_code,
-        detail=detail,
+        detail=detail or _unconfirmed_detail(status, action_id),
     )
+
+
+def _unconfirmed_detail(status: PublicStatus, action_id: UUID) -> str | None:
+    """What an unconfirmed result means for the agent's next step. The agent
+    decides; this only says what is known and how to find out more."""
+    check = f'{{"op": "status", "action_id": "{action_id}"}}'
+    if status is PublicStatus.PENDING:
+        return f"Queued, not yet confirmed sent. Check with {check} in about 30 seconds."
+    if status is PublicStatus.UNKNOWN:
+        return (
+            "The message went to the provider but delivery is not confirmed yet, so it may already "
+            f"have reached the recipient. Check with {check} in about 30 seconds or read the thread "
+            "before deciding whether to send anything else."
+        )
+    if status is PublicStatus.MANUAL_REVIEW:
+        return (
+            "Delivery could not be confirmed and a person will check it; the message may already have "
+            "reached the recipient. Read the thread before deciding whether to send anything else."
+        )
+    return None

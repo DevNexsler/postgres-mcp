@@ -111,7 +111,13 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
     )
     assert result.status == expected
     assert result.retryable is False
-    assert result.detail is None
+    # An unconfirmed result says what is known and how to check; the rest
+    # carry no detail unless the caller gives one.
+    if expected in {PublicStatus.PENDING, PublicStatus.UNKNOWN, PublicStatus.MANUAL_REVIEW}:
+        assert result.detail is not None
+        assert "request-1" not in result.detail
+    else:
+        assert result.detail is None
     # needs_confirmation's two fields exist on every result but are only set
     # on that one; server.py omits unset ones from the wire.
     assert result.new_context is None
@@ -152,3 +158,19 @@ def test_public_result_carries_optional_detail_text_through_unmodified():
         detail="resend with override=true if it is still needed",
     )
     assert result.detail == "resend with override=true if it is still needed"
+
+
+def test_an_unknown_result_says_it_may_have_been_delivered_and_how_to_check():
+    """Wake 27151 reworded a send whose outcome was unknown. The gateway does
+    not refuse that; it tells the agent what is known and lets it decide."""
+    action_id = UUID("8f8f1a45-13a7-4bd3-a15a-f8d265bbc567")
+    result = public_result(
+        state=ActionState.UNKNOWN,
+        action_id=action_id,
+        action_uid=None,
+        provider_request_ref=None,
+        detail_code="ambiguous_transport_error",
+    )
+    assert "may already have reached the recipient" in result.detail
+    assert f'{{"op": "status", "action_id": "{action_id}"}}' in result.detail
+    assert "30 seconds" in result.detail
