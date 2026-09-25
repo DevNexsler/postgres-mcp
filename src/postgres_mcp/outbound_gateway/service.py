@@ -10,9 +10,11 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Any
 from typing import Mapping
 from typing import Protocol
@@ -28,6 +30,7 @@ from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
 from .context import ContextDerivationError
+from .context import DerivedTarget
 from .context import canonical_payload_hash
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
@@ -1193,7 +1196,7 @@ class OutboundActionService:
             # TenantCloud writes are synchronous: no provider job to ask
             # about, and its reconcile is a readback of the record itself.
             return None
-        context, _detail = await self._loaded_context(action)
+        context, _detail = await self._verified_context(action)
         if context is None:
             return None
         adapter = self._adapter(context.operation)
@@ -1629,73 +1632,26 @@ class OutboundActionService:
             lock_holder=f"outbound-gateway:{action.action_id}",
         )
 
-    async def _loaded_context(
-        self,
-        action: OutboundActionRecord,
-    ) -> tuple[ActionContext | None, str]:
-        """The stored action's context re-derived from the wake, checked only
-        for identity: the same action, account, routing and recipient."""
-        try:
-            context = await self._context_loader.load(action.execute_request())
-        except ContextDerivationError:
-            return None, "persisted_context_unavailable"
-        context = self._context_for(action, context)
-        if not action.payload_hash:
-            return context, "context_verified"
-        expected_recipient = {
-            "kind": context.target.kind,
-            "target_id": context.target.target_id,
-            "verified": context.target.verified,
-        }
-        differing = [
-            name
-            for name, differs in (
-                ("action_id", context.action_id != action.action_id),
-                ("provider_account", context.provider_account != action.provider_account),
-                ("routing_policy_version", context.routing_policy_version != action.routing_policy_version),
-                ("recipient_scope", expected_recipient != dict(action.recipient_scope)),
-            )
-            if differs
-        ]
-        if differing:
-            logger.warning("persisted context mismatch for action %s: %s", action.action_id, ", ".join(differing))
-            return None, "persisted_context_mismatch"
-        return context, "context_verified"
-
     async def _verified_context(
         self,
         action: OutboundActionRecord,
     ) -> tuple[ActionContext | None, str]:
-        context, detail = await self._loaded_context(action)
-        if context is None or not action.payload_hash:
-            return context, detail
-        stored_context, current_context = dict(action.canonical_context), dict(context.canonical_context)
-        stored_scope, current_scope = dict(action.canonical_scope), dict(context.canonical_scope)
-        if (
-            context.payload_hash == action.payload_hash
-            and current_context == stored_context
-            and current_scope == stored_scope
-        ):
-            return context, "context_verified"
-        if self._matches_durable_subject_alias_promotion(action, context):
-            return context, "context_verified_alias_promotion"
-        # Name what moved, so a mismatch can be diagnosed (wake 27244's was
-        # gone before anyone could look).
-        differing = [
-            *(["payload_hash"] if context.payload_hash != action.payload_hash else []),
-            *(
-                f"canonical_context.{key}"
-                for key in sorted(set(stored_context) | set(current_context))
-                if stored_context.get(key) != current_context.get(key)
-            ),
-            *(
-                f"canonical_scope.{key}"
-                for key in sorted(set(stored_scope) | set(current_scope))
-                if stored_scope.get(key) != current_scope.get(key)
-            ),
-        ]
-        logger.warning("persisted context mismatch for action %s: %s", action.action_id, ", ".join(differing))
-        return None, "persisted_context_mismatch"
+        """The context the worker executes an existing action with: the saved
+        record of what was asked and derived at execute time (Comm-Data-Store
+        migration 206 makes it immutable), never a fresh derivation compared
+        against it. Live data moves -- a sender's name flips, a message is
+        re-threaded -- and comparing against it parked real sends (wake
+        27244). The wake is re-read only for facts the record does not carry
+        (the message's source and send time, the property label, aliases),
+        none of which decides who receives what."""
+        try:
+            live = await self._context_loader.load(action.execute_request())
+        except ContextDerivationError:
+            return None, "persisted_context_unavailable"
+        live = self._context_for(action, live)
+        if not action.payload_hash:
+            return live, "context_verified"
+        return _recorded_context(action, live), "context_recorded"
 
     @staticmethod
     def _matches_durable_subject_alias_promotion(
@@ -1837,3 +1793,47 @@ class OutboundActionService:
             repeated_execute=repeated,
             detail=detail,
         )
+
+
+_RECORDED_ID_LISTS = frozenset({"cross_channel_duplicate_message_ids", "certified_older_message_ids"})
+_ACTION_CONTEXT_FIELDS = frozenset(field.name for field in dataclass_fields(ActionContext))
+_RECORD_COLUMN_FIELDS = frozenset({
+    "target", "intent_kind", "appointment_slot", "provider_account",
+    "routing_policy_version", "canonical_context", "canonical_scope", "payload_hash",
+})
+
+
+def _recorded_context(action: OutboundActionRecord, live: ActionContext) -> ActionContext:
+    """`live` with every decision replaced by the action's saved record: the
+    request (intent, slot), who receives it, from which account, and the
+    context the gateway derived when the agent asked."""
+    recorded = dict(action.canonical_context)
+    overlay: dict[str, Any] = {}
+    for key, value in recorded.items():
+        # target and the columns below come from their own record columns.
+        if key in _RECORD_COLUMN_FIELDS or key not in _ACTION_CONTEXT_FIELDS:
+            continue
+        if key in _RECORDED_ID_LISTS:
+            value = tuple(value or ())
+        elif isinstance(value, dict):
+            value = MappingProxyType(dict(value))
+        overlay[key] = value
+    scope = dict(action.recipient_scope)
+    target = (
+        DerivedTarget(str(scope["kind"]), str(scope["target_id"]), bool(scope.get("verified")))
+        if scope.get("kind") and scope.get("target_id")
+        else live.target
+    )
+    intent = action.intent_kind
+    return dataclass_replace(
+        live,
+        **overlay,
+        target=target,
+        intent_kind=str(getattr(intent, "value", intent)),
+        appointment_slot=action.appointment_slot,
+        provider_account=action.provider_account,
+        routing_policy_version=action.routing_policy_version,
+        canonical_context=MappingProxyType(recorded),
+        canonical_scope=MappingProxyType(dict(action.canonical_scope)),
+        payload_hash=action.payload_hash,
+    )
