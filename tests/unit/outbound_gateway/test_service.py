@@ -2033,3 +2033,35 @@ async def test_execute_still_raises_context_derivation_error_before_dispatch():
 
     with pytest.raises(ContextDerivationError):
         await svc.execute(request())
+
+
+@pytest.mark.asyncio
+async def test_a_later_action_of_the_same_role_carries_its_own_identity():
+    """CDS migration 204: a wake may hold several actions per role, so the row
+    create_or_load returns can be a later ordinal than the loaded context's
+    ordinal-0 id. Every step after it (the traffic check that excludes the
+    action itself, the lock holder, the result) must use the row's id."""
+    later = uuid4()
+    pending = ProviderObservation(
+        ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-2", provider_call_id="req-2"
+    )
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-2",
+        message_id="mail-2",
+        accepted_at=NOW,
+        evidence={"kind": "provider_message_id"},
+    )
+    store = FakeStore(row(action_id=later))
+    probe = FakeProbe()
+
+    result = await service(
+        store, FakeAdapter(pending, accepted), traffic_mode="enforce", traffic_probe=probe
+    ).execute(request())
+
+    assert result.status is PublicStatus.SENT
+    assert result.action_id == later
+    assert store.calls[0] == ("create", ACTION_ID)
+    assert probe.calls[0] == ("in_flight", "prospect:amanda", later)
+    assert probe.calls[-1][-1] == later

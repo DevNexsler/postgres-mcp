@@ -52,7 +52,10 @@ async def test_in_flight_actions_builds_sql_and_maps_rows():
     assert "ANY" in query
     assert params[0] == "email:amanda@example.com"
     assert params[1] == ACTION_ID
-    assert isinstance(params[2], list) and set(params[2]) == {
+    # The same id again names the wake whose own actions never block it.
+    assert params[2] == ACTION_ID
+    assert "wakeup_event_id IS DISTINCT FROM" in query
+    assert isinstance(params[3], list) and set(params[3]) == {
         "received",
         "dependency_wait",
         "prepared",
@@ -139,8 +142,9 @@ async def test_newest_activity_after_prefers_the_more_recent_of_ledger_and_messa
     assert "ORDER BY created_at DESC" in ledger_query
     # newest_activity_after is activity_after(limit=1): the limit is a parameter.
     assert "LIMIT {}" in ledger_query
-    # [exclude lineage root, recipient, excluded (shown) action ids, watermark, limit]
-    assert ledger_params == [ACTION_ID, "email:amanda@example.com", [], watermark, 1]
+    # [exclude lineage root, recipient, own wake (by action), excluded (shown)
+    # action ids, watermark, limit]
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", ACTION_ID, [], watermark, 1]
 
     messages_query, messages_params = calls[1]
     assert "messages" in messages_query
@@ -281,8 +285,9 @@ async def test_newest_activity_after_excludes_retry_ancestors_from_the_ledger_qu
     assert "JOIN retry_lineage AS child" in ledger_query
     assert "ancestor.action_id = child.retry_of_action_id" in ledger_query
     assert "SELECT action_id FROM retry_lineage" in ledger_query
-    # [exclude lineage root, recipient, excluded (shown) action ids, watermark, limit]
-    assert ledger_params == [ACTION_ID, "email:amanda@example.com", [], watermark, 1]
+    # [exclude lineage root, recipient, own wake (by action), excluded (shown)
+    # action ids, watermark, limit]
+    assert ledger_params == [ACTION_ID, "email:amanda@example.com", ACTION_ID, [], watermark, 1]
 
 
 @pytest.mark.asyncio
@@ -419,7 +424,7 @@ async def test_activity_after_excludes_exactly_the_shown_refs():
 
     (ledger_query, ledger_params), (message_query, message_params) = calls
     assert "NOT (action_id::text = ANY({}::text[]))" in ledger_query
-    assert ledger_params[2] == [str(other)]
+    assert ledger_params[3] == [str(other)]
     assert "NOT (message.id = ANY({}::bigint[]))" in message_query
     assert message_params[3] == [12, 750824]
 

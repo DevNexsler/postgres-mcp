@@ -359,6 +359,9 @@ class OutboundActionService:
                 action = existing
         if action is None:
             action = await self._store.create_or_load(context)
+        # A wake may hold several actions per role (CDS migration 204); the one
+        # the database returned is this request's, whatever its ordinal.
+        context = self._context_for(action, context)
         if action.state is ActionState.COMPLETED:
             return self._result(action, repeated=True)
         if not self._is_due(action):
@@ -1557,6 +1560,19 @@ class OutboundActionService:
             raise LookupError("outbound action does not exist")
         return action
 
+    @staticmethod
+    def _context_for(action: OutboundActionRecord, context: ActionContext) -> ActionContext:
+        """The loaded context names the wake role's first action (ordinal 0).
+        A retry, or a later action of the same role, is a different row with
+        the same wake-derived context, so carry that row's own identity."""
+        if context.action_id == action.action_id:
+            return context
+        return dataclass_replace(
+            context,
+            action_id=action.action_id,
+            lock_holder=f"outbound-gateway:{action.action_id}",
+        )
+
     async def _verified_context(
         self,
         action: OutboundActionRecord,
@@ -1565,12 +1581,7 @@ class OutboundActionService:
             context = await self._context_loader.load(action.execute_request())
         except ContextDerivationError:
             return None, "persisted_context_unavailable"
-        if action.retry_of_action_id is not None:
-            context = dataclass_replace(
-                context,
-                action_id=action.action_id,
-                lock_holder=f"outbound-gateway:{action.action_id}",
-            )
+        context = self._context_for(action, context)
         if not action.payload_hash:
             return context, "context_verified"
         expected_recipient = {
