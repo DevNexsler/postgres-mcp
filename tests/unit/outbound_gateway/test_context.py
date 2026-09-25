@@ -1953,3 +1953,46 @@ async def test_email_send_from_zoho_mail_wake_uses_mapped_account():
     )
     assert context.provider_account == "nigel-zoho"
     assert context.target.target_id == "dan@pfg.io"
+
+
+@pytest.mark.asyncio
+async def test_email_from_a_wake_without_a_mailbox_uses_the_default_sender():
+    """A tenant texting on Quo asked for an email (wake 27253). The wake's
+    source has no mailbox of its own, so the email comes from Nigel's."""
+    event = record(message_source="zoho_mail", channel_type="email_thread",
+                   participant_key="someone@gmail.com", raw_payload={},
+                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    defaulted = dataclasses.replace(
+        policy(), email_account_by_provider={"zillow": "nigel-zoho"}, email_default_account="nigel-zoho"
+    )
+    context = await ActionContextLoader(FakeRepository(event), defaulted).load(
+        request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
+    )
+    assert context.provider_account == "nigel-zoho"
+
+
+@pytest.mark.asyncio
+async def test_omitted_optional_email_fields_leave_the_stored_arguments_unchanged():
+    """subject and cc were added after actions were stored. An email that
+    omits them must hash exactly as before, or every existing action's
+    retry and the worker's context check would see a different request."""
+    context = await ActionContextLoader(FakeRepository(record()), policy()).load(request())
+    assert set(context.arguments) == {"to_address", "text"}
+    with_subject = await ActionContextLoader(FakeRepository(record()), policy()).load(
+        request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel",
+                           "subject": "Your tour", "cc": ["dan@pfg.io"]})
+    )
+    assert with_subject.arguments["subject"] == "Your tour"
+    assert with_subject.arguments["cc"] == ["dan@pfg.io"]
+    assert with_subject.payload_hash != context.payload_hash
+
+
+@pytest.mark.asyncio
+async def test_a_qualification_send_cannot_add_recipients():
+    values = dict(record().__dict__)
+    values.update(provenance="internal_test", qualification_run_id="qualification-cc")
+    loader = ActionContextLoader(FakeRepository(SimpleNamespace(**values)), policy())
+    with pytest.raises(ContextDerivationError, match="cannot add cc or attendees"):
+        await loader.load(
+            request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "hi", "cc": ["someone@example.com"]})
+        )

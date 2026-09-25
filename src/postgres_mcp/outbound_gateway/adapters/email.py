@@ -59,9 +59,11 @@ class EmailAdapter:
 
     def build_request(self, context: ActionContext, action_uid: UUID) -> ProviderRequest:
         self.validate(context)
-        subject = context.source_subject or "Rental inquiry"
-        if not subject.casefold().startswith("re:"):
-            subject = f"Re: {subject}"
+        subject = context.arguments.get("subject")
+        if not subject:
+            subject = context.source_subject or "Rental inquiry"
+            if not subject.casefold().startswith("re:"):
+                subject = f"Re: {subject}"
         arguments = {
             "account_id": context.provider_account,
             "to": [{"address": context.target.target_id}],
@@ -69,9 +71,12 @@ class EmailAdapter:
             "text": str(context.arguments["text"]),
             "outbound_action_uid": str(action_uid),
         }
-        copy_address = self._cc_by_source.get(context.source)
-        if copy_address:
-            arguments["cc"] = [{"address": copy_address}]
+        copies: list[str] = []
+        for address in (self._cc_by_source.get(context.source), *(context.arguments.get("cc") or ())):
+            if address and address.casefold() not in {kept.casefold() for kept in copies}:
+                copies.append(address)
+        if copies:
+            arguments["cc"] = [{"address": address} for address in copies]
         return ProviderRequest(
             server_name="agent-email",
             tool="email_send",
