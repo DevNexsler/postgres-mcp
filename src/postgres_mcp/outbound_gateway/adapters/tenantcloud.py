@@ -497,12 +497,29 @@ class TenantCloudAdapter:
         error_code = execution.mutation.audit.error_code
         if disposition_value == "definitive_non_acceptance":
             retryable = error_code == "authentication_unavailable"
+            status = getattr(execution.mutation.audit, "status", None)
+            has_status = type(status) is int and 400 <= status <= 499
+            detail_code = "tenantcloud_auth_rejected_before_dispatch"
+            if not retryable:
+                # The ledger keeps only detail_code, so a bare "rejected" left
+                # no way to tell a closed thread from a bad request (2 of 2
+                # rejections through 2026-09-24 were undiagnosable).
+                detail_code = (
+                    f"tenantcloud_provider_rejected_http_{status}"
+                    if has_status
+                    else "tenantcloud_provider_rejected"
+                )
+            evidence = None
+            if error_code:
+                evidence = {"kind": "http_status", "error_code": error_code}
+                if has_status:
+                    evidence["status"] = status
             return ProviderObservation(
                 ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-                "tenantcloud_auth_rejected_before_dispatch" if retryable else "tenantcloud_provider_rejected",
+                detail_code,
                 category="provider_authentication" if retryable else "provider_rejected",
                 retryable=retryable,
-                evidence={"kind": "http_status", "error_code": error_code} if error_code else None,
+                evidence=evidence,
             )
         # ACCEPTED-but-unverified or UNKNOWN: the write may or may not have
         # taken effect. Never trust it and never retry blindly -- route to

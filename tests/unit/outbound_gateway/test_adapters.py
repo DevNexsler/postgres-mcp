@@ -904,14 +904,15 @@ TC_UNKNOWN = FakeDisposition("unknown")
 
 
 class FakeAudit:
-    def __init__(self, error_code=None):
+    def __init__(self, error_code=None, status=None):
         self.error_code = error_code
+        self.status = status
 
 
 class FakeMutationResult:
-    def __init__(self, disposition, error_code=None):
+    def __init__(self, disposition, error_code=None, status=None):
         self.disposition = disposition
-        self.audit = FakeAudit(error_code)
+        self.audit = FakeAudit(error_code, status)
 
 
 class FakeMutationObservation:
@@ -1558,6 +1559,63 @@ async def test_tenantcloud_provider_rejected_non_acceptance_is_not_retryable():
     assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
     assert observation.retryable is False
     assert observation.detail_code == "tenantcloud_provider_rejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+async def test_tenantcloud_rejection_records_the_http_status(status):
+    """The ledger keeps only detail_code, so the provider's status must ride
+    in it; otherwise a closed thread and a bad request look identical."""
+    facade = FakeTenantCloudMutations()
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_DEFINITIVE_NON_ACCEPTANCE, "provider_rejected", status),
+        None,
+        "provider_rejected",
+    )
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.retryable is False
+    assert observation.detail_code == f"tenantcloud_provider_rejected_http_{status}"
+    assert observation.evidence["status"] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, 200, 500, "422", True])
+async def test_tenantcloud_rejection_without_a_4xx_status_keeps_the_bare_code(status):
+    facade = FakeTenantCloudMutations()
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_DEFINITIVE_NON_ACCEPTANCE, "provider_rejected", status),
+        None,
+        "provider_rejected",
+    )
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.detail_code == "tenantcloud_provider_rejected"
+    assert "status" not in observation.evidence
+
+
+@pytest.mark.asyncio
+async def test_auth_unavailable_keeps_its_exact_code_for_remediation():
+    """Migration 161's remediation matches this code exactly; never suffix it."""
+    facade = FakeTenantCloudMutations()
+    facade.send_message_result = FakeMutationExecution(
+        FakeMutationResult(TC_DEFINITIVE_NON_ACCEPTANCE, "authentication_unavailable", None),
+        None,
+        "authentication_unavailable",
+    )
+    adapter = TenantCloudAdapter(mutations_factory=lambda: facade)
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND)
+
+    observation = await adapter.invoke(facade, adapter.build_request(ctx, ACTION_UID))
+
+    assert observation.retryable is True
+    assert observation.detail_code == "tenantcloud_auth_rejected_before_dispatch"
 
 
 @pytest.mark.asyncio
