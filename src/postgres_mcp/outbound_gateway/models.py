@@ -18,6 +18,7 @@ from uuid import UUID
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import ValidationInfo
 from pydantic import TypeAdapter
 from pydantic import field_validator
 from pydantic import model_validator
@@ -334,11 +335,29 @@ def normalize_tenantcloud_text(value: Any, *, field: str, maximum: int) -> str:
         raise ValueError(f"{field} must not have surrounding whitespace")
     if any(category(character) == "Cc" and character not in {"\n", "\t"} for character in normalized):
         raise ValueError(f"{field} contains unsupported control characters")
-    # TenantCloud accepts the write (201) and stores the text only up to the
-    # first character outside the Basic Multilingual Plane -- most emoji. Wake
-    # 27226 (2026-09-25) sent "... the lazy dog. \U0001f98a\U0001f415 ..." and the
-    # tenant received "... the lazy dog. ". Refuse before anything is sent.
-    wide = next((character for character in normalized if ord(character) > 0xFFFF), None)
+    return normalized
+
+
+STORED_ACTION_CONTEXT = {"stored_action": True}
+
+
+def refuse_tenantcloud_wide_characters(value: str, *, field: str, info: ValidationInfo) -> str:
+    """Refuse text TenantCloud would silently cut, on NEW requests only.
+
+    TenantCloud accepts the write (201) and stores the text only up to the
+    first character outside the Basic Multilingual Plane -- most emoji. Wake
+    27226 (2026-09-25) sent "... the lazy dog. \U0001f98a\U0001f415 ..." and the
+    tenant received "... the lazy dog. ".
+
+    A stored action is rebuilt through this model on every reconcile and
+    resume (OutboundActionRecord.execute_request, STORED_ACTION_CONTEXT).
+    Refusing it there made an action stored before this rule un-reconcilable
+    forever, and its in-flight lease then held every later send to the same
+    recipient (lease_held): wake 27230 could not reply to the test tenant.
+    """
+    if (info.context or {}).get("stored_action"):
+        return value
+    wide = next((character for character in value if ord(character) > 0xFFFF), None)
     if wide is not None:
         raise ValueError(
             f"{field} contains {wide!r} (U+{ord(wide):X}); TenantCloud silently drops "
@@ -346,7 +365,7 @@ def normalize_tenantcloud_text(value: Any, *, field: str, maximum: int) -> str:
             "them and send again (accented letters, dashes, and symbols such as "
             "\u2713 and \u2705 are fine)"
         )
-    return normalized
+    return value
 
 
 def parse_iso_date(value: Any, *, field: str) -> date:
@@ -367,8 +386,9 @@ class TenantCloudMessageArguments(StrictModel):
 
     @field_validator("text", mode="before")
     @classmethod
-    def normalize_text(cls, value: Any) -> str:
-        return normalize_tenantcloud_text(value, field="text", maximum=10_000)
+    def normalize_text(cls, value: Any, info: ValidationInfo) -> str:
+        text = normalize_tenantcloud_text(value, field="text", maximum=10_000)
+        return refuse_tenantcloud_wide_characters(text, field="text", info=info)
 
 
 class LeadStatusArguments(StrictModel):
@@ -389,13 +409,15 @@ class MaintenanceCreateArguments(StrictModel):
 
     @field_validator("title", mode="before")
     @classmethod
-    def normalize_title(cls, value: Any) -> str:
-        return normalize_tenantcloud_text(value, field="title", maximum=255)
+    def normalize_title(cls, value: Any, info: ValidationInfo) -> str:
+        title = normalize_tenantcloud_text(value, field="title", maximum=255)
+        return refuse_tenantcloud_wide_characters(title, field="title", info=info)
 
     @field_validator("text", mode="before")
     @classmethod
-    def normalize_text(cls, value: Any) -> str:
-        return normalize_tenantcloud_text(value, field="text", maximum=10_000)
+    def normalize_text(cls, value: Any, info: ValidationInfo) -> str:
+        text = normalize_tenantcloud_text(value, field="text", maximum=10_000)
+        return refuse_tenantcloud_wide_characters(text, field="text", info=info)
 
     @field_validator("initiated_at", "available_on", mode="before")
     @classmethod
@@ -472,7 +494,7 @@ class ExecuteRequest(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def validate_adapter_arguments(cls, raw: Any) -> Any:
+    def validate_adapter_arguments(cls, raw: Any, info: ValidationInfo) -> Any:
         if not isinstance(raw, dict):
             return raw
         operation_value = raw.get("operation")
@@ -481,7 +503,10 @@ class ExecuteRequest(StrictModel):
         except (TypeError, ValueError):
             return raw
         data = dict(raw)
-        data["arguments"] = ARGUMENT_MODELS[operation].model_validate(raw.get("arguments"))
+        # Carry the caller's context (STORED_ACTION_CONTEXT) into the arguments.
+        data["arguments"] = ARGUMENT_MODELS[operation].model_validate(
+            raw.get("arguments"), context=info.context
+        )
         return data
 
     @field_validator("intent_kind", mode="before")

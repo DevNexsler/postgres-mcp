@@ -34,6 +34,7 @@ from .metrics import bounded_backoff_seconds
 from .models import REVISABLE_ARGUMENT_KEYS
 from .models import STALE_CONTEXT_DETAIL
 from .models import STALE_CONTEXT_DETAILS
+from .models import STORED_ACTION_CONTEXT
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
@@ -161,7 +162,10 @@ class OutboundActionRecord:
                 "intent_kind": self.intent_kind,
                 "appointment_slot": self.appointment_slot,
                 "arguments": arguments,
-            }
+            },
+            # An already-stored action: only NEW requests get the new-content
+            # rules (see refuse_tenantcloud_wide_characters).
+            context=STORED_ACTION_CONTEXT,
         )
 
 
