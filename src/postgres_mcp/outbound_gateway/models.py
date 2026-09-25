@@ -342,30 +342,32 @@ STORED_ACTION_CONTEXT = {"stored_action": True}
 
 
 def refuse_tenantcloud_wide_characters(value: str, *, field: str, info: ValidationInfo) -> str:
-    """Refuse text TenantCloud would silently cut, on NEW requests only.
+    """Remove the characters TenantCloud cannot store, on NEW requests only.
 
-    TenantCloud accepts the write (201) and stores the text only up to the
+    TenantCloud accepts the write (201) but stores the text only up to the
     first character outside the Basic Multilingual Plane -- most emoji. Wake
     27226 (2026-09-25) sent "... the lazy dog. \U0001f98a\U0001f415 ..." and the
-    tenant received "... the lazy dog. ".
+    tenant received "... the lazy dog. ". Those characters are dropped here,
+    with the zero-width joiners that glued them together, so the whole reply
+    arrives and verifies; the agent never has to know. Accented letters,
+    dashes and symbols such as \u2713 and \u2705 are kept.
 
     A stored action is rebuilt through this model on every reconcile and
-    resume (OutboundActionRecord.execute_request, STORED_ACTION_CONTEXT).
-    Refusing it there made an action stored before this rule un-reconcilable
-    forever, and its in-flight lease then held every later send to the same
-    recipient (lease_held): wake 27230 could not reply to the test tenant.
+    resume (OutboundActionRecord.execute_request, STORED_ACTION_CONTEXT); its
+    text is left exactly as stored so it still matches its own desired state.
     """
     if (info.context or {}).get("stored_action"):
         return value
-    wide = next((character for character in value if ord(character) > 0xFFFF), None)
-    if wide is not None:
-        raise ValueError(
-            f"{field} contains {wide!r} (U+{ord(wide):X}); TenantCloud silently drops "
-            "everything from the first emoji or other 4-byte character on, so remove "
-            "them and send again (accented letters, dashes, and symbols such as "
-            "\u2713 and \u2705 are fine)"
-        )
-    return value
+    if all(ord(character) <= 0xFFFF for character in value):
+        return value
+    kept = "".join(character for character in value if ord(character) <= 0xFFFF)
+    kept = kept.replace("\u200d", "")
+    kept = re.sub(r"[ \t]{2,}", " ", kept)
+    kept = re.sub(r"[ \t]+\n", "\n", kept)
+    kept = re.sub(r" ([!?.,;:])", r"\1", kept).strip()
+    if not kept:
+        raise ValueError(f"{field} has nothing TenantCloud can store once emoji are removed")
+    return kept
 
 
 def parse_iso_date(value: Any, *, field: str) -> date:
