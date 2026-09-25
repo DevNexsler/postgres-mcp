@@ -1144,6 +1144,9 @@ class OutboundActionService:
             )
         if action.state is not ActionState.UNKNOWN:
             return self._result(action)
+        answered = await self._provider_outcome(action)
+        if answered is not None:
+            return answered
         context, context_detail = await self._verified_context(action)
         if context is None:
             return await self._manual_review(action, context_detail)
@@ -1170,6 +1173,59 @@ class OutboundActionService:
                 ProviderDisposition.AMBIGUOUS,
                 "prior_dispatch_ambiguous",
                 provider_request_ref=reconciling.provider_request_ref,
+            ),
+        )
+        return await self._finish_observation(reconciling, context, adapter, observation)
+
+    async def _provider_outcome(self, action: OutboundActionRecord) -> PublicResult | None:
+        """Ask the provider about a send it already has, before judging the
+        wake's context. "Did job X finish?" needs only the job id; the context
+        check guards against sending with the wrong details, and this send has
+        already been made. Wake 27244: a transient context mismatch parked an
+        email for review 4 seconds before its job reported "sent".
+
+        The loaded context must still name the same action, account and
+        recipient (it builds the receipt). None means the provider could not
+        say, or the identity differs: the ordinary reconcile path decides."""
+        if not action.provider_request_ref or action.action_uid is None:
+            return None
+        if action.operation in TENANTCLOUD_OPERATIONS:
+            # TenantCloud writes are synchronous: no provider job to ask
+            # about, and its reconcile is a readback of the record itself.
+            return None
+        context, _detail = await self._loaded_context(action)
+        if context is None:
+            return None
+        adapter = self._adapter(context.operation)
+        observation = await adapter.poll(
+            self._provider_client,
+            ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                "prior_dispatch_ambiguous",
+                provider_request_ref=action.provider_request_ref,
+            ),
+        )
+        if observation.disposition is ProviderDisposition.PENDING:
+            # The job is still running: look again later, as the ordinary
+            # path does for a pending poll. Claiming spends one attempt, so a
+            # job that never finishes still reaches the retry budget.
+            claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
+            return self._result(await self._schedule(claimed, observation.detail_code))
+        if observation.disposition not in {
+            ProviderDisposition.ACCEPTED,
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+        }:
+            return None
+        await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
+        reconciling = await self._store.transition(
+            action.action_id,
+            ActionState.UNKNOWN,
+            ActionState.RECONCILING,
+            self._lease_owner,
+            ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                "reconciliation_started",
+                provider_request_ref=action.provider_request_ref,
             ),
         )
         return await self._finish_observation(reconciling, context, adapter, observation)
@@ -1573,10 +1629,12 @@ class OutboundActionService:
             lock_holder=f"outbound-gateway:{action.action_id}",
         )
 
-    async def _verified_context(
+    async def _loaded_context(
         self,
         action: OutboundActionRecord,
     ) -> tuple[ActionContext | None, str]:
+        """The stored action's context re-derived from the wake, checked only
+        for identity: the same action, account, routing and recipient."""
         try:
             context = await self._context_loader.load(action.execute_request())
         except ContextDerivationError:
@@ -1589,21 +1647,54 @@ class OutboundActionService:
             "target_id": context.target.target_id,
             "verified": context.target.verified,
         }
-        if (
-            context.action_id != action.action_id
-            or context.provider_account != action.provider_account
-            or context.routing_policy_version != action.routing_policy_version
-            or expected_recipient != dict(action.recipient_scope)
-        ):
+        differing = [
+            name
+            for name, differs in (
+                ("action_id", context.action_id != action.action_id),
+                ("provider_account", context.provider_account != action.provider_account),
+                ("routing_policy_version", context.routing_policy_version != action.routing_policy_version),
+                ("recipient_scope", expected_recipient != dict(action.recipient_scope)),
+            )
+            if differs
+        ]
+        if differing:
+            logger.warning("persisted context mismatch for action %s: %s", action.action_id, ", ".join(differing))
             return None, "persisted_context_mismatch"
+        return context, "context_verified"
+
+    async def _verified_context(
+        self,
+        action: OutboundActionRecord,
+    ) -> tuple[ActionContext | None, str]:
+        context, detail = await self._loaded_context(action)
+        if context is None or not action.payload_hash:
+            return context, detail
+        stored_context, current_context = dict(action.canonical_context), dict(context.canonical_context)
+        stored_scope, current_scope = dict(action.canonical_scope), dict(context.canonical_scope)
         if (
             context.payload_hash == action.payload_hash
-            and dict(context.canonical_context) == dict(action.canonical_context)
-            and dict(context.canonical_scope) == dict(action.canonical_scope)
+            and current_context == stored_context
+            and current_scope == stored_scope
         ):
             return context, "context_verified"
         if self._matches_durable_subject_alias_promotion(action, context):
             return context, "context_verified_alias_promotion"
+        # Name what moved, so a mismatch can be diagnosed (wake 27244's was
+        # gone before anyone could look).
+        differing = [
+            *(["payload_hash"] if context.payload_hash != action.payload_hash else []),
+            *(
+                f"canonical_context.{key}"
+                for key in sorted(set(stored_context) | set(current_context))
+                if stored_context.get(key) != current_context.get(key)
+            ),
+            *(
+                f"canonical_scope.{key}"
+                for key in sorted(set(stored_scope) | set(current_scope))
+                if stored_scope.get(key) != current_scope.get(key)
+            ),
+        ]
+        logger.warning("persisted context mismatch for action %s: %s", action.action_id, ", ".join(differing))
         return None, "persisted_context_mismatch"
 
     @staticmethod
