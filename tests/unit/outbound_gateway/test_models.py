@@ -710,17 +710,31 @@ def test_slot_still_required_for_showing_offer():
 
 # TenantCloud stores text only up to the first 4-byte character (2026-09-25:
 # a live probe kept "é — ✓ ✅" and cut at "🦊", while returning 201 Accepted).
-@pytest.mark.parametrize("emoji", ["\U0001f98a", "\U0001f44d", "\U0001f600", "\U0001d11e"])
-def test_tenantcloud_text_with_a_4byte_character_is_refused_before_sending(emoji):
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        ("The lazy dog. \U0001f98a\U0001f415 — received, Dan.", "The lazy dog. — received, Dan."),
+        ("Great job \U0001f44d\U0001f3fd!", "Great job!"),
+        ("Family \U0001f468\u200d\U0001f469\u200d\U0001f467 here", "Family here"),
+        ("See you Friday \U0001f600\nNigel", "See you Friday\nNigel"),
+    ],
+)
+def test_tenantcloud_text_loses_its_emoji_so_the_whole_reply_arrives(sent, stored):
     from postgres_mcp.outbound_gateway.models import MaintenanceCreateArguments, TenantCloudMessageArguments
 
-    with pytest.raises(ValueError, match="TenantCloud silently drops everything from the first emoji"):
-        TenantCloudMessageArguments(thread_id=1270770, text=f"The lazy dog. {emoji} received")
-    with pytest.raises(ValueError, match="remove them and send again"):
-        MaintenanceCreateArguments(
-            property_id=1, unit_id=1, category_id=13, title=f"Leak {emoji}", priority="normal",
-            initiated_at="2026-09-25", text="Kitchen sink", entry_allowed=False,
-        )
+    assert TenantCloudMessageArguments(thread_id=1270770, text=sent).text == stored
+    created = MaintenanceCreateArguments(
+        property_id=1, unit_id=1, category_id=13, title=f"Leak {sent}", priority="normal",
+        initiated_at="2026-09-25", text=sent, entry_allowed=False,
+    )
+    assert created.text == stored
+
+
+def test_a_message_of_only_emoji_is_refused_because_nothing_would_be_sent():
+    from postgres_mcp.outbound_gateway.models import TenantCloudMessageArguments
+
+    with pytest.raises(ValidationError, match="nothing TenantCloud can store"):
+        TenantCloudMessageArguments(thread_id=1, text="\U0001f600\U0001f44d")
 
 
 def test_tenantcloud_text_keeps_the_characters_tenantcloud_stores():
@@ -743,5 +757,4 @@ def test_a_stored_action_with_old_emoji_text_still_rebuilds_so_it_can_settle():
     }
     rebuilt = ExecuteRequest.model_validate(raw, context=STORED_ACTION_CONTEXT)
     assert "\U0001f98a" in rebuilt.arguments.text
-    with pytest.raises(ValidationError, match="TenantCloud silently drops"):
-        ExecuteRequest.model_validate(raw)
+    assert "\U0001f98a" not in ExecuteRequest.model_validate(raw).arguments.text
