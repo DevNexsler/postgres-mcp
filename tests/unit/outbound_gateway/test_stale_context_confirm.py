@@ -177,7 +177,9 @@ class LedgerStore:
         self.calls.append(("create", ctx.action_id))
         existing = self.rows.get(ctx.action_id)
         if existing is not None:
-            if existing.payload_hash != ctx.payload_hash:
+            # Comm-Data-Store migration 206: the same request is the same
+            # action even when the derived context (and so the hash) moved.
+            if dict(existing.arguments) != dict(ctx.arguments):
                 raise ValueError(f"outbound action immutable context mismatch for {ctx.action_id}")
             return existing
         return self._put(
@@ -1030,3 +1032,22 @@ def test_confirm_request_contract():
         parse_outbound_request({"op": "confirm", "wakeup_event_id": WAKE, "action_id": str(BLOCKED), "decision": "yes", "arguments": {"text": "x"}})
     with pytest.raises(ValueError):
         parse_outbound_request({"op": "confirm", "wakeup_event_id": WAKE, "action_id": str(BLOCKED), "decision": "maybe"})
+
+
+@pytest.mark.asyncio
+async def test_the_same_message_again_after_context_drift_asks_again_and_is_not_a_revise():
+    """The refused message executed again must be asked again, not sent as a
+    revise. The gateway's derived context can move between the two calls (a
+    sender name flipping moves the payload hash); comparing the hash made the
+    identical message read as a different one and send it (review finding)."""
+    service, store, _probe, adapter = harness(CRON_ALERT)
+    loader = service._context_loader
+    await service.execute(execute_request())
+
+    loader.canonical_context = MappingProxyType({**loader.canonical_context, "prospect_name": "moved"})
+    again = await service.execute(execute_request())
+
+    assert again.status is PublicStatus.NEEDS_CONFIRMATION
+    assert again.action_id == BLOCKED
+    assert store.rows[BLOCKED].stale_context_decision is None
+    assert adapter.sent == []

@@ -17,6 +17,7 @@ from unicodedata import normalize
 from uuid import UUID
 from uuid import uuid5
 
+from .identity import request_arguments
 from .models import ActionRole
 from .models import CalendarCreateArguments
 from .models import CalendarDeleteArguments
@@ -80,9 +81,6 @@ class DerivedTarget:
     kind: str
     target_id: str
     verified: bool
-
-
-_LATER_OPTIONAL_ARGUMENTS = frozenset({"subject", "cc", "title", "duration_minutes", "location", "attendees"})
 
 
 @dataclass(frozen=True)
@@ -385,16 +383,7 @@ class ActionContextLoader:
             refresh_evidence,
         )
 
-        # Optional fields added after actions were already stored are left
-        # out when omitted, so every existing action keeps its payload hash
-        # (dedupe and the worker's context check compare it).
-        arguments = MappingProxyType(
-            {
-                key: value
-                for key, value in request.arguments.model_dump(mode="json", exclude_none=False).items()
-                if not (value is None and key in _LATER_OPTIONAL_ARGUMENTS)
-            }
-        )
+        arguments = MappingProxyType(request_arguments(request.arguments))
         if request.operation in _TENANTCLOUD_OPERATIONS:
             desired_state_hash = canonical_payload_hash(dict(arguments))
             canonical_scope = {
