@@ -277,3 +277,44 @@ async def test_restate_workflow_returns_serializable_terminal_outcome(monkeypatc
         "detail_code": "provider_receipt_verified",
         "retry_after_seconds": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_action_that_never_verifies_is_parked_for_a_person() -> None:
+    """Action c3df14e3 (2026-09-25): TenantCloud stored a truncated text, the
+    readback could never match, and the send stayed `unknown` -- holding every
+    later send to that tenant. Past the ambiguous bound it goes to manual review."""
+    row = action(ActionState.UNKNOWN, attempts=12)
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.exhaust.return_value = SimpleNamespace(
+        status=PublicStatus.MANUAL_REVIEW, detail_code="retry_budget_exhausted_manual_review"
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(store=store, service=service, auth=auth, max_attempts=5)
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.TERMINAL
+    service.exhaust.assert_awaited_once_with(ACTION_ID)
+    service.reconcile.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempts", [5, 11])
+async def test_an_ambiguous_action_below_the_bound_still_reconciles(attempts) -> None:
+    row = action(ActionState.RECONCILING, attempts=attempts)
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.reconcile.return_value = SimpleNamespace(status=PublicStatus.UNKNOWN, detail_code="reconciliation_no_match")
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(store=store, service=service, auth=auth, max_attempts=5)
+
+    await coordinator.advance(ACTION_ID)
+
+    service.reconcile.assert_awaited_once_with(ACTION_ID)
+    service.exhaust.assert_not_called()

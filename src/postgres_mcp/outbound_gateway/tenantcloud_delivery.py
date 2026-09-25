@@ -116,12 +116,20 @@ class TenantCloudDeliveryCoordinator:
         service: DeliveryService,
         auth: AuthGate,
         max_attempts: int = 5,
+        max_ambiguous_attempts: int = 12,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._service = service
         self._auth = auth
         self._max_attempts = max(1, max_attempts)
+        # An ambiguous write keeps reconciling past the send limit (the readback
+        # may still prove acceptance), but not forever: a TenantCloud send that
+        # can never verify -- its text arrived truncated, action c3df14e3 on
+        # 2026-09-25 -- stayed `unknown`, and its in-flight state held every
+        # later send to the same recipient (lease_held). Past this bound it is
+        # parked for a person (manual_review), which releases the recipient.
+        self._max_ambiguous_attempts = max(self._max_attempts, max_ambiguous_attempts)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def status(self, action_id: UUID) -> DeliveryResult:
@@ -179,7 +187,10 @@ class TenantCloudDeliveryCoordinator:
                     300,
                 )
         elif action.state in _AMBIGUOUS_STATES:
-            result = await self._service.reconcile(action_id)
+            if action.attempt_count >= self._max_ambiguous_attempts:
+                result = await self._service.exhaust(action_id)
+            else:
+                result = await self._service.reconcile(action_id)
         elif action.attempt_count >= self._max_attempts:
             result = await self._service.exhaust(action_id)
         else:
