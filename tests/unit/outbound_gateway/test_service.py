@@ -308,8 +308,12 @@ class FakeStore:
 
 
 class FakeAdapter:
-    def __init__(self, *observations):
+    def __init__(self, *observations, outcome_polls=()):
         self.observations = list(observations)
+        # Answers to reconcile's "did job X finish?" pre-check. None queued
+        # means the provider cannot say (the TenantCloud facade, or a lost
+        # job), so the ordinary reconcile path runs.
+        self.outcome_polls = list(outcome_polls)
         self.calls = []
 
     def build_request(self, ctx, action_uid):
@@ -322,6 +326,8 @@ class FakeAdapter:
 
     async def poll(self, client, observation):
         self.calls.append(("poll", observation.provider_request_ref))
+        if observation.detail_code == "prior_dispatch_ambiguous":
+            return self.outcome_polls.pop(0) if self.outcome_polls else observation
         return self.observations.pop(0)
 
     def parse_receipt(self, ctx, observation):
@@ -2065,3 +2071,70 @@ async def test_a_later_action_of_the_same_role_carries_its_own_identity():
     assert store.calls[0] == ("create", ACTION_ID)
     assert probe.calls[0] == ("in_flight", "prospect:amanda", later)
     assert probe.calls[-1][-1] == later
+
+
+def _identity_matched_row(state, **overrides):
+    """A stored action whose account, routing and recipient match the loaded
+    context but whose content does not (wake 27244's shape)."""
+    loaded = context()
+    return row(
+        state,
+        provider_account=loaded.provider_account,
+        routing_policy_version=loaded.routing_policy_version,
+        recipient_scope={
+            "kind": loaded.target.kind,
+            "target_id": loaded.target.target_id,
+            "verified": loaded.target.verified,
+        },
+        payload_hash="f" * 64,
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_send_is_settled_by_its_provider_job_before_the_context_is_judged():
+    """Wake 27244: the email job completed, but reconcile re-derived the wake
+    context first, hit a transient mismatch and parked the action for review.
+    The provider's answer about its own job needs no context, so it comes
+    first; the mismatching context is never consulted for the outcome."""
+    store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1"))
+    sent = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=NOW,
+        evidence={"kind": "provider_job_completed"},
+    )
+    adapter = FakeAdapter(outcome_polls=[sent])
+
+    result = await service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == [("poll", "req-1")]
+    assert ("complete", ActionState.RECONCILING, "req-1") in store.calls
+    assert not any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_job_still_running_is_looked_at_again_not_parked():
+    store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1"))
+    running = ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1")
+    adapter = FakeAdapter(outcome_polls=[running])
+
+    result = await service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.UNKNOWN
+    assert store.current.state is ActionState.UNKNOWN
+    assert [call[0] for call in store.calls] == ["claim", "schedule"]
+
+
+@pytest.mark.asyncio
+async def test_when_the_provider_cannot_say_a_context_mismatch_still_parks_the_action():
+    store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1"))
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert adapter.calls == [("poll", "req-1")]
