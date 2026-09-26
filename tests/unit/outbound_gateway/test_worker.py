@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import logging
+import re
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.state_machine import ALLOWED_TRANSITIONS
+from postgres_mcp.outbound_gateway.store import PostgresActionStore
 from postgres_mcp.outbound_gateway.worker import OutboundWorker
 
 
@@ -112,3 +117,76 @@ def test_default_error_line_names_the_error(capsys):
     line = capsys.readouterr().out.strip()
     assert '"error_type": "KeyError"' in line
     assert "nigel-zoho" in line
+
+
+# ----------------------------------------------------------------------------
+# No state the gateway leaves an action in is invisible to the worker unless
+# nobody should drive it: terminal, parked for a person, or `received` -- the
+# agent's own execute call. A pre-send error that leaves a row `received`
+# says "not sent" to the agent, and executing again re-runs the send
+# (test_service).
+# ----------------------------------------------------------------------------
+
+
+async def _listed_states(method: str) -> set[ActionState]:
+    queries = []
+
+    async def execute(_driver, query, params):
+        queries.append(query)
+        return []
+
+    with patch("postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query", AsyncMock(side_effect=execute)):
+        await getattr(PostgresActionStore(object()), method)(20, 5)
+    in_list = re.search(r"state IN \(([^)]*)\)", queries[0])
+    assert in_list is not None
+    return {ActionState(value) for value in re.findall(r"'([a-z_]+)'", in_list.group(1))}
+
+
+TERMINAL_STATES = {state for state, targets in ALLOWED_TRANSITIONS.items() if not targets}
+PARKED_FOR_A_PERSON = {ActionState.DEAD_LETTER, ActionState.MANUAL_REVIEW}
+THE_AGENTS_OWN_CALL = {ActionState.RECEIVED}
+
+
+@pytest.mark.asyncio
+async def test_every_state_is_worker_driven_terminal_parked_or_the_agents_own_call():
+    work = await _listed_states("list_work")
+    assert await _listed_states("list_exhausted") == work
+    classes = [work, TERMINAL_STATES, PARKED_FOR_A_PERSON, THE_AGENTS_OWN_CALL]
+    assert set().union(*classes) == set(ActionState)
+    assert sum(len(group) for group in classes) == len(ActionState), "a state is in two classes"
+    assert TERMINAL_STATES == {
+        ActionState.COMPLETED,
+        ActionState.STALE,
+        ActionState.REJECTED,
+        ActionState.DEFINITIVE_FAILED,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_worker_drives_every_state_it_lists():
+    work = sorted(await _listed_states("list_work"))
+    ids = {state: UUID(int=100 + index) for index, state in enumerate(work)}
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(ids[state], state) for state in work]
+    service = AsyncMock()
+
+    assert await OutboundWorker(store=store, service=service).run_once() == len(work)
+    driven = {call.args[0] for call in service.resume.await_args_list + service.reconcile.await_args_list}
+    assert driven == set(ids.values())
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_worker_error_is_logged_at_error_with_the_action_id(caplog):
+    action_id = UUID(int=41)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(action_id, ActionState.RETRY_READY)]
+    service = AsyncMock()
+    service.resume.side_effect = TypeError("boom")
+    worker = OutboundWorker(store=store, service=service, on_error=lambda *_args: None)
+
+    with caplog.at_level(logging.ERROR):
+        assert await worker.run_once() == 1
+
+    assert any(record.levelno == logging.ERROR and str(action_id) in record.getMessage() for record in caplog.records)
