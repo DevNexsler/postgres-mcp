@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable
 from collections.abc import Callable
-from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
@@ -16,10 +13,7 @@ from types import MappingProxyType
 from typing import Any
 from typing import Mapping
 from typing import Protocol
-from typing import Sequence
 from uuid import UUID
-
-from pydantic import ValidationError
 
 from .adapters.base import ProviderAdapter
 from .adapters.base import ProviderDisposition
@@ -30,61 +24,36 @@ from .context import ActionContextLoader
 from .context import ContextDerivationError
 from .context import DerivedTarget
 from .context import canonical_payload_hash
-from .identity import same_request
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
-from .models import REVISABLE_ARGUMENT_KEYS
-from .models import STALE_CONTEXT_DETAIL
-from .models import STALE_CONTEXT_DETAILS
-from .models import STORED_ACTION_CONTEXT
-from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
 from .models import ConfirmRequest
-from .models import ContextItem
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
-from .models import PublicStatus
 from .models import StaleContextDecision
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
 from .preflight import PreflightOutcome
 from .preflight import SafetyPreflight
-from .state_machine import public_result
-from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
-from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
+from .record import ActionStore as ActionStore
+from .record import OutboundActionRecord as OutboundActionRecord
+from .record import action_result
+from .record import is_due
+from .record import require_action
+from .recovery import ActionRecovery
+from .stale_context import ExecuteAnswer
+from .stale_context import StaleContextQuestions
+from .stale_context import asks_on_block
+from .stale_context import execute_answer
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
-from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
-from .traffic_control import CONFIRM_REFUSAL_NOTICE
-from .traffic_control import CONTEXT_PREVIEW_CHARS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .traffic_control import TrafficProbe
 from .traffic_control import TrafficVerdict
 from .traffic_control import check_traffic
-from .traffic_control import list_stale_context
-from .traffic_control import stale_context_question
-from .traffic_control import stale_context_verdict
 
 logger = logging.getLogger(__name__)
-
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-# States with a legal edge into `stale` (outbound_action_transition_allowed,
-# Comm-Data-Store migration 153): a stale_context refusal can become a
-# confirmable no-send only from these. retry_ready has no such edge.
-_STALE_CONTEXT_SUCCESSOR_REASONS = frozenset({"stale_context_confirmed", "stale_context_revised"})
-
-
-def _refusal(message: str) -> ValueError:
-    """Every refused stale_context answer names itself as a decision, not an
-    outage, so no agent reads it as leave to use a direct provider route."""
-    return ValueError(f"{message} {CONFIRM_REFUSAL_NOTICE}")
-
-
-_STALE_BLOCKABLE_STATES = frozenset(
-    {ActionState.RECEIVED, ActionState.PREPARED, ActionState.DEPENDENCY_WAIT}
-)
 
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
@@ -106,157 +75,6 @@ _ENQUEUE_TERMINAL_STATES = _EXECUTE_TERMINAL_STATES | {
     ActionState.RETRY_READY,
     ActionState.DEPENDENCY_WAIT,
 }
-
-
-@dataclass(frozen=True)
-class OutboundActionRecord:
-    action_id: UUID
-    wakeup_event_id: int
-    action_role: ActionRole
-    operation: Operation
-    intent_kind: str
-    appointment_slot: datetime | None
-    arguments: dict[str, Any]
-    state: ActionState
-    action_uid: UUID | None
-    provider_request_ref: str | None
-    provider_message_id: str | None
-    provider_accepted_at: datetime | None
-    completion_kind: CompletionKind | None
-    detail_code: str
-    attempt_count: int
-    next_attempt_at: datetime
-    payload_hash: str
-    canonical_context: Mapping[str, Any]
-    canonical_scope: Mapping[str, Any]
-    recipient_scope: Mapping[str, Any]
-    provider_account: str
-    routing_policy_version: str
-    provider_evidence_kind: str | None = None
-    provider_evidence_reference: str | None = None
-    provider_evidence_hash: str | None = None
-    provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
-    error_category: str | None = None
-    retry_of_action_id: UUID | None = None
-    remediation_reason: str | None = None
-    # Comm-Data-Store migration 192: the stale-context question's durable
-    # half. shown_refs are the exact context items the agent was shown
-    # (message:<id> / action:<uuid>); decision is its answer (yes | no |
-    # revise), NULL while unanswered.
-    stale_context_shown_refs: tuple[str, ...] = ()
-    stale_context_decision: str | None = None
-
-    def execute_request(self) -> ExecuteRequest:
-        # create_or_load() persists TenantCloud arguments enriched with
-        # desired_state/target_reference/idempotency_key (migration 118
-        # reads those directly off outbound_actions.arguments). Every
-        # ArgumentModel is a StrictModel with extra="forbid", so those
-        # gateway-owned keys must be stripped back out before they reach
-        # model_validate() here -- this method rebuilds context on every
-        # reconcile()/resume() call, including the crash-recovery path.
-        arguments = strip_tenantcloud_persisted_argument_keys(self.operation, self.arguments)
-        return ExecuteRequest.model_validate(
-            {
-                "op": "execute",
-                "wakeup_event_id": self.wakeup_event_id,
-                "action_role": self.action_role,
-                "operation": self.operation,
-                "intent_kind": self.intent_kind,
-                "appointment_slot": self.appointment_slot,
-                "arguments": arguments,
-            },
-            # An already-stored action: only NEW requests get the new-content
-            # rules (see refuse_tenantcloud_wide_characters).
-            context=STORED_ACTION_CONTEXT,
-        )
-
-
-class ActionStore(Protocol):
-    async def create_or_load(self, context: ActionContext) -> OutboundActionRecord: ...
-
-    async def prepare(
-        self,
-        context: ActionContext,
-        expected_state: ActionState,
-    ) -> OutboundActionRecord: ...
-
-    async def claim(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        lease_owner: str,
-        lease_seconds: int,
-    ) -> OutboundActionRecord: ...
-
-    async def record_provider_request(
-        self,
-        action_id: UUID,
-        lease_owner: str,
-        observation: ProviderObservation,
-    ) -> OutboundActionRecord: ...
-
-    async def transition(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        next_state: ActionState,
-        lease_owner: str | None,
-        observation: ProviderObservation,
-    ) -> OutboundActionRecord: ...
-
-    async def complete(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        lease_owner: str | None,
-        receipt: ProviderReceipt,
-        completion_kind: CompletionKind,
-        detail_code: str,
-    ) -> OutboundActionRecord: ...
-
-    async def definitive_fail(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        lease_owner: str,
-        observation: ProviderObservation,
-    ) -> OutboundActionRecord: ...
-
-    async def remediate_traffic_block(
-        self,
-        action_id: UUID,
-        *,
-        operator_identity: str,
-        reason: str,
-    ) -> OutboundActionRecord: ...
-
-    async def block_stale_context(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        lease_owner: str | None,
-        shown_refs: Sequence[str],
-    ) -> OutboundActionRecord: ...
-
-    async def confirm_stale_context(
-        self,
-        action_id: UUID,
-        *,
-        wakeup_event_id: int,
-        decision: str,
-        actor: str,
-        revision: ActionContext | None = None,
-    ) -> OutboundActionRecord: ...
-
-    async def get(self, action_id: UUID) -> OutboundActionRecord | None: ...
-
-    async def schedule_next_attempt(
-        self,
-        action_id: UUID,
-        expected_state: ActionState,
-        delay_seconds: int,
-        detail_code: str,
-    ) -> OutboundActionRecord: ...
 
 
 class PreflightEvidenceLoader(Protocol):
@@ -327,12 +145,35 @@ class OutboundActionService:
         self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
         self._traffic_mode = traffic_mode
         self._traffic_probe = traffic_probe
-        # OUTBOUND_STALE_CONFIRM_ENABLED. Off (default) is the pre-192 gateway:
-        # a stale_context block is the terminal traffic_blocked failure and
-        # confirm is refused. Turn it on only after Comm-Data-Store's reconciler
-        # (which reads a confirmed successor's outcome) is live and migration
-        # 192 is applied; before that a successor's failure would be invisible.
-        self._stale_confirm_enabled = stale_confirm_enabled
+        self._stale = StaleContextQuestions(
+            store=store,
+            context_loader=context_loader,
+            traffic_probe=traffic_probe,
+            actor=lease_owner,
+            enabled=stale_confirm_enabled,
+            drive_answered=self._drive_answered,
+            terminal_block=self._terminal_traffic_block,
+        )
+        self._recovery = ActionRecovery(
+            store=store,
+            provider_client=provider_client,
+            adapter_for=self._adapter,
+            verified_context=self._verified_context,
+            finish_observation=self._finish_observation,
+            schedule=self._schedule,
+            clock=clock,
+            actor=lease_owner,
+            lease_seconds=lease_seconds,
+        )
+
+    @property
+    def _stale_confirm_enabled(self) -> bool:
+        """OUTBOUND_STALE_CONFIRM_ENABLED; owned by the stale-context questions."""
+        return self._stale.enabled
+
+    @_stale_confirm_enabled.setter
+    def _stale_confirm_enabled(self, enabled: bool) -> None:
+        self._stale.enabled = enabled
 
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         return await self._execute(request, dispatch=True)
@@ -347,13 +188,13 @@ class OutboundActionService:
 
     async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
         context = await self._context_loader.load(request)
-        enabled = self._stale_confirm_enabled
+        enabled = self._stale.enabled
         action = None
         existing = None
         if enabled or (dispatch and context.prospect_id.startswith("subject:")):
             existing = await self._store.get(context.action_id)
         if enabled and existing is not None:
-            answered = await self._execute_after_stale_context(existing, request, context, dispatch=dispatch)
+            answered = await self._stale.after_execute(existing, request, dispatch=dispatch)
             if answered is not None:
                 return answered
         if dispatch and existing is not None and context.prospect_id.startswith("subject:"):
@@ -365,25 +206,14 @@ class OutboundActionService:
         # the database returned is this request's, whatever its ordinal.
         context = self._context_for(action, context)
         if action.state is ActionState.COMPLETED:
-            return self._result(action, repeated=True)
+            return action_result(action, repeated=True)
         if not self._is_due(action):
-            return self._result(action)
-        if enabled and self._awaits_stale_confirmation(action):
-            # The same message again after a needs_confirmation. override=true
-            # is the historical spelling of "yes"; anything else re-asks.
-            if request.override:
-                return await self._confirm_successor(
-                    action, StaleContextDecision.YES, None, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
-                )
-            return await self._reask_stale_context(action, context)
-        if (
-            enabled
-            and action.state is ActionState.STALE
-            and action.stale_context_decision == StaleContextDecision.YES.value
-        ):
-            # A repeated execute of a message already confirmed: report the
-            # successor that carries it (idempotent, never a second send).
-            return await self._confirm_successor(
+            return action_result(action)
+        answer = execute_answer(action, request, enabled=enabled)
+        if answer is ExecuteAnswer.REASK:
+            return await self._stale.reask(action, context)
+        if answer is ExecuteAnswer.YES:
+            return await self._stale.answer_and_drive(
                 action, StaleContextDecision.YES, None, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
             )
         if (
@@ -396,7 +226,7 @@ class OutboundActionService:
             if remediated is not None:
                 action, context = remediated
             else:
-                return self._result(
+                return action_result(
                     action,
                     detail=(
                         "override cannot resend this action yet: it is blocked by traffic "
@@ -405,12 +235,12 @@ class OutboundActionService:
                     ),
                 )
         elif action.state in (_EXECUTE_TERMINAL_STATES if dispatch else _ENQUEUE_TERMINAL_STATES):
-            return self._result(action)
+            return action_result(action)
         # With confirmation enabled an agent's override never bypasses
         # staleness silently: it is the "yes" of a stale_context question,
         # recorded as one (blocked row + successor). Disabled, it is the
         # pre-192 bypass, unchanged.
-        blocked = await self._check_traffic(
+        return await self._drive(
             action,
             context,
             agent_facing=True,
@@ -418,242 +248,64 @@ class OutboundActionService:
             override=not enabled and request.override,
             dispatch=dispatch,
         )
+
+    async def confirm(self, request: ConfirmRequest, *, dispatch: bool = True) -> PublicResult:
+        """Answer a needs_confirmation (stale_context) result: see
+        StaleContextQuestions.confirm."""
+        return await self._stale.confirm(request, dispatch=dispatch)
+
+    async def _drive(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        *,
+        agent_facing: bool = False,
+        confirm_stale: bool = False,
+        override: bool = False,
+        dispatch: bool = True,
+    ) -> PublicResult:
+        """The send gate every new or answered action passes: traffic control,
+        then preflight, then dispatch (or, with dispatch=False, preflight and
+        prepare for Restate without provider I/O)."""
+        blocked = await self._check_traffic(
+            action,
+            context,
+            agent_facing=agent_facing,
+            confirm_stale=confirm_stale,
+            override=override,
+            dispatch=dispatch,
+        )
         if blocked is not None:
             return blocked
         if not dispatch:
-            return await self._preflight_without_dispatch(action, context, agent_facing=True)
+            return await self._preflight_without_dispatch(action, context, agent_facing=agent_facing)
 
         async def _preflight_fallback() -> PublicResult:
             return await self._preflight(action, context)
 
         return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
 
-    async def _execute_after_stale_context(
-        self,
-        existing: OutboundActionRecord,
-        request: ExecuteRequest,
-        context: ActionContext,
-        *,
-        dispatch: bool,
-    ) -> PublicResult | None:
-        """A DIFFERENT message executed for a wake role whose first message is
-        waiting on a stale_context answer is that answer's `revise` -- and a
-        revise changes message content only. Operation, role, intent and
-        appointment slot must be the refused message's own; anything else is
-        refused rather than silently sent with the refused message's values.
-        None means "not this case": the ordinary execute path continues."""
-        # The same message again is not an answer; only a different message is
-        # its revise. "Same" is what was asked, not the derived context hash.
-        if not self._awaits_stale_confirmation(existing) or same_request(existing.execute_request(), request):
-            return None
-        differing = [
-            name
-            for name, asked, refused in (
-                ("operation", request.operation, existing.operation),
-                ("action_role", request.action_role, existing.action_role),
-                ("intent_kind", request.intent_kind, str(existing.intent_kind)),
-                ("appointment_slot", request.appointment_slot, existing.appointment_slot),
-            )
-            if asked != refused
-        ]
-        if differing:
-            raise _refusal(
-                f"execute refused: action {existing.action_id} is awaiting your stale_context answer, and a "
-                "different message for it counts as its revise, which may change message content only; "
-                f"{', '.join(differing)} differ from the refused message. Answer the question with "
-                'op "confirm" (yes, no, or revise with the same operation, intent, slot and target).'
-            )
-        arguments = dict(request.arguments.model_dump(mode="json", exclude_none=True))
-        return await self._confirm_successor(
-            existing,
-            StaleContextDecision.REVISE,
-            arguments,
-            wakeup_event_id=request.wakeup_event_id,
-            dispatch=dispatch,
-        )
-
-    async def confirm(self, request: ConfirmRequest, *, dispatch: bool = True) -> PublicResult:
-        """Answer a needs_confirmation (stale_context) result.
-
-        `no` records the decline and sends nothing. `yes` mints (once) a
-        successor carrying the same payload; `revise` mints one carrying the
-        revised content to the same target. Either successor is driven through
-        the same gate every execute passes -- in-flight lease, recipient
-        safety, intent lock, preflight -- with only the context items the agent
-        was SHOWN waived. With dispatch=False (TenantCloud) the successor is
-        preflighted and prepared for Restate instead of dispatched inline."""
-        if not self._stale_confirm_enabled:
-            raise _refusal(
-                "confirm refused: stale_context confirmation is not enabled on this gateway; "
-                "a stale_context refusal from it is final."
-            )
-        parent = await self._require_action(request.action_id)
-        if parent.wakeup_event_id != request.wakeup_event_id:
-            raise _refusal(
-                f"confirm refused: action {parent.action_id} belongs to wake {parent.wakeup_event_id}, "
-                f"not wake {request.wakeup_event_id}; a confirmation never crosses wakes."
-            )
-        if parent.state is not ActionState.STALE or parent.detail_code not in STALE_CONTEXT_DETAILS:
-            raise _refusal(
-                f"confirm refused: action {parent.action_id} is not awaiting a stale_context "
-                f"confirmation (state {parent.state.value}, detail {parent.detail_code})."
-            )
-        if request.decision is StaleContextDecision.NO:
-            declined = await self._answer_stale_context(
-                parent, StaleContextDecision.NO, wakeup_event_id=request.wakeup_event_id
-            )
-            return self._result(
-                declined,
-                detail="Declined: nothing was sent for this action. This is a recorded no-send, not a failure.",
-            )
-        return await self._confirm_successor(
-            parent, request.decision, request.arguments, wakeup_event_id=request.wakeup_event_id, dispatch=dispatch
-        )
-
-    async def _revision_context(
-        self,
-        parent: OutboundActionRecord,
-        arguments: Mapping[str, Any],
-    ) -> ActionContext:
-        """Validate a `revise` answer and derive its context. The request is
-        rebuilt from the refused row -- same operation, role, intent and slot --
-        with only `arguments` replaced, and only the operation's content keys
-        may differ from the refused arguments."""
-        revisable = REVISABLE_ARGUMENT_KEYS[parent.operation]
-        if not revisable:
-            raise _refusal(
-                f"revise refused: {parent.operation.value} has no message content to revise; answer yes or no."
-            )
-        original = dict(strip_tenantcloud_persisted_argument_keys(parent.operation, parent.arguments))
-        try:
-            base = parent.execute_request()
-            revised = ExecuteRequest.model_validate(
-                {**base.model_dump(mode="python"), "arguments": dict(arguments)}
-            )
-        except ValidationError as exc:
-            first = exc.errors()[0]
-            location = ".".join(str(part) for part in first["loc"]) or "arguments"
-            raise _refusal(f"revise refused: invalid arguments: {location}: {first['msg']}.") from exc
-        normalized = revised.arguments.model_dump(mode="json", exclude_none=True)
-        comparable_original = {key: value for key, value in original.items() if value is not None}
-        changed = sorted(
-            key
-            for key in set(comparable_original) | set(normalized)
-            if key not in revisable and comparable_original.get(key) != normalized.get(key)
-        )
-        if changed:
-            raise _refusal(
-                "revise refused: only the message content ("
-                + ", ".join(sorted(revisable))
-                + ") may change; "
-                + ", ".join(changed)
-                + " must stay exactly as refused (same operation, recipient and target)."
-            )
-        return await self._context_loader.load(revised)
-
-    async def _answer_stale_context(
-        self,
-        parent: OutboundActionRecord,
-        decision: StaleContextDecision,
-        revision: ActionContext | None = None,
-        *,
-        wakeup_event_id: int,
-    ) -> OutboundActionRecord:
-        try:
-            return await self._store.confirm_stale_context(
-                parent.action_id,
-                wakeup_event_id=wakeup_event_id,
-                decision=decision.value,
-                actor=self._lease_owner,
-                revision=revision,
-            )
-        except Exception as exc:
-            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-            raise _refusal(f"confirm refused for action {parent.action_id}: {reason}.") from exc
-
-    async def _confirm_successor(
-        self,
-        parent: OutboundActionRecord,
-        decision: StaleContextDecision,
-        arguments: Mapping[str, Any] | None,
-        *,
-        wakeup_event_id: int,
-        dispatch: bool,
-    ) -> PublicResult:
-        revision = None
-        if decision is StaleContextDecision.REVISE:
-            revision = await self._revision_context(parent, arguments or {})
-        successor = await self._answer_stale_context(parent, decision, revision, wakeup_event_id=wakeup_event_id)
+    async def _drive_answered(self, successor: OutboundActionRecord, *, dispatch: bool) -> PublicResult:
+        """A yes/revise successor executes its own saved record, like any
+        action, through the same gate as the agent's execute."""
         if successor.state is ActionState.COMPLETED:
-            return self._result(successor, repeated=True)
+            return action_result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
-            return self._result(successor)
-        # The successor executes its own saved record, like any action.
+            return action_result(successor)
         context, context_detail = await self._verified_context(successor)
         if context is None:
-            return self._result(successor, detail=context_detail)
-        blocked = await self._check_traffic(
-            successor,
-            context,
-            agent_facing=True,
-            confirm_stale=False,
-            dispatch=dispatch,
-        )
-        if blocked is not None:
-            return blocked
-        if not dispatch:
-            return await self._preflight_without_dispatch(successor, context, agent_facing=True)
+            return action_result(successor, detail=context_detail)
+        return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
 
-        async def _preflight_fallback() -> PublicResult:
-            return await self._preflight(successor, context)
-
-        return await self._dispatch_stage(successor, context, otherwise=_preflight_fallback)
-
-    async def _reask_stale_context(
-        self,
-        action: OutboundActionRecord,
-        context: ActionContext,
-    ) -> PublicResult:
-        """The agent re-executed a message whose stale_context question is
-        still unanswered. Ask again, listing everything newer than the wake's
-        context, and add what it now saw to the shown set."""
-        verdict = None
-        if self._traffic_probe is not None:
-            verdict = await list_stale_context(
-                self._traffic_probe,
-                recipient_key=context.prospect_id,
-                channel_id=context.channel_id,
-                wakeup_event_id=context.wakeup_event_id,
-                action_id=action.action_id,
-                logger=logger,
-            )
-        if verdict is not None and verdict.shown_refs:
-            try:
-                action = await self._store.block_stale_context(
-                    action.action_id,
-                    ActionState.STALE,
-                    None,
-                    verdict.shown_refs,
-                )
-            except Exception:
-                logger.warning(
-                    "stale-context shown set could not be extended for action %s",
-                    action.action_id,
-                    exc_info=True,
-                )
-        return self._needs_confirmation(action, verdict)
-
-    @staticmethod
-    def _awaits_stale_confirmation(action: OutboundActionRecord) -> bool:
-        return (
-            action.state is ActionState.STALE
-            and action.detail_code == STALE_CONTEXT_DETAIL
-            and action.stale_context_decision is None
-        )
-
-    @staticmethod
-    def _is_stale_context_successor(action: OutboundActionRecord) -> bool:
-        return action.remediation_reason in _STALE_CONTEXT_SUCCESSOR_REASONS
+    async def prepare(self, action_id: UUID) -> PublicResult:
+        """Preflight a persisted remediation successor without provider I/O."""
+        action = await self._require_action(action_id)
+        if action.state is not ActionState.RECEIVED or not self._is_due(action):
+            return action_result(action)
+        context, context_detail = await self._verified_context(action)
+        if context is None:
+            return action_result(action, detail=context_detail)
+        return await self._drive(action, context, dispatch=False)
 
     async def _preflight_without_dispatch(
         self,
@@ -663,98 +315,17 @@ class OutboundActionService:
         agent_facing: bool = False,
     ) -> PublicResult:
         evidence = await self._evidence_loader.load(context)
-        evidence, unshown = await self._waive_shown_inbound(context, evidence)
+        evidence, unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
-            return self._result(prepared, repeated=prepared.state is ActionState.COMPLETED)
-        asked = await self._ask_about_unshown_inbound(action, context, decision, unshown, agent_facing, dispatch=False)
+            return action_result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+        asked = await self._stale.ask_about_unshown_inbound(
+            action, context, decision, unshown, agent_facing=agent_facing, dispatch=False
+        )
         if asked is not None:
             return asked
         return await self._apply_preflight_decision(action, evidence, decision)
-
-    async def _waive_shown_inbound(
-        self,
-        context: ActionContext,
-        evidence: PreflightEvidence,
-    ) -> tuple[PreflightEvidence, tuple[int, ...]]:
-        """A prospect reply's preflight declines to send over ANY inbound newer
-        than its source message (`newer_inbound`), across channels. An inbound
-        this wake's agent was SHOWN in a stale_context question -- by message
-        id, never by timestamp -- is no longer unseen context and is waived;
-        every other one still counts. Returns the evidence restricted to the
-        unshown inbound, and those ids."""
-        later = evidence.later_inbound_message_ids or (
-            (evidence.later_inbound_message_id,) if evidence.later_inbound_message_id is not None else ()
-        )
-        if not later or not self._stale_confirm_enabled or self._traffic_probe is None:
-            return evidence, tuple(later)
-        try:
-            shown = await self._traffic_probe.acknowledged_refs(context.wakeup_event_id, context.prospect_id)
-        except Exception:
-            logger.warning(
-                "shown-context read failed on wake %s; waiving no newer inbound",
-                context.wakeup_event_id,
-                exc_info=True,
-            )
-            return evidence, tuple(later)
-        unshown = tuple(message_id for message_id in later if f"message:{message_id}" not in shown)
-        return (
-            dataclass_replace(
-                evidence,
-                later_inbound_message_id=max(unshown) if unshown else None,
-                later_inbound_message_ids=unshown,
-            ),
-            unshown,
-        )
-
-    async def _ask_about_unshown_inbound(
-        self,
-        action: OutboundActionRecord,
-        context: ActionContext,
-        decision: PreflightDecision,
-        unshown: tuple[int, ...],
-        agent_facing: bool,
-        *,
-        dispatch: bool,
-    ) -> PublicResult | None:
-        """After the agent answered a stale_context question, an inbound it
-        was never shown (another channel of the same prospect, ingested late,
-        or past the display cap) asks again -- on the successor -- instead of
-        silently suppressing the send it just confirmed."""
-        if not (
-            agent_facing
-            and self._stale_confirm_enabled
-            and self._traffic_probe is not None
-            and decision.outcome is PreflightOutcome.STALE
-            and decision.detail_code == "newer_inbound"
-            and unshown
-            and self._is_stale_context_successor(action)
-            and action.state in _STALE_BLOCKABLE_STATES
-        ):
-            return None
-        try:
-            items = await self._traffic_probe.messages_by_id(list(unshown))
-        except Exception:
-            logger.warning("unshown-inbound read failed for action %s", action.action_id, exc_info=True)
-            return None
-        verdict = stale_context_verdict(items)
-        if verdict is None:
-            return None
-        return await self._block_stale_context(action, context, verdict, confirm=False, dispatch=dispatch)
-
-    async def prepare(self, action_id: UUID) -> PublicResult:
-        """Preflight a persisted remediation successor without provider I/O."""
-        action = await self._require_action(action_id)
-        if action.state is not ActionState.RECEIVED or not self._is_due(action):
-            return self._result(action)
-        context, context_detail = await self._verified_context(action)
-        if context is None:
-            return self._result(action, detail=context_detail)
-        blocked = await self._check_traffic(action, context)
-        if blocked is not None:
-            return blocked
-        return await self._preflight_without_dispatch(action, context)
 
     async def _dispatch_stage(
         self,
@@ -813,7 +384,7 @@ class OutboundActionService:
                 action.action_id,
                 exc_info=True,
             )
-            return self._result(await self._require_action(action.action_id))
+            return action_result(await self._require_action(action.action_id))
 
     async def _remediate_traffic_block(
         self,
@@ -906,24 +477,12 @@ class OutboundActionService:
             action_id=context.action_id,
             override=override,
             logger=logger,
-            acknowledged=self._stale_confirm_enabled,
+            acknowledged=self._stale.enabled,
         )
         if not verdict.allowed:
             if self._traffic_mode == "enforce":
-                if (
-                    self._stale_confirm_enabled
-                    and agent_facing
-                    and verdict.reason == "stale_context"
-                    and verdict.shown_refs
-                    and action.state in _STALE_BLOCKABLE_STATES
-                ):
-                    return await self._block_stale_context(
-                        action,
-                        context,
-                        verdict,
-                        confirm=confirm_stale,
-                        dispatch=dispatch,
-                    )
+                if self._stale.enabled and asks_on_block(action, verdict, agent_facing=agent_facing):
+                    return await self._stale.block(action, context, verdict, confirm=confirm_stale, dispatch=dispatch)
                 return await self._terminal_traffic_block(action, context, verdict)
             logger.warning(
                 "traffic control shadow would-block: %s %s wake=%s recipient=%s",
@@ -935,88 +494,6 @@ class OutboundActionService:
         elif verdict.check_failed:
             logger.warning("traffic control fail-open on wake %s", context.wakeup_event_id)
         return None
-
-    async def _block_stale_context(
-        self,
-        action: OutboundActionRecord,
-        context: ActionContext,
-        verdict: TrafficVerdict,
-        *,
-        confirm: bool,
-        dispatch: bool,
-    ) -> PublicResult:
-        try:
-            blocked = await self._store.block_stale_context(
-                action.action_id,
-                action.state,
-                None if action.state is ActionState.RECEIVED else self._lease_owner,
-                verdict.shown_refs,
-            )
-        except Exception:
-            # Migration 192 not applied (or a concurrent writer moved the
-            # row): keep the pre-192 contract rather than dispatching.
-            logger.error(
-                "stale_context block for action %s on wake %s could not be recorded as a "
-                "confirmable no-send; falling back to the terminal traffic block",
-                action.action_id,
-                context.wakeup_event_id,
-                exc_info=True,
-            )
-            current = await self._require_action(action.action_id)
-            return await self._terminal_traffic_block(current, context, verdict)
-        if confirm:
-            logger.warning(
-                "override=true answered stale_context yes: wake=%s action=%s shown=%s",
-                context.wakeup_event_id,
-                blocked.action_id,
-                ",".join(verdict.shown_refs),
-            )
-            return await self._confirm_successor(
-                blocked,
-                StaleContextDecision.YES,
-                None,
-                wakeup_event_id=context.wakeup_event_id,
-                dispatch=dispatch,
-            )
-        return self._needs_confirmation(blocked, verdict)
-
-    @staticmethod
-    def _needs_confirmation(
-        action: OutboundActionRecord,
-        verdict: TrafficVerdict | None,
-    ) -> PublicResult:
-        newer = verdict.newer if verdict is not None else ()
-        items = tuple(
-            ContextItem(
-                id=item.ref,
-                source=item.source,
-                direction=item.direction,
-                sender=item.sender,
-                occurred_at=item.occurred_at,
-                preview=item.preview[:CONTEXT_PREVIEW_CHARS],
-            )
-            # verdict.newer is newest first; the agent reads oldest -> newest.
-            for item in reversed(newer)
-        )
-        detail = (
-            verdict.detail
-            if verdict is not None and verdict.detail
-            else "Refused - stale context: this message is still awaiting your yes/no answer."
-        )
-        return PublicResult(
-            status=PublicStatus.NEEDS_CONFIRMATION,
-            action_id=action.action_id,
-            action_uid=action.action_uid,
-            provider_request_ref=None,
-            retryable=True,
-            detail_code=STALE_CONTEXT_DETAIL,
-            detail=detail,
-            new_context=items,
-            question=stale_context_question(
-                wakeup_event_id=action.wakeup_event_id,
-                action_id=action.action_id,
-            ),
-        )
 
     async def _terminal_traffic_block(
         self,
@@ -1034,7 +511,7 @@ class OutboundActionService:
             # _preflight() READY path uses, before it is claimable at all.
             claimable = await self._store.prepare(context, action.state)
             if claimable.state is ActionState.COMPLETED:
-                return self._result(claimable, repeated=True)
+                return action_result(claimable, repeated=True)
         if claimable.state is ActionState.DEPENDENCY_WAIT or verdict.reason == "lease_held":
             # Two independent reasons land here, both deferring
             # instead of terminalizing:
@@ -1061,7 +538,7 @@ class OutboundActionService:
             # Both are still a block (do-not-dispatch-now), and the
             # row stays legally re-drivable: the worker's next
             # resume() re-runs this same gate on its next poll.
-            return self._result(claimable, detail_code=verdict.reason, detail=verdict.detail)
+            return action_result(claimable, detail_code=verdict.reason, detail=verdict.detail)
         # Worker-driven staleness (resume/prepare: nobody to ask) and a
         # retry_ready row (no retry_ready -> stale edge) keep the terminal
         # traffic_blocked failure, which pages.
@@ -1083,10 +560,10 @@ class OutboundActionService:
                 evidence={"detail": verdict.detail},
             ),
         )
-        return self._result(failed, detail=verdict.detail)
+        return action_result(failed, detail=verdict.detail)
 
     async def status(self, action_id: UUID) -> PublicResult:
-        return self._result(await self._require_action(action_id))
+        return action_result(await self._require_action(action_id))
 
     async def action_operation(self, action_id: UUID) -> Operation | None:
         action = await self._store.get(action_id)
@@ -1098,10 +575,10 @@ class OutboundActionService:
     async def resume(self, action_id: UUID) -> PublicResult:
         action = await self._require_action(action_id)
         if not self._is_due(action):
-            return self._result(action)
+            return action_result(action)
         context, context_detail = await self._verified_context(action)
         if context is None:
-            return await self._manual_review(action, context_detail)
+            return await self._recovery.manual_review(action, context_detail)
         # Worker-driven resume (worker.py's list_work -> resume for
         # dependency_wait/prepared/retry_ready) has no ExecuteRequest and
         # therefore no caller-supplied override -- a long-waited action
@@ -1112,274 +589,30 @@ class OutboundActionService:
             return blocked
 
         async def _unchanged_fallback() -> PublicResult:
-            return self._result(action)
+            return action_result(action)
 
         return await self._dispatch_stage(action, context, otherwise=_unchanged_fallback)
 
     async def reconcile(self, action_id: UUID) -> PublicResult:
-        action = await self._require_action(action_id)
-        if not self._is_due(action):
-            return self._result(action)
-        recovered = await self._recover_persisted_acceptance(action)
-        if recovered is not None:
-            return recovered
-        if action.state in {
-            ActionState.DISPATCHING,
-            ActionState.PROVIDER_ACCEPTED,
-            ActionState.RECONCILING,
-        }:
-            await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.UNKNOWN,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "expired_dispatch_requires_reconciliation",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-        if action.state is not ActionState.UNKNOWN:
-            return self._result(action)
-        answered = await self._provider_outcome(action)
-        if answered is not None:
-            return answered
-        context, context_detail = await self._verified_context(action)
-        if context is None:
-            return await self._manual_review(action, context_detail)
-        adapter = self._adapter(context.operation)
-        await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-        reconciling = await self._store.transition(
-            action.action_id,
-            ActionState.UNKNOWN,
-            ActionState.RECONCILING,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "reconciliation_started",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        if reconciling.action_uid is None:
-            raise RuntimeError("reconciling action has no deterministic action UID")
-        observation = await adapter.reconcile(
-            self._provider_client,
-            context,
-            reconciling.action_uid,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "prior_dispatch_ambiguous",
-                provider_request_ref=reconciling.provider_request_ref,
-            ),
-        )
-        return await self._finish_observation(reconciling, context, adapter, observation)
-
-    async def _provider_outcome(self, action: OutboundActionRecord) -> PublicResult | None:
-        """Ask the provider about a send it already has before anything else.
-        "Did job X finish?" needs only the job id; this send has already been
-        made (wake 27244 parked an email for review 4 seconds before its job
-        reported "sent"). None means the provider could not say, or the saved
-        record cannot be executed: the ordinary reconcile path decides."""
-        if not action.provider_request_ref or action.action_uid is None:
-            return None
-        if action.operation in TENANTCLOUD_OPERATIONS:
-            # TenantCloud writes are synchronous: no provider job to ask
-            # about, and its reconcile is a readback of the record itself.
-            return None
-        context, _detail = await self._verified_context(action)
-        if context is None:
-            return None
-        adapter = self._adapter(context.operation)
-        observation = await adapter.poll(
-            self._provider_client,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "prior_dispatch_ambiguous",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        if observation.disposition is ProviderDisposition.PENDING:
-            # The job is still running: look again later, as the ordinary
-            # path does for a pending poll. Claiming spends one attempt, so a
-            # job that never finishes still reaches the retry budget.
-            claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-            return self._result(await self._schedule(claimed, observation.detail_code))
-        if observation.disposition not in {
-            ProviderDisposition.ACCEPTED,
-            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-        }:
-            return None
-        await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
-        reconciling = await self._store.transition(
-            action.action_id,
-            ActionState.UNKNOWN,
-            ActionState.RECONCILING,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "reconciliation_started",
-                provider_request_ref=action.provider_request_ref,
-            ),
-        )
-        return await self._finish_observation(reconciling, context, adapter, observation)
+        return await self._recovery.reconcile(action_id)
 
     async def exhaust(self, action_id: UUID) -> PublicResult:
         """Close exhausted work without another provider invocation."""
-        action = await self._require_action(action_id)
-        recovered = await self._recover_persisted_acceptance(action)
-        if recovered is not None:
-            return recovered
-        lease_held = False
-        observation = ProviderObservation(
-            ProviderDisposition.AMBIGUOUS,
-            "retry_budget_exhausted",
-            provider_request_ref=action.provider_request_ref,
-        )
-        if action.state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            lease_held = True
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.UNKNOWN,
-                self._lease_owner,
-                observation,
-            )
-            lease_held = False
-        if action.state is ActionState.UNKNOWN:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            lease_held = True
-            action = await self._store.transition(
-                action.action_id,
-                ActionState.UNKNOWN,
-                ActionState.RECONCILING,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "retry_budget_exhausted_reconciliation",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-        if action.state in {ActionState.RECONCILING, ActionState.DEPENDENCY_WAIT}:
-            if not lease_held:
-                await self._store.claim(
-                    action.action_id,
-                    action.state,
-                    self._lease_owner,
-                    self._lease_seconds,
-                )
-            action = await self._store.transition(
-                action.action_id,
-                action.state,
-                ActionState.DEAD_LETTER,
-                self._lease_owner,
-                observation,
-            )
-            action = await self._store.transition(
-                action.action_id,
-                ActionState.DEAD_LETTER,
-                ActionState.MANUAL_REVIEW,
-                None,
-                ProviderObservation(
-                    ProviderDisposition.AMBIGUOUS,
-                    "retry_budget_exhausted_manual_review",
-                    provider_request_ref=action.provider_request_ref,
-                ),
-            )
-            return self._result(action)
-        if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
-            await self._store.claim(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                self._lease_seconds,
-            )
-            failed = await self._store.definitive_fail(
-                action.action_id,
-                action.state,
-                self._lease_owner,
-                ProviderObservation(
-                    ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-                    "retry_budget_exhausted",
-                    provider_request_ref=action.provider_request_ref,
-                    category="retry_budget_exhausted",
-                    retryable=False,
-                    evidence={"kind": "retry_budget"},
-                ),
-            )
-            return self._result(failed)
-        return self._result(action)
-
-    async def _recover_persisted_acceptance(
-        self,
-        action: OutboundActionRecord,
-    ) -> PublicResult | None:
-        """Complete a durable provider acceptance without provider I/O."""
-        if not (
-            action.state is ActionState.PROVIDER_ACCEPTED
-            and action.provider_request_ref
-            and action.provider_message_id
-            and action.provider_accepted_at
-        ):
-            return None
-        if action.operation in TENANTCLOUD_OPERATIONS and not self._verified_tenantcloud_evidence(action):
-            # TenantCloud writes are irreversible provider-side actions
-            # (lead status, maintenance requests). The generic ref/id/accepted_at
-            # heuristic above is not proof enough here: only durable evidence
-            # that says "verified readback" AND whose hash matches the
-            # persisted canonical state may complete without provider I/O.
-            # Anything else -- including a crash between the PROVIDER_ACCEPTED
-            # transition and the evidence write -- must go through bounded
-            # reconciliation instead of being trusted blindly.
-            return None
-        provider_request_ref = action.provider_request_ref
-        provider_message_id = action.provider_message_id
-        provider_accepted_at = action.provider_accepted_at
-        action = await self._store.claim(
-            action.action_id,
-            action.state,
-            self._lease_owner,
-            self._lease_seconds,
-        )
-        completed = await self._store.complete(
-            action.action_id,
-            ActionState.PROVIDER_ACCEPTED,
-            self._lease_owner,
-            ProviderReceipt(
-                provider_request_ref=provider_request_ref,
-                provider_message_id=provider_message_id,
-                accepted_at=provider_accepted_at,
-                evidence={"kind": "persisted_provider_acceptance"},
-            ),
-            CompletionKind.SENT,
-            "persisted_provider_acceptance_recovered",
-        )
-        return self._result(completed)
+        return await self._recovery.exhaust(action_id)
 
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         """The agent-facing preflight (execute and confirm)."""
         evidence = await self._evidence_loader.load(context)
-        evidence, unshown = await self._waive_shown_inbound(context, evidence)
+        evidence, unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
-                return self._result(prepared, repeated=True)
+                return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:
-                return self._result(prepared)
+                return action_result(prepared)
             return await self._dispatch(prepared, context)
-        asked = await self._ask_about_unshown_inbound(action, context, decision, unshown, True, dispatch=True)
+        asked = await self._stale.ask_about_unshown_inbound(action, context, decision, unshown, agent_facing=True, dispatch=True)
         if asked is not None:
             return asked
         return await self._apply_preflight_decision(action, evidence, decision)
@@ -1392,18 +625,18 @@ class OutboundActionService:
             self._lease_seconds,
         )
         evidence = await self._evidence_loader.load(context)
-        evidence, _unshown = await self._waive_shown_inbound(context, evidence)
+        evidence, _unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
-                return self._result(prepared, repeated=True)
+                return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:
-                return self._result(prepared)
+                return action_result(prepared)
             return await self._dispatch(prepared, context)
         if decision.outcome is PreflightOutcome.DEPENDENCY_WAIT:
             scheduled = await self._schedule(action, decision.detail_code)
-            return self._result(scheduled)
+            return action_result(scheduled)
         return await self._apply_preflight_decision(
             action,
             evidence,
@@ -1439,7 +672,7 @@ class OutboundActionService:
                 CompletionKind.DUPLICATE,
                 decision.detail_code,
             )
-            return self._result(completed, repeated=True)
+            return action_result(completed, repeated=True)
         if decision.outcome in {PreflightOutcome.STALE, PreflightOutcome.REJECTED}:
             target = ActionState.STALE if decision.outcome is PreflightOutcome.STALE else ActionState.REJECTED
             transitioned = await self._store.transition(
@@ -1449,7 +682,7 @@ class OutboundActionService:
                 lease_owner,
                 ProviderObservation(ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE, decision.detail_code),
             )
-            return self._result(transitioned)
+            return action_result(transitioned)
         if decision.outcome is PreflightOutcome.MANUAL_REVIEW and action.state is ActionState.DEPENDENCY_WAIT:
             transitioned = await self._store.transition(
                 action.action_id,
@@ -1461,7 +694,7 @@ class OutboundActionService:
                     decision.detail_code,
                 ),
             )
-            return self._result(transitioned)
+            return action_result(transitioned)
         dependency_code = decision.detail_code
         transitioned = await self._store.transition(
             action.action_id,
@@ -1470,7 +703,7 @@ class OutboundActionService:
             lease_owner,
             ProviderObservation(ProviderDisposition.PENDING, dependency_code),
         )
-        return self._result(await self._schedule(transitioned, dependency_code))
+        return action_result(await self._schedule(transitioned, dependency_code))
 
     async def _dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         adapter = self._adapter(context.operation)
@@ -1482,7 +715,7 @@ class OutboundActionService:
                 max(1, circuit.retry_after_seconds),
                 "provider_circuit_open",
             )
-            return self._result(scheduled)
+            return action_result(scheduled)
         claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         dispatching = await self._store.transition(
             claimed.action_id,
@@ -1555,7 +788,7 @@ class OutboundActionService:
                     CompletionKind.SENT,
                     "provider_receipt_verified",
                 )
-                return self._result(completed)
+                return action_result(completed)
         if observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE:
             if observation.retryable:
                 retry = await self._store.transition(
@@ -1565,14 +798,14 @@ class OutboundActionService:
                     self._lease_owner,
                     observation,
                 )
-                return self._result(await self._schedule(retry, observation.detail_code))
+                return action_result(await self._schedule(retry, observation.detail_code))
             failed = await self._store.definitive_fail(
                 action.action_id,
                 expected_state,
                 self._lease_owner,
                 observation,
             )
-            return self._result(failed)
+            return action_result(failed)
         unknown = await self._store.transition(
             action.action_id,
             expected_state,
@@ -1580,7 +813,7 @@ class OutboundActionService:
             self._lease_owner,
             observation,
         )
-        return self._result(await self._schedule(unknown, observation.detail_code))
+        return action_result(await self._schedule(unknown, observation.detail_code))
 
     async def _schedule(
         self,
@@ -1605,10 +838,7 @@ class OutboundActionService:
         return adapter
 
     async def _require_action(self, action_id: UUID) -> OutboundActionRecord:
-        action = await self._store.get(action_id)
-        if action is None:
-            raise LookupError("outbound action does not exist")
-        return action
+        return await require_action(self._store, action_id)
 
     @staticmethod
     def _context_for(action: OutboundActionRecord, context: ActionContext) -> ActionContext:
@@ -1693,93 +923,8 @@ class OutboundActionService:
         )
         return normalized_hash == action.payload_hash
 
-    async def _manual_review(
-        self,
-        action: OutboundActionRecord,
-        detail_code: str,
-    ) -> PublicResult:
-        claimed = await self._store.claim(
-            action.action_id,
-            action.state,
-            self._lease_owner,
-            self._lease_seconds,
-        )
-        dead_letter = await self._store.transition(
-            claimed.action_id,
-            claimed.state,
-            ActionState.DEAD_LETTER,
-            self._lease_owner,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                detail_code,
-                provider_request_ref=claimed.provider_request_ref,
-            ),
-        )
-        manual = await self._store.transition(
-            dead_letter.action_id,
-            ActionState.DEAD_LETTER,
-            ActionState.MANUAL_REVIEW,
-            None,
-            ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                detail_code,
-                provider_request_ref=dead_letter.provider_request_ref,
-            ),
-        )
-        return self._result(manual)
-
     def _is_due(self, action: OutboundActionRecord) -> bool:
-        return action.next_attempt_at <= self._clock()
-
-    @staticmethod
-    def _verified_tenantcloud_evidence(action: OutboundActionRecord) -> bool:
-        """Migration 118's transition_outbound_action already enforced the
-        full acceptance guard (evidence_kind literal, six-key observation
-        shape, per-key type/format checks, and equality against the
-        persisted arguments' desired_state/target_reference/operation)
-        atomically, in the same statement that wrote evidence_kind =
-        'verified_provider_readback'. So a row bearing that literal is only
-        reachable through that guarded write. This re-checks the literal,
-        the evidence_hash's own format, and structural completeness of the
-        persisted six-key observation -- defense against a corrupted or
-        partial read, not a re-derivation of the facade's own opaque hash
-        (which, for maintenance create, is computed over a target_reference
-        that differs by design from what is persisted here -- see
-        tenantcloud_shared.py)."""
-        if action.provider_evidence_kind != EVIDENCE_KIND_VERIFIED_READBACK:
-            return False
-        if not action.provider_evidence_hash or not _HEX64.fullmatch(action.provider_evidence_hash):
-            return False
-        evidence = dict(action.provider_readback_evidence)
-        if set(evidence) != READBACK_OBSERVATION_KEYS:
-            return False
-        if not isinstance(evidence.get("canonical_observed_state"), Mapping):
-            return False
-        if evidence.get("readback_verified") is not True:
-            return False
-        for key in ("operation", "provider_object_id", "target_reference", "readback_timestamp"):
-            if not isinstance(evidence.get(key), str) or not evidence[key]:
-                return False
-        return True
-
-    @staticmethod
-    def _result(
-        action: OutboundActionRecord,
-        *,
-        repeated: bool = False,
-        detail: str | None = None,
-        detail_code: str | None = None,
-    ) -> PublicResult:
-        return public_result(
-            state=action.state,
-            action_id=action.action_id,
-            action_uid=action.action_uid,
-            provider_request_ref=action.provider_request_ref,
-            detail_code=detail_code or action.detail_code,
-            completion_kind=action.completion_kind,
-            repeated_execute=repeated,
-            detail=detail,
-        )
+        return is_due(action, self._clock())
 
 
 _RECORDED_ID_LISTS = frozenset({"cross_channel_duplicate_message_ids", "certified_older_message_ids"})
