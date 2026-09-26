@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from hashlib import sha256
 from typing import Any
 from typing import Mapping
@@ -55,12 +56,65 @@ def _verified_readback_evidence(value: ProviderObservation) -> Mapping[str, Any]
     return evidence
 
 
+# What the agent should read after a Comm-Data-Store stored function refuses
+# a request. Text only: the database still decides; each refusal keeps its
+# own words first (CDS system tests and operators search for them) and gains
+# what happened and what to do next.
+_DATABASE_REFUSAL_NEXT_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"ordinary outbound action cannot attach to terminal wake \S+"),
+        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
+        "the gateway), so no new action can be recorded on it. Do not retry this request. Record "
+        "needs_human with what you meant to send, or send it from a new wake.",
+    ),
+    (
+        re.compile(r"outbound action immutable context mismatch for \S+"),
+        "Nothing was sent by this request: that action is already recorded with different content, "
+        "and a recorded action never changes. Do not retry this request. Sending new content is a new "
+        'request: if the action is awaiting your stale_context answer, answer op "confirm" with '
+        'decision "revise"; otherwise check it with op "status" and send the new content as a new execute.',
+    ),
+    (
+        re.compile(r"outbound action limit reached: wake \S+ already has \d+ actions"),
+        "Nothing was sent: a wake records at most 10 actions. Record needs_human with what is still "
+        "to send.",
+    ),
+    (
+        re.compile(r"stale context confirmation cannot send for terminal wake \S+"),
+        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
+        "the gateway). Do not retry this answer. Record needs_human with what you meant to send, or "
+        "send it from a new wake.",
+    ),
+    (
+        re.compile(r"stale context already answered[^\n]*"),
+        'Nothing new was sent: the first answer stands. Check the action with op "status" to see '
+        "what it did.",
+    ),
+)
+
+
+def _explain_database_refusal(error: Exception) -> Exception:
+    """The same refusal with its next step, or the error unchanged."""
+    message = str(error)
+    for pattern, next_step in _DATABASE_REFUSAL_NEXT_STEPS:
+        match = pattern.search(message)
+        if match:
+            return ValueError(f"{match.group(0).rstrip('.')}. {next_step}")
+    return error
+
+
 class PostgresActionStore:
     def __init__(self, driver: Any):
         self._driver = driver
 
     async def _one(self, query: str, params: list[Any]) -> OutboundActionRecord:
-        rows = await SafeSqlDriver.execute_param_query(self._driver, query, params)  # type: ignore[arg-type]
+        try:
+            rows = await SafeSqlDriver.execute_param_query(self._driver, query, params)  # type: ignore[arg-type]
+        except Exception as error:
+            explained = _explain_database_refusal(error)
+            if explained is error:
+                raise
+            raise explained from error
         if not rows:
             raise LookupError("outbound action database function returned no row")
         return await self._hydrated_record(rows[0].cells)

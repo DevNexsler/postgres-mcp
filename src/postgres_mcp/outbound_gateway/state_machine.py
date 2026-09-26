@@ -100,7 +100,10 @@ LOCK_DISPOSITIONS: dict[ActionState, LockDisposition] = {
 
 def validate_transition(current: ActionState, target: ActionState) -> None:
     if target not in ALLOWED_TRANSITIONS[current]:
-        raise InvalidTransitionError(f"invalid outbound action transition: {current} -> {target}")
+        raise InvalidTransitionError(
+            f"invalid outbound action transition: {current} -> {target}. Check the action with "
+            'op "status" before doing anything else; do not send it another way.'
+        )
 
 
 def lock_disposition(state: ActionState) -> LockDisposition:

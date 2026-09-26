@@ -180,7 +180,10 @@ class ActionStore(Protocol):
 async def require_action(store: ActionStore, action_id: UUID) -> OutboundActionRecord:
     action = await store.get(action_id)
     if action is None:
-        raise LookupError("outbound action does not exist")
+        raise LookupError(
+            f"outbound action does not exist (action_id {action_id}). Check the action_id: copy it from "
+            "the execute result it came from."
+        )
     return action
 
 
