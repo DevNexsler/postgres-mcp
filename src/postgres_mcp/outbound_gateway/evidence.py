@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from typing import Any
@@ -10,6 +11,9 @@ from typing import Mapping
 from postgres_mcp.sql import SafeSqlDriver
 
 from .context import ActionContext
+from .context import normalize_phone
+from .models import ActionRole
+from .models import Operation
 from .preflight import CalendarDependencyState
 from .preflight import PreflightEvidence
 from .preflight import RefreshEvidence
@@ -27,6 +31,7 @@ class DatabasePreflightEvidenceLoader:
         recipient_phone = "".join(character for character in str(context.recipient_phone or "") if character.isdigit())
         equivalent_inbound_ids = sorted({context.source_message_id, *context.cross_channel_duplicate_message_ids})
         certified_older_message_ids = list(context.certified_older_message_ids)
+        outbound = outbound_target(context)
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -166,63 +171,73 @@ class DatabasePreflightEvidenceLoader:
                     ) AS later_inbound_message_ids,
                     max(related.sent_at) AS latest_sent_at
                 FROM related_messages AS related
-            ), verified_outbound AS (
-                SELECT
-                    related.id AS verified_outbound_message_id,
-                    coalesce(
-                        related.payload->'provider_ids'->>'message',
-                        related.payload#>>'{{data,object,id}}',
-                        related.payload->>'provider_request_ref',
-                        related.payload->>'request_ref',
-                        related.payload->>'provider_message_id',
-                        related.payload->>'message_id',
-                        related.source_message_id
-                    ) AS verified_outbound_request_ref
-                FROM related_messages AS related
-                WHERE (related.sent_at, related.id) > ({}::timestamptz, {})
-                  AND (
-                    (
-                        {} = 'zillow'
-                        AND lower(related.source) IN ('zoho_mail', 'nigel_mail')
-                        AND lower(coalesce(related.direction, '')) = 'outbound'
-                        AND replace(lower(coalesce(
-                            related.payload->>'source_folder', ''
-                        )), '_', '-') IN ('sent', 'sent-mail', 'outbox')
-                        AND EXISTS (
-                            SELECT 1
-                            FROM jsonb_array_elements(related.payload->'participants')
-                                AS sender_participant(value)
-                            WHERE lower(coalesce(
-                                sender_participant.value->>'kind', ''
-                            )) = 'from'
-                              AND split_part(lower(coalesce(
-                                  sender_participant.value->>'address', ''
-                              )), '@', 2) = 'pfg.io'
+            ), later_outbound AS (
+                -- Outbound sent after the source message TO THIS ACTION'S
+                -- TARGET, on the operation's own channel family: an email to
+                -- the same address, a text to the same phone, a post to the
+                -- same Cliq chat, a message in the same TenantCloud thread.
+                -- Keyed on the recipient, never on the source conversation: a
+                -- Cliq post in the wake's DM is not an email's activity (wake
+                -- 27279), and a Quo channel is a line, a mail channel a folder.
+                -- This wake's own sends are the agent's own work, not news.
+                -- The agent is shown these; the gateway decides nothing.
+                SELECT array_agg(candidate.id ORDER BY candidate.sent_at, candidate.id)
+                           AS later_outbound_message_ids
+                FROM messages AS candidate
+                JOIN channels AS candidate_channel ON candidate_channel.id = candidate.channel_id
+                LEFT JOIN raw_events AS candidate_raw ON candidate_raw.id = candidate.raw_event_id
+                WHERE candidate.source = ANY({}::text[])
+                  AND candidate.sent_at >= {}::timestamptz
+                  AND (candidate.sent_at, candidate.id) > ({}::timestamptz, {})
+                  AND lower(coalesce(
+                      candidate.direction,
+                      candidate_raw.payload->>'direction',
+                      candidate_raw.payload#>>'{{data,object,direction}}',
+                      ''
+                  )) IN ('outbound', 'outgoing', 'sent')
+                  AND CASE {}
+                      WHEN 'email' THEN EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                              CASE
+                                  WHEN jsonb_typeof(candidate_raw.payload->'participants') = 'array'
+                                  THEN candidate_raw.payload->'participants'
+                                  ELSE '[]'::jsonb
+                              END
+                          ) AS recipient(value)
+                          WHERE lower(coalesce(recipient.value->>'kind', '')) IN ('to', 'cc', 'bcc')
+                            AND lower(btrim(coalesce(recipient.value->>'address', ''))) = {}
+                      )
+                      WHEN 'sms' THEN EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(
+                              CASE
+                                  WHEN jsonb_typeof(candidate_raw.payload#>'{{data,object,to}}') = 'array'
+                                  THEN candidate_raw.payload#>'{{data,object,to}}'
+                                  WHEN jsonb_typeof(candidate_raw.payload#>'{{data,object,to}}') = 'string'
+                                  THEN jsonb_build_array(candidate_raw.payload#>'{{data,object,to}}')
+                                  ELSE '[]'::jsonb
+                              END
+                          ) AS phone(value)
+                          WHERE nullif(regexp_replace(phone.value, '[^0-9]', '', 'g'), '') = {}
+                      )
+                      WHEN 'channel' THEN candidate_channel.source_channel_id = {}
+                      ELSE false
+                  END
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM outbound_actions AS own
+                      WHERE own.wakeup_event_id = {}
+                        AND (
+                            nullif(regexp_replace(replace(regexp_replace(
+                                own.provider_message_id, '^.*:', ''), '%20', ''),
+                                '[^0-9A-Za-z]', '', 'g'), '')
+                            = regexp_replace(replace(regexp_replace(
+                                candidate.source_message_id, '^.*:', ''), '%20', ''),
+                                '[^0-9A-Za-z]', '', 'g')
+                            OR candidate_raw.payload->>'outbound_action_id' = own.action_id::text
                         )
-                    ) OR (
-                        {} = 'quo'
-                        AND lower(coalesce(
-                            related.direction,
-                            related.payload->>'direction',
-                            related.payload#>>'{{data,object,direction}}',
-                            ''
-                        )) IN ('outbound', 'outgoing', 'sent')
-                    ) OR (
-                        {} NOT IN ('zillow', 'quo')
-                        AND lower(coalesce(related.direction, '')) = 'outbound'
-                    )
                   )
-                  AND nullif(btrim(coalesce(
-                      related.payload->'provider_ids'->>'message',
-                      related.payload#>>'{{data,object,id}}',
-                      related.payload->>'provider_request_ref',
-                      related.payload->>'request_ref',
-                      related.payload->>'provider_message_id',
-                      related.payload->>'message_id',
-                      related.source_message_id
-                  )), '') IS NOT NULL
-                ORDER BY related.sent_at DESC, related.id DESC
-                LIMIT 1
             ), dependency AS (
                 SELECT CASE
                     WHEN {} NOT IN (
@@ -250,14 +265,13 @@ class DatabasePreflightEvidenceLoader:
             SELECT
                 conversation.later_inbound_message_id,
                 conversation.later_inbound_message_ids,
-                verified_outbound.verified_outbound_message_id,
-                verified_outbound.verified_outbound_request_ref,
+                later_outbound.later_outbound_message_ids,
                 coalesce(conversation.latest_sent_at, {}::timestamptz) AS latest_sent_at,
                 dependency.calendar_dependency_state,
                 false AS calendar_already_applied
             FROM conversation
             CROSS JOIN dependency
-            LEFT JOIN verified_outbound ON true
+            CROSS JOIN later_outbound
             """,
             [
                 provider_family,
@@ -279,11 +293,15 @@ class DatabasePreflightEvidenceLoader:
                 context.source_message_id,
                 equivalent_inbound_ids,
                 certified_older_message_ids,
+                list(outbound.sources),
+                context.source_sent_at,
                 context.source_sent_at,
                 context.source_message_id,
-                provider_family,
-                provider_family,
-                provider_family,
+                outbound.match,
+                outbound.recipient,
+                outbound.recipient,
+                outbound.recipient,
+                context.wakeup_event_id,
                 context.intent_kind,
                 context.wakeup_event_id,
                 context.wakeup_event_id,
@@ -293,8 +311,6 @@ class DatabasePreflightEvidenceLoader:
         if not rows:
             raise LookupError("preflight evidence query returned no row")
         cells = rows[0].cells
-        verified_id = cells.get("verified_outbound_message_id")
-        verified_ref = cells.get("verified_outbound_request_ref")
         latest_sent_at = cells.get("latest_sent_at") or context.source_sent_at
         return PreflightEvidence(
             current_recipient_id=context.target.target_id,
@@ -302,9 +318,7 @@ class DatabasePreflightEvidenceLoader:
             current_appointment_slot=context.appointment_slot,
             later_inbound_message_id=cells.get("later_inbound_message_id"),
             later_inbound_message_ids=tuple(int(item) for item in (cells.get("later_inbound_message_ids") or ())),
-            verified_outbound_message_id=verified_id,
-            verified_outbound_request_ref=verified_ref,
-            verified_outbound_covers_source=bool(verified_id and verified_ref),
+            later_outbound_message_ids=tuple(int(item) for item in (cells.get("later_outbound_message_ids") or ())),
             calendar_dependency=CalendarDependencyState(str(cells["calendar_dependency_state"])),
             calendar_already_applied=bool(cells.get("calendar_already_applied")),
             calendar_context_changed=False,
@@ -341,6 +355,42 @@ class DatabasePreflightEvidenceLoader:
             thread_resolved=bool(value.get("thread_resolved", True)),
             property_resolved=bool(value.get("property_resolved", True)),
         )
+
+
+@dataclass(frozen=True)
+class OutboundTarget:
+    """How to recognise an outbound message to the action's own target: which
+    message sources are the operation's channel family, how the recipient is
+    matched (`email`, `sms`, `channel`, or `none`), and the normalized
+    recipient key."""
+
+    sources: tuple[str, ...]
+    match: str
+    recipient: str
+
+
+_NO_OUTBOUND_TARGET = OutboundTarget(sources=(), match="none", recipient="")
+
+
+def outbound_target(context: ActionContext) -> OutboundTarget:
+    """The target key the newer-outbound evidence matches on. Only a prospect
+    reply asks about earlier sends to its recipient (the role the retired
+    already_handled check covered)."""
+    if context.action_role is not ActionRole.PROSPECT_REPLY:
+        return _NO_OUTBOUND_TARGET
+    target = context.target.target_id.strip()
+    if not target:
+        return _NO_OUTBOUND_TARGET
+    if context.operation is Operation.EMAIL_SEND:
+        return OutboundTarget(sources=("zoho_mail", "nigel_mail"), match="email", recipient=target.casefold())
+    if context.operation is Operation.QUO_SMS_SEND:
+        digits = "".join(character for character in (normalize_phone(target) or target) if character.isdigit())
+        return OutboundTarget(sources=("quo", "openphone"), match="sms", recipient=digits) if digits else _NO_OUTBOUND_TARGET
+    if context.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
+        return OutboundTarget(sources=("zoho_cliq",), match="channel", recipient=target)
+    if context.operation is Operation.TENANTCLOUD_MESSAGE_SEND:
+        return OutboundTarget(sources=("tenantcloud_api",), match="channel", recipient=f"tenantcloud:thread:{target}")
+    return _NO_OUTBOUND_TARGET
 
 
 def _datetime(value: Any) -> datetime | None:

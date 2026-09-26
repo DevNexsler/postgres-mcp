@@ -131,8 +131,9 @@ def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
     The answer is now a first-class gateway call, and the only one."""
     base = f'"op": "confirm", "wakeup_event_id": {wakeup_event_id}, "action_id": "{action_id}"'
     return (
-        "Refused - stale context: nothing was sent, because the messages in new_context arrived "
-        "after your context was built. Read them, then answer exactly once with outbound_action. "
+        "Refused - stale context: nothing was sent, because the messages in new_context are newer than "
+        "your context (direction outbound = a message we already sent to this recipient). "
+        "Read them, then answer exactly once with outbound_action. "
         f'YES - send your message unchanged: {{{base}, "decision": "yes"}}. '
         f'NO - send nothing (the new context makes it redundant or wrong): {{{base}, "decision": "no"}}. '
         f'REVISE - send a corrected message instead: {{{base}, "decision": "revise", '

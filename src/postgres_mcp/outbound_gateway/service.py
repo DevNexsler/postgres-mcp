@@ -18,7 +18,6 @@ from uuid import UUID
 from .adapters.base import ProviderAdapter
 from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
-from .adapters.base import ProviderReceipt
 from .context import ActionContext
 from .context import ActionContextLoader
 from .context import ContextDerivationError
@@ -317,6 +316,11 @@ class OutboundActionService:
         evidence = await self._evidence_loader.load(context)
         evidence, unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
+        asked = await self._stale.ask_about_newer_outbound(
+            action, context, decision, evidence, agent_facing=agent_facing, dispatch=False
+        )
+        if asked is not None:
+            return asked
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             return action_result(prepared, repeated=prepared.state is ActionState.COMPLETED)
@@ -325,7 +329,7 @@ class OutboundActionService:
         )
         if asked is not None:
             return asked
-        return await self._apply_preflight_decision(action, evidence, decision)
+        return await self._apply_preflight_decision(action, decision)
 
     async def _dispatch_stage(
         self,
@@ -605,6 +609,9 @@ class OutboundActionService:
         evidence = await self._evidence_loader.load(context)
         evidence, unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
+        asked = await self._stale.ask_about_newer_outbound(action, context, decision, evidence, agent_facing=True, dispatch=True)
+        if asked is not None:
+            return asked
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
@@ -615,7 +622,7 @@ class OutboundActionService:
         asked = await self._stale.ask_about_unshown_inbound(action, context, decision, unshown, agent_facing=True, dispatch=True)
         if asked is not None:
             return asked
-        return await self._apply_preflight_decision(action, evidence, decision)
+        return await self._apply_preflight_decision(action, decision)
 
     async def _resume_dependency(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         action = await self._store.claim(
@@ -627,6 +634,9 @@ class OutboundActionService:
         evidence = await self._evidence_loader.load(context)
         evidence, _unshown = await self._stale.waive_shown_inbound(context, evidence)
         decision = SafetyPreflight.evaluate(context, evidence, now=self._clock())
+        # The worker has nobody to ask: an unshown newer outbound is logged
+        # and the send proceeds (the gateway records, it does not decide).
+        await self._stale.ask_about_newer_outbound(action, context, decision, evidence, agent_facing=False, dispatch=True)
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
@@ -639,7 +649,6 @@ class OutboundActionService:
             return action_result(scheduled)
         return await self._apply_preflight_decision(
             action,
-            evidence,
             decision,
             lease_owner=self._lease_owner,
         )
@@ -647,32 +656,17 @@ class OutboundActionService:
     async def _apply_preflight_decision(
         self,
         action: OutboundActionRecord,
-        evidence: PreflightEvidence,
         decision: PreflightDecision,
         *,
         lease_owner: str | None = None,
     ) -> PublicResult:
         if decision.outcome is PreflightOutcome.DUPLICATE:
-            assert evidence.verified_outbound_request_ref is not None
-            assert evidence.verified_outbound_message_id is not None
-            receipt = ProviderReceipt(
-                provider_request_ref=evidence.verified_outbound_request_ref,
-                provider_message_id=evidence.verified_outbound_request_ref,
-                accepted_at=self._clock(),
-                evidence={
-                    "kind": "verified_existing_outbound",
-                    "cds_message_id": evidence.verified_outbound_message_id,
-                },
-            )
-            completed = await self._store.complete(
-                action.action_id,
-                action.state,
-                lease_owner,
-                receipt,
-                CompletionKind.DUPLICATE,
-                decision.detail_code,
-            )
-            return action_result(completed, repeated=True)
+            # No longer completed from conversation evidence: the gateway
+            # fabricated a receipt from whatever outbound message it matched
+            # (wake 27279: a Cliq cron post "was" a prospect email). The one
+            # remaining producer, calendar_already_applied, is never set by the
+            # evidence loader and has no provider receipt to complete with.
+            raise RuntimeError(f"preflight {decision.detail_code} has no provider receipt to complete action {action.action_id} with")
         if decision.outcome in {PreflightOutcome.STALE, PreflightOutcome.REJECTED}:
             target = ActionState.STALE if decision.outcome is PreflightOutcome.STALE else ActionState.REJECTED
             transitioned = await self._store.transition(

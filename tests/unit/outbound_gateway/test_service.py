@@ -111,9 +111,6 @@ def evidence(**overrides):
         current_property_id="building:bullman-st",
         current_appointment_slot=datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
         later_inbound_message_id=None,
-        verified_outbound_message_id=None,
-        verified_outbound_request_ref=None,
-        verified_outbound_covers_source=False,
         calendar_dependency=CalendarDependencyState.NOT_REQUIRED,
         calendar_already_applied=False,
         calendar_context_changed=False,
@@ -542,29 +539,6 @@ async def test_repeated_execute_accepts_durable_subject_alias_promotion_before_c
     assert result.status is PublicStatus.DUPLICATE
     assert adapter.calls == []
     store.create_or_load.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_verified_existing_outbound_keeps_provider_id_as_receipt_identity():
-    store = FakeStore()
-    adapter = FakeAdapter()
-    provider_message_id = "<existing-message@pfg.io>"
-    proof = evidence(
-        verified_outbound_message_id=702,
-        verified_outbound_request_ref=provider_message_id,
-        verified_outbound_covers_source=True,
-    )
-
-    result = await service(store, adapter, proof=proof).execute(request())
-
-    assert result.status is PublicStatus.DUPLICATE
-    assert store.current.provider_request_ref == provider_message_id
-    assert store.current.provider_message_id == provider_message_id
-    assert store.last_receipt.evidence == {
-        "kind": "verified_existing_outbound",
-        "cds_message_id": 702,
-    }
-    assert adapter.calls == []
 
 
 @pytest.mark.asyncio
