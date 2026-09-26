@@ -1257,26 +1257,12 @@ class LegacyOutboundActionService:
         lease_owner: str | None = None,
     ) -> PublicResult:
         if decision.outcome is PreflightOutcome.DUPLICATE:
-            assert evidence.verified_outbound_request_ref is not None
-            assert evidence.verified_outbound_message_id is not None
-            receipt = ProviderReceipt(
-                provider_request_ref=evidence.verified_outbound_request_ref,
-                provider_message_id=evidence.verified_outbound_request_ref,
-                accepted_at=self._clock(),
-                evidence={
-                    "kind": "verified_existing_outbound",
-                    "cds_message_id": evidence.verified_outbound_message_id,
-                },
-            )
-            completed = await self._store.complete(
-                action.action_id,
-                action.state,
-                lease_owner,
-                receipt,
-                CompletionKind.DUPLICATE,
-                decision.detail_code,
-            )
-            return self._result(completed, repeated=True)
+            # The one edit to this frozen copy, in lockstep with service.py:
+            # PreflightEvidence no longer carries a "verified outbound" to
+            # fabricate a receipt from (the retired already_handled verdict,
+            # wake 27279), so neither side completes a DUPLICATE decision.
+            del evidence
+            raise RuntimeError(f"preflight {decision.detail_code} has no provider receipt to complete action {action.action_id} with")
         if decision.outcome in {PreflightOutcome.STALE, PreflightOutcome.REJECTED}:
             target = ActionState.STALE if decision.outcome is PreflightOutcome.STALE else ActionState.REJECTED
             transitioned = await self._store.transition(

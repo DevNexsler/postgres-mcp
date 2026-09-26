@@ -59,9 +59,6 @@ def evidence(ctx, **overrides):
         "current_property_id": ctx.property_id,
         "current_appointment_slot": ctx.appointment_slot,
         "later_inbound_message_id": None,
-        "verified_outbound_message_id": None,
-        "verified_outbound_request_ref": None,
-        "verified_outbound_covers_source": False,
         "calendar_dependency": CalendarDependencyState.NOT_REQUIRED,
         "calendar_already_applied": False,
         "calendar_context_changed": False,
@@ -73,7 +70,7 @@ def evidence(ctx, **overrides):
     return PreflightEvidence(**values)
 
 
-def test_later_prospect_turn_is_stale_and_verified_reply_is_duplicate():
+def test_later_prospect_turn_is_stale_and_a_newer_outbound_is_never_a_verdict():
     ctx = context(source="quo")
     stale = SafetyPreflight.evaluate(
         ctx,
@@ -82,18 +79,11 @@ def test_later_prospect_turn_is_stale_and_verified_reply_is_duplicate():
     )
     assert stale.outcome == PreflightOutcome.STALE
     assert stale.detail_code == "newer_inbound"
-    duplicate = SafetyPreflight.evaluate(
-        ctx,
-        evidence(
-            ctx,
-            verified_outbound_message_id=702,
-            verified_outbound_request_ref="quo-message-1",
-            verified_outbound_covers_source=True,
-        ),
-        now=NOW,
-    )
-    assert duplicate.outcome == PreflightOutcome.DUPLICATE
-    assert duplicate.detail_code == "already_handled"
+    # Wake 27279: the preflight no longer decides a send was already handled
+    # from outbound activity. The service shows it to the agent instead.
+    shown_not_decided = SafetyPreflight.evaluate(ctx, evidence(ctx, later_outbound_message_ids=(702,)), now=NOW)
+    assert shown_not_decided.outcome == PreflightOutcome.READY
+    assert shown_not_decided.detail_code == "ready"
 
 
 def test_unrelated_messages_do_not_suppress_calendar_or_internal_roles():
@@ -112,7 +102,7 @@ def test_unrelated_messages_do_not_suppress_calendar_or_internal_roles():
         appointment_slot=None,
         target=DerivedTarget("cliq_channel", "tenant-leads", True),
     )
-    noisy = {"later_inbound_message_id": 999, "verified_outbound_message_id": 1000}
+    noisy = {"later_inbound_message_id": 999, "later_outbound_message_ids": (1000,)}
     assert SafetyPreflight.evaluate(calendar, evidence(calendar, **noisy), now=NOW).outcome == PreflightOutcome.READY
     assert SafetyPreflight.evaluate(internal, evidence(internal, **noisy), now=NOW).outcome == PreflightOutcome.READY
 

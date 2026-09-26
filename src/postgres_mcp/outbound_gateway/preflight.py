@@ -51,9 +51,6 @@ class PreflightEvidence:
     current_property_id: str | None
     current_appointment_slot: datetime | None
     later_inbound_message_id: int | None
-    verified_outbound_message_id: int | None
-    verified_outbound_request_ref: str | None
-    verified_outbound_covers_source: bool
     calendar_dependency: CalendarDependencyState
     calendar_already_applied: bool
     calendar_context_changed: bool
@@ -64,6 +61,10 @@ class PreflightEvidence:
     # the max of these). Empty from callers that only know the max: readers
     # treat that as {later_inbound_message_id}.
     later_inbound_message_ids: tuple[int, ...] = ()
+    # Outbound sent after the source message to this action's own target
+    # (evidence.outbound_target). Information for the agent -- the service
+    # shows it through the stale-context question -- never a verdict here.
+    later_outbound_message_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,12 +105,10 @@ class SafetyPreflight:
         if context.action_role is ActionRole.PROSPECT_REPLY:
             if evidence.later_inbound_message_id is not None:
                 return PreflightDecision(PreflightOutcome.STALE, "newer_inbound")
-            if (
-                evidence.verified_outbound_message_id is not None
-                and evidence.verified_outbound_request_ref
-                and evidence.verified_outbound_covers_source
-            ):
-                return PreflightDecision(PreflightOutcome.DUPLICATE, "already_handled")
+            # Newer outbound is not decided here. The gateway used to complete
+            # the send as duplicate/already_handled over ANY outbound in the
+            # source conversation -- wake 27279's email to a prospect over a
+            # cron post in the Cliq DM. It is shown to the agent instead.
             if context.intent_kind in _CALENDAR_DEPENDENT_REPLIES:
                 if evidence.calendar_dependency is CalendarDependencyState.FAILED:
                     return PreflightDecision(

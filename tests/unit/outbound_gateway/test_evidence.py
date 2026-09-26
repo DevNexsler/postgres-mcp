@@ -15,6 +15,8 @@ from pglast import parse_sql
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.evidence import DatabasePreflightEvidenceLoader
+from postgres_mcp.outbound_gateway.evidence import OutboundTarget
+from postgres_mcp.outbound_gateway.evidence import outbound_target
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
@@ -82,8 +84,7 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": 701,
-                    "verified_outbound_request_ref": "provider-1",
+                    "later_outbound_message_ids": [701],
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -98,9 +99,7 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     ):
         proof = await loader.load(context())
 
-    assert proof.verified_outbound_message_id == 701
-    assert proof.verified_outbound_request_ref == "provider-1"
-    assert proof.verified_outbound_covers_source is True
+    assert proof.later_outbound_message_ids == (701,)
     assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED
     assert proof.refresh.status is RefreshStatus.COVERED
     assert proof.refresh.covered_thread_identity == "zrm-thread-1"
@@ -113,12 +112,14 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
     assert "'{{data,object,conversationid}}'" in query
     assert "'{{data,object,phonenumberid}}'" in query
     assert "'{{data,object,direction}}'" in query
-    assert "related.payload->'provider_ids'->>'message'" in query
-    assert "related.source_message_id" in query
     assert "recipient.value->>'address'" in query
-    # max and array_agg of later inbound share one filter; the third is the
-    # verified-outbound window.
-    assert query.count("(related.sent_at, related.id) > (") == 3
+    # max and array_agg of later inbound share one filter. Newer outbound is
+    # keyed on the action's target, not on the source conversation.
+    assert query.count("(related.sent_at, related.id) > (") == 2
+    assert "verified_outbound" not in query
+    assert "as later_outbound_message_ids" in query
+    assert "candidate.source = any({}::text[])" in query
+    assert "(candidate.sent_at, candidate.id) > (" in query
     assert "as later_inbound_message_ids" in query
     assert "related.id = any({}::bigint[])" in query
     assert calls[0][1] == [
@@ -141,11 +142,15 @@ async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_
         700,
         [700],
         [],
+        ["zoho_mail", "nigel_mail"],
+        NOW,
         NOW,
         700,
-        "zillow",
-        "zillow",
-        "zillow",
+        "email",
+        "lead@convo.zillow.com",
+        "lead@convo.zillow.com",
+        "lead@convo.zillow.com",
+        7,
         "showing_offer",
         7,
         7,
@@ -163,8 +168,6 @@ async def test_evidence_excludes_only_canonical_cross_channel_duplicate_from_new
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": None,
-                    "verified_outbound_request_ref": None,
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -195,8 +198,6 @@ async def test_evidence_excludes_durable_same_message_canonical_duplicates():
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": None,
-                    "verified_outbound_request_ref": None,
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -228,8 +229,6 @@ async def test_evidence_excludes_only_certified_zillow_scrape_rows_from_newer_in
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": None,
-                    "verified_outbound_request_ref": None,
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -261,8 +260,7 @@ async def test_quo_evidence_query_binds_conversation_line_target_and_nested_rece
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": 702,
-                    "verified_outbound_request_ref": "quo-provider-702",
+                    "later_outbound_message_ids": [702],
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -284,10 +282,9 @@ async def test_quo_evidence_query_binds_conversation_line_target_and_nested_rece
     ):
         proof = await DatabasePreflightEvidenceLoader(object()).load(quo_context)
 
-    assert proof.verified_outbound_request_ref == "quo-provider-702"
+    assert proof.later_outbound_message_ids == (702,)
     query = calls[0][0].casefold()
     assert "regexp_replace" in query
-    assert "related.payload#>>'{{data,object,id}}'" in query
     assert "lower(message_row.source) in ('quo', 'openphone')" in query
     assert calls[0][1][4:9] == [
         "PN-line-live",
@@ -305,8 +302,6 @@ async def test_same_building_calendar_overlap_is_not_loaded_as_blocking_evidence
             Row(
                 {
                     "later_inbound_message_id": None,
-                    "verified_outbound_message_id": None,
-                    "verified_outbound_request_ref": None,
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -334,8 +329,6 @@ async def test_evidence_query_survives_literal_json_path_braces():
                 Row(
                     {
                         "later_inbound_message_id": None,
-                        "verified_outbound_message_id": None,
-                        "verified_outbound_request_ref": None,
                         "latest_sent_at": NOW,
                         "calendar_dependency_state": "not_required",
                         "calendar_already_applied": False,
@@ -360,8 +353,6 @@ async def test_every_later_inbound_id_is_returned_not_only_the_newest():
                 {
                     "later_inbound_message_id": 902,
                     "later_inbound_message_ids": [901, 902],
-                    "verified_outbound_message_id": None,
-                    "verified_outbound_request_ref": None,
                     "latest_sent_at": NOW,
                     "calendar_dependency_state": "not_required",
                     "calendar_already_applied": False,
@@ -377,3 +368,40 @@ async def test_every_later_inbound_id_is_returned_not_only_the_newest():
 
     assert evidence.later_inbound_message_id == 902
     assert evidence.later_inbound_message_ids == (901, 902)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        # wake 27279: an email's target is its address, whatever the wake's source
+        (
+            {"source": "cliq", "target": DerivedTarget("email_thread", "YTryboujee@Gmail.com", True)},
+            OutboundTarget(("zoho_mail", "nigel_mail"), "email", "ytryboujee@gmail.com"),
+        ),
+        (
+            {"operation": Operation.QUO_SMS_SEND, "target": DerivedTarget("quo_conversation", "(516) 859-4333", True)},
+            OutboundTarget(("quo", "openphone"), "sms", "15168594333"),
+        ),
+        (
+            {"operation": Operation.CLIQ_CHAT_POST, "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
+            OutboundTarget(("zoho_cliq",), "channel", "1424728044450751028"),
+        ),
+        (
+            {"operation": Operation.TENANTCLOUD_MESSAGE_SEND, "target": DerivedTarget("tenantcloud_thread", "1861792", True)},
+            OutboundTarget(("tenantcloud_api",), "channel", "tenantcloud:thread:1861792"),
+        ),
+        # only a prospect reply asks about earlier sends to its recipient
+        (
+            {"action_role": ActionRole.INTERNAL_REPLY, "operation": Operation.CLIQ_CHAT_POST,
+             "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
+            OutboundTarget((), "none", ""),
+        ),
+        (
+            {"action_role": ActionRole.CALENDAR_MUTATION, "operation": Operation.CALENDAR_CREATE,
+             "target": DerivedTarget("calendar", "nigel", True)},
+            OutboundTarget((), "none", ""),
+        ),
+    ],
+)
+def test_newer_outbound_is_keyed_on_the_actions_own_target(overrides, expected):
+    assert outbound_target(context(**overrides)) == expected

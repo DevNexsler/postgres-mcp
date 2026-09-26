@@ -421,3 +421,72 @@ async def test_the_parity_harness_sees_a_real_difference():
         stale_context.DECLINED_DETAIL = original
     trace = await parity.run_side(OutboundActionService, scenario)
     assert ("call", "store.confirm_stale_context") in trace.kinds
+
+
+# ----------------------------------------------------------------------------
+# 4. Declared difference: newer outbound is a question (wake 27279)
+# ----------------------------------------------------------------------------
+
+
+class _NewerOutboundEvidence(stale_tests.StaticEvidence):
+    """Evidence with an outbound we already sent to the action's target after
+    the source message (evidence.outbound_target)."""
+
+    def __init__(self, *outbound: int) -> None:
+        super().__init__()
+        self.outbound = tuple(outbound)
+
+    async def load(self, ctx):
+        return replace(await super().load(ctx), later_outbound_message_ids=self.outbound)
+
+
+@pytest.mark.asyncio
+async def test_declared_difference_a_newer_outbound_to_the_target_is_asked_only_by_the_new_side():
+    """DECLARED, not a regression. The frozen pre-split service never saw newer
+    outbound as its own evidence: its only use was the retired already_handled
+    verdict, which completed wake 27279's email as a duplicate of a Cliq cron
+    post. The current service shows it to the agent as a stale_context
+    question; the legacy side, given the same evidence, simply sends. With no
+    newer outbound the two stay identical."""
+    from postgres_mcp.outbound_gateway.legacy_service import LegacyOutboundActionService
+    from postgres_mcp.outbound_gateway.service import OutboundActionService
+
+    from . import parity
+
+    ours = replace(
+        stale_tests.CRON_ALERT, direction="outbound", source="quo", message_id=760100, sender="Nigel Pine",
+        preview="ok great, I have you scheduled",
+    )
+
+    def scenario_with(outbound: tuple[int, ...]):
+        async def scenario(service_cls):
+            store = stale_tests.LedgerStore()
+            probe = stale_tests.LedgerProbe(store)
+            probe.elsewhere.append(ours)
+            adapter = stale_tests.CliqAdapter()
+            service = service_cls(
+                store=store,
+                context_loader=stale_tests.FakeLoader(),
+                evidence_loader=_NewerOutboundEvidence(*outbound),
+                adapters={Operation.QUO_SMS_SEND: adapter},
+                provider_client=object(),
+                clock=lambda: NOW,
+                lease_owner="outbound-gateway",
+                traffic_mode="enforce",
+                traffic_probe=probe,
+                stale_confirm_enabled=True,
+            )
+            await _attempt(service.execute(stale_tests.quo_reply_request()))
+
+        return scenario
+
+    await assert_parity(scenario_with(()))
+
+    legacy = await parity.run_side(LegacyOutboundActionService, scenario_with((760100,)))
+    current = await parity.run_side(OutboundActionService, scenario_with((760100,)))
+    assert legacy.events != current.events
+    assert ("call", "adapter.invoke") in legacy.kinds
+    assert ("call", "store.block_stale_context") not in legacy.kinds
+    assert ("call", "adapter.invoke") not in current.kinds
+    assert ("call", "probe.messages_by_id") in current.kinds
+    assert ("call", "store.block_stale_context") in current.kinds

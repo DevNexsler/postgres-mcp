@@ -2,7 +2,10 @@
 
 When newer activity reached a recipient after the agent's context was built,
 the gateway does not decide for the agent: it records the refused message as a
-`stale` no-send, shows the agent what it has not seen, and asks. The agent
+`stale` no-send, shows the agent what it has not seen, and asks. That includes
+outbound we already sent to the action's own target after the source message
+(direction outbound, labelled as sent by us): the gateway never completes a
+send as "already handled" on the agent's behalf. The agent
 answers `yes` (send it unchanged), `no` (send nothing) or `revise` (send a
 corrected message, same operation, recipient and target).
 
@@ -53,7 +56,9 @@ from .record import action_result
 from .record import require_action
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
 from .traffic_control import CONFIRM_REFUSAL_NOTICE
+from .traffic_control import CONTEXT_ITEM_LIMIT
 from .traffic_control import CONTEXT_PREVIEW_CHARS
+from .traffic_control import NewerActivity
 from .traffic_control import TrafficProbe
 from .traffic_control import TrafficVerdict
 from .traffic_control import list_stale_context
@@ -225,16 +230,76 @@ def later_inbound(evidence: PreflightEvidence) -> tuple[int, ...]:
 
 
 def waive_shown(evidence: PreflightEvidence, shown: frozenset[str]) -> tuple[PreflightEvidence, tuple[int, ...]]:
-    """The evidence restricted to the newer inbound NOT in `shown` (by
-    message id, never by timestamp), and those ids."""
+    """The evidence restricted to the newer inbound and outbound NOT in
+    `shown` (by message id, never by timestamp), and the unshown inbound ids."""
     unshown = tuple(message_id for message_id in later_inbound(evidence) if f"message:{message_id}" not in shown)
+    unshown_outbound = tuple(
+        message_id for message_id in evidence.later_outbound_message_ids if f"message:{message_id}" not in shown
+    )
     return (
         dataclass_replace(
             evidence,
             later_inbound_message_id=max(unshown) if unshown else None,
             later_inbound_message_ids=unshown,
+            later_outbound_message_ids=unshown_outbound,
         ),
         unshown,
+    )
+
+
+# Preflight outcomes that lead toward a send (now, or after the calendar
+# dependency): the ones an unshown newer outbound turns into a question.
+_SENDING_OUTCOMES = frozenset({PreflightOutcome.READY, PreflightOutcome.DEPENDENCY_WAIT})
+
+
+def asks_about_outbound(
+    action: OutboundActionRecord,
+    decision: PreflightDecision,
+    outbound: tuple[int, ...],
+    *,
+    agent_facing: bool,
+) -> bool:
+    """An outbound to this action's target, sent after the source message and
+    never shown to this wake's agent, is asked about before a send -- on the
+    agent's own execute or confirm, while the row can still become `stale`."""
+    return (
+        agent_facing
+        and bool(outbound)
+        and decision.outcome in _SENDING_OUTCOMES
+        and action.state in STALE_BLOCKABLE_STATES
+    )
+
+
+def sent_by_us(item: NewerActivity) -> NewerActivity:
+    """Label an outbound item as ours for the agent reading new_context."""
+    if item.direction != "outbound":
+        return item
+    return dataclass_replace(item, sender=f"sent by us ({item.sender})" if item.sender else "sent by us")
+
+
+def newer_outbound_verdict(items: list[NewerActivity]) -> TrafficVerdict | None:
+    """The question over outbound we already sent to the action's target."""
+    if not items:
+        return None
+    ordered = tuple(sorted((sent_by_us(item) for item in items), key=lambda item: item.occurred_at, reverse=True))
+    newer = ordered[:CONTEXT_ITEM_LIMIT]
+    newest = newer[0]
+    more = f" and {len(newer) - 1} more" if len(newer) > 1 else ""
+    omitted = " (older items omitted; you will be asked about them next)" if len(ordered) > CONTEXT_ITEM_LIMIT else ""
+    detail = (
+        "Not sent yet - stale context: since the message you are answering, we already sent this recipient "
+        f"a message (direction outbound, sent by us): {newest.ref.replace(':', ' ')} via {newest.source} at "
+        f'{newest.occurred_at.isoformat()}: "{newest.preview}"{more}{omitted}. Nothing was decided for you. '
+        "Read new_context, then answer with op=confirm: yes (send yours as well), no (it is already covered), "
+        "or revise."
+    )
+    return TrafficVerdict(
+        allowed=False,
+        reason="stale_context",
+        detail=detail,
+        check_failed=False,
+        newer=newer,
+        truncated=len(ordered) > CONTEXT_ITEM_LIMIT,
     )
 
 
@@ -415,12 +480,7 @@ class StaleContextQuestions:
         """Record the refused message as a confirmable `stale` no-send and
         ask; confirm=True (override=true) answers yes at once."""
         try:
-            blocked = await self._store.block_stale_context(
-                action.action_id,
-                action.state,
-                None if action.state is ActionState.RECEIVED else self._actor,
-                verdict.shown_refs,
-            )
+            blocked = await self._record_block(action, verdict)
         except Exception:
             # Migration 192 not applied (or a concurrent writer moved the
             # row): keep the pre-192 contract rather than dispatching.
@@ -445,6 +505,14 @@ class StaleContextQuestions:
             )
         return needs_confirmation(blocked, verdict)
 
+    async def _record_block(self, action: OutboundActionRecord, verdict: TrafficVerdict) -> OutboundActionRecord:
+        return await self._store.block_stale_context(
+            action.action_id,
+            action.state,
+            None if action.state is ActionState.RECEIVED else self._actor,
+            verdict.shown_refs,
+        )
+
     async def waive_shown_inbound(
         self,
         context: ActionContext,
@@ -454,10 +522,11 @@ class StaleContextQuestions:
         than its source message (`newer_inbound`), across channels. An inbound
         this wake's agent was SHOWN in a stale_context question -- by message
         id, never by timestamp -- is no longer unseen context and is waived;
-        every other one still counts. Returns the evidence restricted to the
-        unshown inbound, and those ids."""
+        every other one still counts. The same holds for newer outbound to the
+        action's target. Returns the evidence restricted to the unshown items,
+        and the unshown inbound ids."""
         later = later_inbound(evidence)
-        if not later or not self.can_ask:
+        if not (later or evidence.later_outbound_message_ids) or not self.can_ask:
             return evidence, later
         assert self._probe is not None
         try:
@@ -497,6 +566,52 @@ class StaleContextQuestions:
         if verdict is None:
             return None
         return await self.block(action, context, verdict, confirm=False, dispatch=dispatch)
+
+    async def ask_about_newer_outbound(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        decision: PreflightDecision,
+        evidence: PreflightEvidence,
+        *,
+        agent_facing: bool,
+        dispatch: bool,
+    ) -> PublicResult | None:
+        """Outbound we already sent to this action's target after the source
+        message is information, not a verdict: the agent is shown it (sent by
+        us) and answers yes, no or revise. Where nobody can be asked -- the
+        worker, confirmation disabled, a row that cannot become `stale`, a
+        read or ledger write that fails -- the gateway does not decide either:
+        None, and the send proceeds."""
+        outbound = evidence.later_outbound_message_ids
+        if not outbound or decision.outcome not in _SENDING_OUTCOMES:
+            return None
+        refs = ",".join(f"message:{message_id}" for message_id in outbound)
+        if not (self.can_ask and asks_about_outbound(action, decision, outbound, agent_facing=agent_facing)):
+            logger.warning(
+                "newer outbound to %s on wake %s (%s) not shown to an agent: nobody can be asked here; "
+                "the send for action %s proceeds",
+                context.prospect_id,
+                context.wakeup_event_id,
+                refs,
+                action.action_id,
+            )
+            return None
+        assert self._probe is not None
+        try:
+            verdict = newer_outbound_verdict(await self._probe.messages_by_id(list(outbound)))
+            if verdict is None:
+                return None
+            blocked = await self._record_block(action, verdict)
+        except Exception:
+            logger.warning(
+                "newer outbound (%s) could not be shown for action %s; the send proceeds",
+                refs,
+                action.action_id,
+                exc_info=True,
+            )
+            return None
+        return needs_confirmation(blocked, verdict)
 
     async def _answer(
         self,
