@@ -1265,6 +1265,126 @@ async def test_retryable_pre_dispatch_failure_retries_then_completes_with_one_pr
 
 
 @pytest.mark.asyncio
+async def test_tenantcloud_message_send_404_says_the_thread_does_not_exist_and_to_use_email():
+    """A rejected tenantcloud.message.send used to surface only
+    tenantcloud_provider_rejected_http_404 -- true, but useless: it does not
+    say a thread id is not a lead id, or that email.send is the way to reach
+    this lead anyway (the shape behind wake 26156, 2026-08-30, whose
+    retry_budget_exhausted gave no hint the id it kept retrying was wrong)."""
+    store = FakeStore()
+    loader = AsyncMock()
+    loader.load.return_value = tenantcloud_context_for(Operation.TENANTCLOUD_MESSAGE_SEND)
+    preflight = AsyncMock()
+    preflight.load.return_value = evidence()
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "tenantcloud_provider_rejected_http_404",
+            category="provider_rejected",
+            retryable=False,
+        )
+    )
+    svc = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.TENANTCLOUD_MESSAGE_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+        response_budget_seconds=1,
+        sleep=AsyncMock(),
+    )
+
+    result = await svc.execute(request())
+
+    assert result.status is PublicStatus.FAILED
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert result.detail == (
+        "TenantCloud has no messenger thread 555 (a lead id is not a thread id). If this lead has no "
+        "thread, reply with email.send to the lead's email instead."
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_message_send_target_unavailable_says_the_thread_does_not_exist_while_it_retries():
+    """target_unavailable_before_dispatch (resolve_lead_thread also came up
+    empty) is retryable, so the row keeps retrying -- but the same
+    explanation belongs on this interim retry_ready result too, since an
+    agent checking status mid-retry sees only this result, not the eventual
+    retry_budget_exhausted."""
+    store = FakeStore()
+    loader = AsyncMock()
+    loader.load.return_value = tenantcloud_context_for(Operation.TENANTCLOUD_MESSAGE_SEND)
+    preflight = AsyncMock()
+    preflight.load.return_value = evidence()
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "tenantcloud_target_unavailable_before_dispatch",
+            category="provider_target_resolution",
+            retryable=True,
+        )
+    )
+    svc = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.TENANTCLOUD_MESSAGE_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+        response_budget_seconds=1,
+        sleep=AsyncMock(),
+    )
+
+    result = await svc.execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.RETRY_READY
+    assert result.detail == (
+        "TenantCloud has no messenger thread 555 (a lead id is not a thread id). If this lead has no "
+        "thread, reply with email.send to the lead's email instead."
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unrelated_tenantcloud_rejection_keeps_the_ordinary_detail():
+    """The new text is scoped to the two thread-lookup detail codes -- an
+    ordinary rejection (a bad body, say) must not be misdiagnosed as a
+    missing thread."""
+    store = FakeStore()
+    loader = AsyncMock()
+    loader.load.return_value = tenantcloud_context_for(Operation.TENANTCLOUD_MESSAGE_SEND)
+    preflight = AsyncMock()
+    preflight.load.return_value = evidence()
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "tenantcloud_provider_rejected",
+            category="provider_rejected",
+            retryable=False,
+        )
+    )
+    svc = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=preflight,
+        adapters={Operation.TENANTCLOUD_MESSAGE_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+        response_budget_seconds=1,
+        sleep=AsyncMock(),
+    )
+
+    result = await svc.execute(request())
+
+    assert result.status is PublicStatus.FAILED
+    assert result.detail is None
+
+
+@pytest.mark.asyncio
 async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch():
     store = FakeStore(
         row(

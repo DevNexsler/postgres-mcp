@@ -130,7 +130,8 @@ async def handle_outbound_action(
         elif location.endswith("operation"):
             hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
         raise ValueError(
-            f"invalid outbound action request: {location}: {first['msg']}{hint}"
+            f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
+            "that field and send again; the tool description lists each operation's exact arguments."
         ) from exc
     if isinstance(parsed, SuggestRequest):
         return {

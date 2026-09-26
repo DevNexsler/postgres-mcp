@@ -234,7 +234,10 @@ class ActionContextLoader:
     async def load(self, request: ExecuteRequest) -> ActionContext:
         record = await self._repository.load_wake_event(request.wakeup_event_id)
         if record is None:
-            raise ContextDerivationError("wakeup event does not exist")
+            raise ContextDerivationError(
+                f"wakeup event does not exist (wakeup_event_id {request.wakeup_event_id}). Nothing was sent: "
+                "pass the wakeup_event_id of the wake you are handling, from its envelope."
+            )
         envelope = _mapping(record.envelope)
         message = _mapping(envelope.get("message"))
         raw = _mapping(record.raw_payload)
@@ -271,7 +274,11 @@ class ActionContextLoader:
             raw,
         )
         if not target.verified:
-            raise ContextDerivationError("verified target could not be derived")
+            raise ContextDerivationError(
+                "verified target could not be derived. Nothing was sent: check the recipient in arguments "
+                "(to_address, to_phone, channel_or_chat_id, calendar_id, thread_id ...) and send again; "
+                "if it is right, record needs_human."
+            )
 
         if aliases:
             resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
@@ -316,7 +323,11 @@ class ActionContextLoader:
             IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
         }
         if requires_property and property_id is None:
-            raise ContextDerivationError("verified property could not be derived")
+            raise ContextDerivationError(
+                f"verified property could not be derived. Nothing was sent: intent_kind {request.intent_kind} "
+                "needs a property this wake does not name. A plain reply can use intent_kind inquiry_reply; "
+                "otherwise record needs_human."
+            )
 
         if record.provenance == "internal_test":
             # A qualification send reaches only its dedicated test target;
@@ -336,7 +347,10 @@ class ActionContextLoader:
                 f"v1:wakeup:{request.wakeup_event_id}:role:{request.action_role}:ordinal:0",
             )
         else:
-            raise ContextDerivationError("unsupported wake provenance")
+            raise ContextDerivationError(
+                "unsupported wake provenance. Nothing was sent: this wake cannot send through the gateway; "
+                "record needs_human."
+            )
         showing_lifecycle_id = (
             _nonblank(raw.get("showing_lifecycle_id")) or _nonblank(raw.get("booking_id")) or f"showing:wake:{request.wakeup_event_id}"
         )
@@ -360,9 +374,15 @@ class ActionContextLoader:
                 or calendar_event_uid
             )
             if not calendar_event_uid:
-                raise ContextDerivationError("canonical calendar event UID is required")
+                raise ContextDerivationError(
+                    "canonical calendar event UID is required. Nothing was sent: pass the event's event_uid "
+                    "(or event_url) in arguments, from calendar_events_get."
+                )
             if not calendar_event_url or not calendar_event_etag:
-                raise ContextDerivationError("canonical calendar event revision is required")
+                raise ContextDerivationError(
+                    "canonical calendar event revision is required. Nothing was sent: pass the event's "
+                    "event_url and etag in arguments, from calendar_events_get."
+                )
 
         source_subject = _nonblank(record.subject)
         prospect_name = _nonblank(message.get("prospect_name")) or _nonblank(record.display_name)
@@ -813,7 +833,9 @@ class ActionContextLoader:
                 # manual_review (action a648bd51, 2026-09-16). Refuse at
                 # execute time instead so the agent sees why.
                 raise ContextDerivationError(
-                    f"no outbound email account is configured for provider {provider!r}"
+                    f"no outbound email account is configured for provider {provider!r}. Nothing was "
+                    "sent: this wake's source cannot send email through the gateway. Reply on another "
+                    "operation the gateway offers for it, or record needs_human."
                 )
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
@@ -842,7 +864,9 @@ class ActionContextLoader:
                 # Refuse now, where the agent sees why, instead of recording a
                 # send no worker can ever deliver (wake 27269).
                 raise ContextDerivationError(
-                    f"no Quo line is configured for provider {provider!r}"
+                    f"no Quo line is configured for provider {provider!r}. Nothing was sent: this "
+                    "wake's source cannot text through the gateway. Reply on another operation the "
+                    "gateway offers for it, or record needs_human."
                 )
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
@@ -856,7 +880,12 @@ class ActionContextLoader:
                     or not record.source_channel_id
                     or request.arguments.channel_or_chat_id != record.source_channel_id
                 ):
-                    raise ContextDerivationError("Cliq reply target must match the inbound chat")
+                    raise ContextDerivationError(
+                        "Cliq reply target must match the inbound chat. Nothing was sent: internal_reply is a "
+                        "cliq.chat.post back into the Cliq DM that woke this wake, with its chat id as "
+                        "channel_or_chat_id. To post anywhere else use cliq.channel.post "
+                        "(action_role internal_notification, intent_kind manual_review_alert)."
+                    )
             kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
             return DerivedTarget(kind, request.arguments.channel_or_chat_id, True), request.arguments.channel_or_chat_id
         assert isinstance(request.arguments, (CalendarCreateArguments, CalendarUpdateArguments, CalendarDeleteArguments))

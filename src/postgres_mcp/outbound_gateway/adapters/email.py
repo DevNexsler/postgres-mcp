@@ -77,6 +77,19 @@ class EmailAdapter:
                 copies.append(address)
         if copies:
             arguments["cc"] = [{"address": address} for address in copies]
+        # Agent Email's email_send takes inline base64 attachments (its
+        # content_type is our mime_type). Left out entirely when the action
+        # has none, so every earlier request is sent byte-for-byte as before.
+        attachments = context.arguments.get("attachments")
+        if attachments:
+            arguments["attachments"] = [
+                {
+                    "filename": attachment["filename"],
+                    "content_base64": attachment["content_base64"],
+                    "content_type": attachment["mime_type"],
+                }
+                for attachment in attachments
+            ]
         return ProviderRequest(
             server_name="agent-email",
             tool="email_send",

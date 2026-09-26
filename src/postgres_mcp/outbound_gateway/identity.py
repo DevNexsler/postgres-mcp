@@ -18,7 +18,9 @@ from .models import ExecuteRequest
 # Optional argument fields added after actions were already stored. Left out
 # when omitted, so every existing action keeps its stored arguments and
 # payload hash.
-LATER_OPTIONAL_ARGUMENTS = frozenset({"subject", "cc", "title", "duration_minutes", "location", "attendees"})
+LATER_OPTIONAL_ARGUMENTS = frozenset(
+    {"subject", "cc", "title", "duration_minutes", "location", "attendees", "attachments"}
+)
 
 
 def request_arguments(arguments: BaseModel) -> dict[str, Any]:
