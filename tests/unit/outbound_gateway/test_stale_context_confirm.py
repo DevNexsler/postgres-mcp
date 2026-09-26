@@ -36,19 +36,19 @@ from postgres_mcp.outbound_gateway.context import ACTION_NAMESPACE
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.context import canonical_payload_hash
+from postgres_mcp.outbound_gateway.legacy_judgment.preflight import PreflightEvidence as WorldEvidence
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import ConfirmRequest
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
+from postgres_mcp.outbound_gateway.models import NewerActivity
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
-from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
-from postgres_mcp.outbound_gateway.traffic_control import NewerActivity
 
 WAKE = 27164
 CHAT = "1424728044450751028"
@@ -322,16 +322,43 @@ class LedgerStore:
 
 
 class LedgerProbe:
-    """Traffic probe over the same ledger: the shown set is read back from
-    the blocked rows exactly like the SQL reads it. `activity` is what the
-    channel-scoped probe can see; `elsewhere` are messages only the
-    cross-channel preflight finds (another channel of the same prospect)."""
+    """One fake world over the same ledger, read through both probe
+    interfaces: the current gateway's single `newer_context` query and the
+    frozen bf41be6 judgment's (activity_after, acknowledged_refs,
+    messages_by_id, context_watermark), so the parity tests run the same
+    world through both. The shown set is read back from the blocked rows
+    exactly like the SQL reads it.
+
+    `activity` is what the channel-scoped traffic probe saw; `elsewhere` are
+    messages only the old cross-channel preflight evidence found (another
+    channel of the same prospect); `related` are the ids that evidence
+    reported (StaticEvidence). The current query finds the union: activity
+    newer than the watermark, plus every related message that exists."""
 
     def __init__(self, store: LedgerStore, *activity: NewerActivity) -> None:
         self.store = store
         self.activity = list(activity)
         self.elsewhere: list[NewerActivity] = []
+        self.related: tuple[int, ...] = ()
         self.asked: list[tuple[datetime, frozenset[str]]] = []
+
+    def _shown(self, wakeup_event_id: int) -> frozenset[str]:
+        return frozenset(
+            ref
+            for row in self.store.rows.values()
+            if row.wakeup_event_id == wakeup_event_id and row.state is ActionState.STALE
+            for ref in row.stale_context_shown_refs
+        )
+
+    async def newer_context(self, context, *, limit, waive_shown, as_of=None):
+        shown = self._shown(context.wakeup_event_id) if waive_shown else frozenset()
+        self.asked.append((WATERMARK, shown))
+        found: dict[str, NewerActivity] = {item.ref: item for item in self.activity if item.occurred_at > WATERMARK}
+        for item in self.activity + self.elsewhere:
+            if item.message_id in self.related:
+                found.setdefault(item.ref, item)
+        unshown = [item for ref, item in found.items() if ref not in shown]
+        return sorted(unshown, key=lambda item: item.occurred_at, reverse=True)[:limit]
 
     async def in_flight_actions(self, recipient_key, exclude_action_id):
         return []
@@ -345,12 +372,7 @@ class LedgerProbe:
         return WATERMARK
 
     async def acknowledged_refs(self, wakeup_event_id, recipient_key):
-        return frozenset(
-            ref
-            for row in self.store.rows.values()
-            if row.wakeup_event_id == wakeup_event_id and row.state is ActionState.STALE
-            for ref in row.stale_context_shown_refs
-        )
+        return self._shown(wakeup_event_id)
 
     async def messages_by_id(self, message_ids):
         wanted = set(message_ids)
@@ -393,16 +415,22 @@ class CliqAdapter:
 
 
 class StaticEvidence:
-    def __init__(self, *later_inbound_message_ids: int) -> None:
-        self.later_inbound_message_ids = tuple(later_inbound_message_ids)
+    """The preflight evidence. The current gateway reads only its calendar
+    dependency; the frozen bf41be6 judgment also read the newer inbound ids
+    (its `newer_inbound` check), so the world evidence carries them."""
 
-    async def load(self, ctx: ActionContext) -> PreflightEvidence:
-        return PreflightEvidence(
+    def __init__(self, *later_inbound_message_ids: int, outbound: tuple[int, ...] = ()) -> None:
+        self.later_inbound_message_ids = tuple(later_inbound_message_ids)
+        self.later_outbound_message_ids = tuple(outbound)
+
+    async def load(self, ctx: ActionContext) -> WorldEvidence:
+        return WorldEvidence(
             current_recipient_id=ctx.target.target_id,
             current_property_id=ctx.property_id,
             current_appointment_slot=ctx.appointment_slot,
             later_inbound_message_id=max(self.later_inbound_message_ids) if self.later_inbound_message_ids else None,
             later_inbound_message_ids=self.later_inbound_message_ids,
+            later_outbound_message_ids=self.later_outbound_message_ids,
             calendar_dependency=CalendarDependencyState.NOT_REQUIRED,
             calendar_already_applied=False,
             calendar_context_changed=False,
@@ -415,11 +443,13 @@ class StaticEvidence:
 def harness(*activity: NewerActivity, evidence: StaticEvidence | None = None):
     store = LedgerStore()
     probe = LedgerProbe(store, *activity)
+    evidence = evidence or StaticEvidence()
+    probe.related = evidence.later_inbound_message_ids + evidence.later_outbound_message_ids
     adapter = CliqAdapter()
     service = OutboundActionService(
         store=store,
         context_loader=FakeLoader(),
-        evidence_loader=evidence or StaticEvidence(),
+        evidence_loader=evidence,
         adapters={Operation.CLIQ_CHAT_POST: adapter, Operation.QUO_SMS_SEND: adapter},
         provider_client=object(),
         clock=lambda: EXECUTED_AT,
@@ -461,7 +491,7 @@ async def test_wake_27164_refusal_is_a_question_with_the_cron_alert_as_new_conte
     assert result.detail_code == "stale_context"
     assert result.action_id == BLOCKED
     assert [(item.id, item.source, item.direction) for item in result.new_context] == [
-        ("message:750824", "zoho_cliq", "inbound")
+        ("message:750824", "zoho_cliq", "received")
     ]
     assert result.new_context[0].occurred_at == CRON_ALERT_AT
     assert f'"action_id": "{BLOCKED}", "decision": "yes"' in result.question
@@ -756,19 +786,57 @@ async def test_a_different_message_executed_after_the_refusal_is_the_revise_answ
 
 
 @pytest.mark.asyncio
-async def test_worker_resume_still_terminalizes_staleness_nobody_can_answer():
-    """resume() is the worker: no agent to ask, so a stale PREPARED row keeps
-    the terminal traffic_blocked failure that pages."""
+async def test_worker_resume_over_newer_context_is_a_deliberate_no_send_never_a_failure(caplog):
+    """resume() is the worker: nobody can be asked, so no answer means no
+    send. The action ends `stale` / stale_context_unasked (never the old
+    definitive_failed/traffic_blocked) and the newer items are logged."""
     service, store, _probe, adapter = harness(CRON_ALERT)
+    ctx = await FakeLoader().load(execute_request())
+    await store.create_or_load(ctx)
+    await store.prepare(ctx, ActionState.RECEIVED)
+
+    with caplog.at_level("WARNING"):
+        result = await service.resume(BLOCKED)
+
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked")
+    assert store.rows[BLOCKED].state is ActionState.STALE
+    assert store.rows[BLOCKED].error_category is None
+    assert ("claim", BLOCKED, ActionState.PREPARED) in store.calls
+    assert adapter.sent == []
+    logged = [record.getMessage() for record in caplog.records]
+    assert any("nobody to ask (worker)" in line and "message:750824" in line for line in logged), logged
+    # And it is not a question: confirm refuses it.
+    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+        await service.confirm(confirm(BLOCKED, "yes"))
+
+
+@pytest.mark.asyncio
+async def test_worker_resume_with_nothing_newer_sends_the_saved_record():
+    service, store, _probe, adapter = harness()
     ctx = await FakeLoader().load(execute_request())
     await store.create_or_load(ctx)
     await store.prepare(ctx, ActionState.RECEIVED)
 
     result = await service.resume(BLOCKED)
 
-    assert result.status is PublicStatus.FAILED
-    assert result.detail_code == "stale_context"
-    assert store.rows[BLOCKED].error_category == "traffic_blocked"
+    assert result.status is PublicStatus.SENT
+    assert adapter.sent == ["pong"]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_ready_row_over_newer_context_ends_stale_unasked_not_sent():
+    """A retry nobody can be asked about, over newer context: the same
+    deliberate stale_context_unasked no-send (the retry_ready -> stale edge
+    comes with the pending Comm-Data-Store migration), never definitive_failed."""
+    service, store, _probe, adapter = harness(CRON_ALERT)
+    ctx = await FakeLoader().load(execute_request())
+    row = await store.create_or_load(ctx)
+    store.rows[BLOCKED] = replace(row, state=ActionState.RETRY_READY, action_uid=BLOCKED)
+
+    result = await service.resume(BLOCKED)
+
+    assert (store.rows[BLOCKED].state, result.detail_code) == (ActionState.STALE, "stale_context_unasked")
+    assert ("claim", BLOCKED, ActionState.RETRY_READY) in store.calls
     assert adapter.sent == []
 
 
@@ -827,37 +895,33 @@ async def test_late_ingested_inbound_sent_before_the_shown_one_asks_again():
 
 
 @pytest.mark.asyncio
-async def test_cross_channel_inbound_the_probe_cannot_see_asks_again_on_the_successor():
-    """The staleness probe reads the recipient's channel; the Zillow/Quo
-    preflight reads every channel of the prospect. An inbound only the
-    preflight sees was never shown: the successor asks about it instead of
-    being silently suppressed."""
+async def test_cross_channel_inbound_is_in_the_same_first_question():
+    """One query reads every channel of the prospect: an inbound on another
+    channel is listed in the first question, not held back for a second one
+    on the successor. Yes then sends."""
     other_channel = replace(QUO_TEXT, message_id=751000, source="zillow", preview="replying by email too")
     service, store, probe, adapter = harness(QUO_TEXT, evidence=StaticEvidence(750824, 751000))
     probe.elsewhere.append(other_channel)
     blocked = await service.execute(quo_reply_request())
 
-    asked = await service.confirm(confirm(blocked.action_id, "yes"))
+    assert blocked.status is PublicStatus.NEEDS_CONFIRMATION
+    assert {item.id for item in blocked.new_context} == {"message:750824", "message:751000"}
+    assert set(store.rows[blocked.action_id].stale_context_shown_refs) == {"message:750824", "message:751000"}
 
-    assert asked.status is PublicStatus.NEEDS_CONFIRMATION, asked
-    assert [item.id for item in asked.new_context] == ["message:751000"]
-    assert store.rows[SUCCESSOR_REPLY].stale_context_shown_refs == ("message:751000",)
-    assert adapter.sent == []
-
-    sent = await service.confirm(confirm(SUCCESSOR_REPLY, "yes"))
+    sent = await service.confirm(confirm(blocked.action_id, "yes"))
     assert sent.status is PublicStatus.SENT, sent
     assert adapter.sent == ["Yes, Friday at 10 still works."]
 
 
 @pytest.mark.asyncio
-async def test_multiple_related_inbounds_are_waived_only_as_the_shown_set():
-    """The old waiver checked max(id) only. Here the newest inbound was shown
-    and an older one was not: max-only would have waived both."""
+async def test_only_the_shown_set_is_waived_never_everything_older_than_it():
+    """Waived by identity, never by max(id) or time: an older inbound found
+    only after the question was asked is asked about on the successor."""
     older = replace(QUO_TEXT, message_id=750800, occurred_at=CRON_ALERT_AT - timedelta(seconds=5), preview="first")
     service, store, probe, adapter = harness(QUO_TEXT, evidence=StaticEvidence(750800, 750824))
-    probe.elsewhere.append(older)
     blocked = await service.execute(quo_reply_request())
     assert [item.id for item in blocked.new_context] == ["message:750824"]
+    probe.elsewhere.append(older)  # found only now
 
     result = await service.confirm(confirm(blocked.action_id, "yes"))
 
@@ -867,12 +931,26 @@ async def test_multiple_related_inbounds_are_waived_only_as_the_shown_set():
 
 
 @pytest.mark.asyncio
-async def test_first_execute_keeps_the_existing_newer_inbound_suppression():
-    """No question was asked yet, so nothing is waived and nothing is asked
-    by the preflight: a newer inbound's own wake owns the reply (#1236)."""
-    service, _store, _probe, adapter = harness(evidence=StaticEvidence(751000))
+async def test_a_newer_inbound_on_first_execute_is_a_question_never_a_silent_stale():
+    """The preflight's newer_inbound no-send is gone: a newer message from
+    the prospect is shown and the agent decides. `no` ends as the same
+    deliberate `stale` no-send; nothing ends definitive_failed."""
+    newer = replace(QUO_TEXT, message_id=751000, preview="actually, can we do Saturday?")
+    service, store, probe, adapter = harness(evidence=StaticEvidence(751000))
+    probe.elsewhere.append(newer)
+
     result = await service.execute(quo_reply_request())
-    assert result.status is PublicStatus.STALE and result.detail_code == "newer_inbound"
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION
+    assert result.detail_code == "stale_context"
+    assert [(item.id, item.direction) for item in result.new_context] == [("message:751000", "received")]
+    assert "a message was received" in result.detail
+    assert adapter.sent == []
+
+    declined = await service.confirm(confirm(result.action_id, "no"))
+    assert declined.status is PublicStatus.STALE
+    assert store.rows[result.action_id].state is ActionState.STALE
+    assert all(row.state is not ActionState.DEFINITIVE_FAILED for row in store.rows.values())
     assert adapter.sent == []
 
 
@@ -988,7 +1066,7 @@ async def test_wire_shape_of_needs_confirmation_and_of_an_ordinary_result():
         {
             "id": "message:750824",
             "source": "zoho_cliq",
-            "direction": "inbound",
+            "direction": "received",
             "sender": "Dan Park",
             "occurred_at": CRON_ALERT_AT.isoformat().replace("+00:00", "Z"),
             "preview": "wait, is that cron alert about the gateway you are testing?",
@@ -1048,3 +1126,60 @@ async def test_the_same_message_again_after_context_drift_asks_again_and_is_not_
     assert again.action_id == BLOCKED
     assert store.rows[BLOCKED].stale_context_decision is None
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_question_that_cannot_be_recorded_sends_nothing_and_raises():
+    """No stale situation ends definitive_failed: if the question itself
+    cannot be written (a concurrent writer, a missing migration), nothing is
+    sent, the row is left as it was, and the MCP error means "nothing was
+    sent" -- the same execute asks again."""
+    service, store, _probe, adapter = harness(CRON_ALERT)
+
+    async def unrecordable(*_args, **_kwargs):
+        raise RuntimeError("function block_outbound_stale_context does not exist")
+
+    store.block_stale_context = unrecordable
+    with pytest.raises(RuntimeError, match=r"could not be recorded .* nothing was sent"):
+        await service.execute(execute_request())
+
+    assert adapter.sent == []
+    assert store.rows[BLOCKED].state is ActionState.RECEIVED
+    assert not [call for call in store.calls if call[0] == "definitive_fail"]
+
+
+@pytest.mark.asyncio
+async def test_another_wakes_send_is_listed_as_sent_by_us(caplog):
+    """A send another wake's agent made to this recipient after the context
+    was built is news to this agent: listed as sent by us."""
+    other = NewerActivity(
+        direction="outbound",
+        source="outbound_actions",
+        occurred_at=CRON_ALERT_AT,
+        preview="pong from another wake",
+        message_id=None,
+        action_id=action_id_for(WAKE - 1, "internal_reply", 0),
+        sender="outbound gateway (cliq.chat.post)",
+    )
+    service, _store, _probe, adapter = harness(other)
+
+    result = await service.execute(execute_request())
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION
+    assert [(item.id, item.direction) for item in result.new_context] == [(other.ref, "sent by us")]
+    assert "a message was sent by us" in result.detail
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_only_logs_the_question(caplog):
+    service, store, _probe, adapter = harness(CRON_ALERT)
+    service._stale._mode = "shadow"
+
+    with caplog.at_level("WARNING"):
+        result = await service.execute(execute_request())
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.sent == ["pong"]
+    assert not [call for call in store.calls if call[0] == "block_stale"]
+    assert any("shadow would-ask" in record.getMessage() and "message:750824" in record.getMessage() for record in caplog.records)

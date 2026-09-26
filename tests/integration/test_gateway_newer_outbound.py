@@ -8,7 +8,7 @@ management@pfg.io on cc. The pre-fix preflight took the cron post for "we
 already replied" and completed the email as duplicate/already_handled.
 
 Everything the gateway reads runs as SQL here -- the wake/context load, the
-preflight evidence query, the traffic probe. Only the outbound_actions ledger
+calendar evidence query, the stale-context query. Only the outbound_actions ledger
 writes (CDS stored functions) are the migration-192 fake of the unit tests, and
 the provider is a recorder.
 
@@ -135,7 +135,8 @@ SCHEMA = """
         id bigint PRIMARY KEY, canonical_message_id bigint, source text, source_message_id text,
         sent_at timestamptz, created_at timestamptz, updated_at timestamptz, subject text, body text,
         user_account_id text, channel_id bigint, sender_participant_id bigint,
-        recipient_participant_id bigint, raw_event_id bigint, direction text
+        recipient_participant_id bigint, raw_event_id bigint, direction text,
+        received_at timestamptz  -- when it reached CDS (created_at is sent_at in production)
     );
     CREATE TEMP TABLE hermes_wakeup_events (
         id bigint PRIMARY KEY, source text, source_event_id text, created_at timestamptz,
@@ -154,6 +155,11 @@ SCHEMA = """
         stale_context_shown_refs text[], provider_message_id text
     );
     CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
+    -- These scenario rows reach CDS when they are sent.
+    CREATE FUNCTION pg_temp.received_when_sent() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN NEW.received_at := coalesce(NEW.received_at, NEW.sent_at); RETURN NEW; END $$;
+    CREATE TRIGGER received_when_sent BEFORE INSERT ON messages
+        FOR EACH ROW EXECUTE FUNCTION pg_temp.received_when_sent();
 """
 
 
@@ -289,8 +295,8 @@ async def add_quo_outbound(conn, message_id: int, *, to: str, at: datetime, conv
 
 
 class Probe:
-    """The real traffic probe, except that the shown set is read from the fake
-    ledger (the ledger's writes are the part that is faked)."""
+    """The real stale-context query, except that the shown set is waived from
+    the fake ledger (the ledger's writes are the part that is faked)."""
 
     def __init__(self, repository: OutboundGatewayRepository, store: Any) -> None:
         self._repository = repository
@@ -299,13 +305,15 @@ class Probe:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._repository, name)
 
-    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]:
-        return frozenset(
+    async def newer_context(self, context, *, limit, waive_shown, as_of=None):
+        found = await self._repository.newer_context(context, limit=100, waive_shown=False, as_of=as_of)
+        shown = {
             ref
             for row in self._store.rows.values()
-            if row.wakeup_event_id == wakeup_event_id and row.state.value == "stale"
+            if waive_shown and row.wakeup_event_id == context.wakeup_event_id and row.state.value == "stale"
             for ref in row.stale_context_shown_refs
-        )
+        }
+        return [item for item in found if item.ref not in shown][:limit]
 
 
 def build(conn):
@@ -422,7 +430,7 @@ async def test_an_earlier_email_to_the_same_prospect_is_shown_and_the_agent_answ
         service, store, adapter = build(conn)
         asked = await service.execute(email_request())
         assert asked.status is PublicStatus.NEEDS_CONFIRMATION, asked
-        assert [(item.id, item.direction, item.sender) for item in asked.new_context] == [("message:806300", "outbound", "sent by us (Nigel Pine)")]
+        assert [(item.id, item.direction, item.sender) for item in asked.new_context] == [("message:806300", "sent by us", "Nigel Pine")]
         revised = None
         if decision == "revise":
             revised = email_request("Following up: did the application link come through?").arguments.model_dump(mode="json", exclude_none=True)
@@ -482,14 +490,61 @@ async def test_this_wakes_own_earlier_send_is_not_newer_context(conn):
 
 
 @pytest.mark.asyncio
-async def test_a_quo_reply_after_we_already_texted_that_prospect_is_asked(conn):
+async def test_a_text_we_sent_on_the_wake_channel_before_its_watermark_was_in_the_agents_context(conn):
+    """DECLARED (was asked by the bf41be6 newer-outbound question): the wake's
+    own channel is the agent's context up to the watermark, so our text at
+    +2 min -- before the wake was built at +5 min -- is not news."""
     await add_quo_outbound(conn, 9002, to=QUO_PROSPECT, at=QUO_SOURCE_AT + timedelta(minutes=2), conversation="CN-prospect")
-    service, store, adapter = build(conn)
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(sms_request())
+
+    assert result.status is PublicStatus.SENT, result
+    assert adapter.sent == ["Saturday at 9 works, see you then."]
+
+
+@pytest.mark.asyncio
+async def test_a_text_we_sent_that_prospect_after_the_watermark_is_asked(conn):
+    await add_quo_outbound(conn, 9004, to=QUO_PROSPECT, at=QUO_SOURCE_AT + timedelta(minutes=6), conversation="CN-prospect")
+    service, _store, adapter = build(conn)
 
     result = await service.execute(sms_request())
 
     assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
-    assert [(item.id, item.source, item.direction) for item in result.new_context] == [("message:9002", "quo", "outbound")]
+    assert [(item.id, item.source, item.direction) for item in result.new_context] == [("message:9004", "quo", "sent by us")]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_her_new_text_after_the_watermark_is_the_same_question(conn):
+    """Newer inbound is the same question (was: a silent stale/newer_inbound)."""
+    payload = {
+        "data": {
+            "object": {
+                "id": "AC-in-2",
+                "from": QUO_PROSPECT,
+                "to": [QUO_LINE_PHONE],
+                "direction": "incoming",
+                "phoneNumberId": QUO_LINE,
+                "conversationId": "CN-prospect",
+            }
+        }
+    }
+    at = QUO_SOURCE_AT + timedelta(minutes=7)
+    await conn.execute("INSERT INTO raw_events VALUES (9005, %s)", (Jsonb(payload),))
+    await conn.execute(
+        "INSERT INTO messages VALUES (9005, NULL, 'quo', 'AC-in-2', %s, %s, %s, NULL, 'actually can we do Sunday?', "
+        "NULL, 18, 5001, NULL, 9005, 'inbound')",
+        (at, at, at),
+    )
+    service, store, adapter = build(conn)
+
+    asked = await service.execute(sms_request())
+
+    assert asked.status is PublicStatus.NEEDS_CONFIRMATION, asked
+    assert [(item.id, item.direction) for item in asked.new_context] == [("message:9005", "received")]
+    declined = await service.confirm(answer(asked.action_id, "no", wake=QUO_WAKE))
+    assert declined.status is PublicStatus.STALE
     assert adapter.sent == []
 
 

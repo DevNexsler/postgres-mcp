@@ -34,11 +34,16 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+# The traffic-control staleness block this backtest judged is gone (one
+# stale-context question since the one-stale-question change); both sides run
+# as they were: the frozen check and each side's probe from git.
+from postgres_mcp.outbound_gateway.legacy_judgment.traffic_control import check_traffic
 from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
-from postgres_mcp.outbound_gateway.traffic_control import check_traffic
 from postgres_mcp.sql import SqlDriver
 
 BASELINE_COMMIT = "12ebe21355d393edd287fa97aa7c6bfbb9eba2d1"
+# The last commit with the fixed probe (activity_after / newest_activity_after).
+FIXED_COMMIT = "bf41be6"
 
 
 def stamp(value):
@@ -139,22 +144,30 @@ def capture(path):
     print(json.dumps({"captured_actions": len(snapshot["actions"]), "captured_messages": len(snapshot["messages"])}))
 
 
-def old_repository():
-    """Freeze the pre-fix method from git; all its SQL still executes on PG."""
+def repository_at(commit, names=("newest_activity_after",)):
+    """Freeze probe methods from git; all their SQL still executes on PG."""
     root = Path(__file__).resolve().parents[2]
     source = subprocess.check_output(
-        ["git", "show", f"{BASELINE_COMMIT}:src/postgres_mcp/outbound_gateway/repository.py"],
+        ["git", "show", f"{commit}:src/postgres_mcp/outbound_gateway/repository.py"],
         cwd=root,
         text=True,
     )
     tree = ast.parse(source)
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "OutboundGatewayRepository")
-    method = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "newest_activity_after")
+    methods = [node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
     import postgres_mcp.outbound_gateway.repository as module
 
     namespace = dict(module.__dict__)
-    exec(compile(ast.Module(body=[method], type_ignores=[]), "<pre-fix-probe>", "exec"), namespace)
-    return type("PreFixRepository", (OutboundGatewayRepository,), {method.name: namespace[method.name]})
+    exec(compile(ast.Module(body=methods, type_ignores=[]), f"<probe@{commit}>", "exec"), namespace)
+    return type(f"Repository_{commit[:7]}", (OutboundGatewayRepository,), {node.name: namespace[node.name] for node in methods})
+
+
+def old_repository():
+    return repository_at(BASELINE_COMMIT)
+
+
+def fixed_repository():
+    return repository_at(FIXED_COMMIT, ("newest_activity_after", "activity_after", "context_watermark", "acknowledged_refs"))
 
 
 async def load_snapshot(conn, snapshot):
@@ -249,7 +262,7 @@ async def replay(snapshot, dsn):
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
         await load_snapshot(conn, snapshot)
         driver = SqlDriver(conn=conn)
-        old, fixed = baseline_class(driver), OutboundGatewayRepository(driver)
+        old, fixed = baseline_class(driver), fixed_repository()(driver)
         for index, original in enumerate(snapshot["actions"]):
             action = dict(original)
             wake = wakes.get(action["wakeup_event_id"])

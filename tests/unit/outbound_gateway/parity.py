@@ -1,21 +1,27 @@
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false
-"""Differential harness: the frozen pre-split service vs the current one.
+"""Differential harness: the frozen bf41be6 send judgment vs the current one.
 
-Each scenario runs twice -- once through LegacyOutboundActionService (the
-service exactly as it was before it was split into modules) and once through
-OutboundActionService -- with every collaborator instrumented. A run's trace
-is the ordered list of everything externally visible:
+Each scenario runs twice -- once through LegacyJudgmentService (the gateway's
+service, stale-context question, preflight and traffic control exactly as
+deployed at bf41be6, legacy_judgment/) and once through OutboundActionService
+-- with every collaborator instrumented. A run's trace is the ordered list of
+everything externally visible:
 
 - every public service call and its PublicResult (status, action_id,
   detail_code, detail, ...) or raised exception;
 - every store call with its arguments and returned row;
-- every adapter, context-loader, evidence-loader, traffic-probe and circuit
-  call with its arguments and result;
+- every adapter, context-loader, evidence-loader, probe and circuit call with
+  its arguments and result;
 - every log record the gateway emits.
 
-Two runs are equal when their traces are equal after UUIDs are replaced by
-their order of first appearance (a scenario that mints uuid4()s mints them in
-the same order on both sides, or the traces differ anyway).
+UUIDs are replaced by their order of first appearance.
+
+The simplification changes behaviour on purpose, so equality is judged in
+steps (see `compare`): identical traces; the same observable outcome (the
+store writes, provider calls and public results -- reads and logs differ
+because the detection is now one query); the same outcome up to the
+question's wording; and otherwise the FIRST observable divergence must be one
+of the DECLARED differences, each a named predicate. Anything else fails.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import dataclasses
 import inspect
 import itertools
 import logging
+import os
 import re
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -37,7 +44,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from postgres_mcp.outbound_gateway.legacy_service import LegacyOutboundActionService
+from postgres_mcp.outbound_gateway.legacy_judgment import LegacyJudgmentService
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 
 _UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -58,7 +65,14 @@ STORE_METHODS = (
 )
 ADAPTER_METHODS = ("build_request", "invoke", "poll", "parse_receipt", "reconcile")
 LOADER_METHODS = ("load", "suggest_targets")
-PROBE_METHODS = ("in_flight_actions", "activity_after", "context_watermark", "acknowledged_refs", "messages_by_id")
+PROBE_METHODS = (
+    "in_flight_actions",
+    "newer_context",
+    "activity_after",
+    "context_watermark",
+    "acknowledged_refs",
+    "messages_by_id",
+)
 PUBLIC_METHODS = (
     "execute",
     "enqueue",
@@ -243,7 +257,7 @@ class tapped_logs:  # noqa: N801 -- used as a context manager
         self._logger.propagate = self._propagate
 
 
-SIDES: tuple[type, type] = (LegacyOutboundActionService, OutboundActionService)
+SIDES: tuple[type, type] = (LegacyJudgmentService, OutboundActionService)
 
 
 async def run_side(service_cls: type, scenario: Callable[[type], Any]) -> Trace:
@@ -262,11 +276,241 @@ async def run_side(service_cls: type, scenario: Callable[[type], Any]) -> Trace:
     return trace
 
 
-async def assert_parity(scenario: Callable[[type], Any]) -> Trace:
+# ----------------------------------------------------------------------------
+# Comparing a changed judgment: observable outcome, wording, declared changes
+# ----------------------------------------------------------------------------
+
+IDENTICAL = "identical"
+# Only reads and log lines differ: the newer-context detection is one query
+# (probe.newer_context) instead of four reads plus the evidence arms.
+SAME_OUTCOME = "same_outcome_one_query"
+# Only the question's words differ: one detail text for received and sent by
+# us, direction "received" / "sent by us", the plain sender name.
+WORDING = "question_wording"
+
+_TOKEN = re.compile(r"uuid#\d+")
+
+
+def _retokenize(events: list[Any]) -> list[Any]:
+    """Renumber UUID tokens by first appearance in `events` (a projection
+    drops the reads that first mentioned some of them)."""
+    seen: dict[str, str] = {}
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return _TOKEN.sub(lambda match: seen.setdefault(match.group(0), f"id#{len(seen)}"), value)
+        if isinstance(value, tuple):
+            return tuple(walk(item) for item in value)
+        return value
+
+    return [walk(event) for event in events]
+
+
+def observable(events: list[Any]) -> list[Any]:
+    """What the world sees: public calls and their results or raises, every
+    store write and every provider (adapter) call. Not reads, not logs."""
+    kept = []
+    for event in events:
+        event = event[1]  # a normalized event is ("tuple", (kind, label, ...))
+        kind = event[0]
+        if kind in {"service", "service_return", "service_raise", "scenario_raised", "scenario_completed"}:
+            kept.append(event)
+        elif kind in {"call", "raise"} and ((event[1].startswith("store.") and event[1] != "store.get") or event[1].startswith("adapter.")):
+            kept.append(event)
+    return _retokenize(kept)
+
+
+def _mask_wording(value: Any) -> Any:
+    """Blank the question's words: a needs_confirmation result's detail,
+    question and each item's direction/sender, and the confirmation-disabled
+    refusal's text."""
+    if isinstance(value, str):
+        if "stale_context confirmation is not enabled on this gateway" in value:
+            return "<confirmation disabled refusal>"
+        return value
+    if not isinstance(value, tuple):
+        return value
+    if len(value) == 2 and value[0] == "dict" and isinstance(value[1], tuple):
+        pairs = value[1]
+        keys = {pair[0] for pair in pairs if isinstance(pair, tuple) and len(pair) == 2}
+        status = dict(pair for pair in pairs if isinstance(pair, tuple) and len(pair) == 2).get("status")
+        if "status" in keys and status == "needs_confirmation":
+            return (
+                "dict",
+                tuple((key, "<words>") if key in {"detail", "question"} else (key, _mask_wording(item)) for key, item in pairs),
+            )
+        if {"id", "direction", "sender", "preview"} <= keys:
+            return ("dict", tuple((key, "<label>") if key in {"direction", "sender"} else (key, item) for key, item in pairs))
+    return tuple(_mask_wording(item) for item in value)
+
+
+def _call(event: Any, label: str) -> bool:
+    return event is not None and event[0] == "call" and event[1] == label
+
+
+_SEND_PATH = frozenset(
+    {
+        "store.prepare",
+        "store.claim",
+        "store.transition",
+        "store.schedule_next_attempt",
+        "adapter.build_request",
+        "adapter.invoke",
+    }
+)
+
+
+def _refs(event: Any) -> set[str]:
+    return set(re.findall(r"(?:message|action):[\w#-]+", repr(event)))
+
+
+def _result(event: Any) -> dict[str, Any] | None:
+    if event is None or event[0] != "service_return" or not isinstance(event[2], tuple) or event[2][0] != "PublicResult":
+        return None
+    return dict(event[2][1][1])
+
+
+def _this_call(events: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The events up to and including the end of the public call they are in."""
+    for index, event in enumerate(events):
+        if event[0] in {"service_return", "service_raise"}:
+            return events[: index + 1]
+    return events
+
+
+def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
+    legacy_rest: tuple[Any, ...],
+    current_rest: tuple[Any, ...],
+    *,
+    prefix: tuple[Any, ...],
+    current_logs: str,
+    current_queried: bool = True,
+) -> str | None:
+    """Name the declared difference that explains the FIRST observable
+    divergence; `*_rest` start at it. Everything after it follows from it."""
+    legacy = legacy_rest[0] if legacy_rest else None
+    current = current_rest[0] if current_rest else None
+    old, new = repr(_this_call(legacy_rest)), repr(_this_call(current_rest))
+    legacy_result, current_result = _result(legacy), _result(current)
+    # The override resend of a legacy traffic_blocked row needed the terminal
+    # block that no longer exists.
+    if _call(legacy, "store.remediate_traffic_block"):
+        return "traffic_block_override_resend_removed"
+    # recipient/context mismatch and the calendar STALE/DUPLICATE verdicts:
+    # unreachable in production (test_preflight proves it); only a
+    # hand-built evidence object reaches them.
+    if any(code in old for code in ("recipient_mismatch", "context_mismatch", "calendar_context_changed", "has no provider receipt")):
+        return "unreachable_preflight_verdict_removed"
+    # A question that cannot be recorded: nothing is sent and the call
+    # raises (was: the terminal traffic_blocked failure).
+    if current is not None and current[0] == "service_raise" and "could not be recorded" in new:
+        return "unrecordable_question_raises_nothing_sent"
+    # No answer means no send: where nobody can be asked (worker, Restate
+    # prepare, confirmation off, retry_ready) unshown newer context ends the
+    # action as a `stale_context_unasked` no-send (retry_ready included).
+    # The legacy terminal-failed, preflight-staled, deferred -- or sent.
+    if "stale_context_unasked" in new and "stale_context_unasked" not in old:
+        return "unasked_newer_context_is_a_stale_no_send"
+    asked = "store.block_stale_context" in new or (current_result is not None and current_result.get("status") == "needs_confirmation")
+    legacy_stale_verdict = (
+        "newer_inbound" in old
+        or ("store.definitive_fail" in old and "traffic_blocked" in old)
+        or (legacy_result is not None and legacy_result.get("detail_code") == "stale_context" and legacy_result.get("status") != "needs_confirmation")
+    )
+    # One switch: in OUTBOUND_TRAFFIC_CONTROL=shadow the question is only
+    # logged. The legacy's preflight newer_inbound and newer-outbound
+    # question ignored the mode.
+    if not asked and "stale-context shadow would-" in current_logs and (legacy_stale_verdict or "store.block_stale_context" in old):
+        return "shadow_mode_only_logs"
+    # A stale verdict of the legacy (preflight newer_inbound `stale`, the
+    # terminal traffic_blocked failure, the stale_context deferral): now the
+    # question -- or, where nobody can be asked, the normal gate goes on.
+    if legacy_stale_verdict and "store.block_stale_context" not in old:
+        if asked:
+            return "newer_inbound_is_the_question"
+        # OUTBOUND_TRAFFIC_CONTROL=off (or no probe) now switches off every
+        # stale check; the legacy preflight's newer_inbound ignored it.
+        if not current_queried:
+            return "traffic_control_off_means_no_stale_check"
+        # The one query waives what this wake's agent was already shown, with
+        # confirmation on or off; the legacy waived nothing while it was off.
+        return "already_shown_items_are_not_new"
+    # The legacy newer-outbound question ignored override=true (the
+    # historical "yes"); the one question takes it as yes for every item.
+    last_call = next((event for event in reversed(prefix) if event[0] == "service"), None)
+    if (
+        legacy_result is not None
+        and legacy_result.get("status") == "needs_confirmation"
+        and _call(current, "store.confirm_stale_context")
+        and "('decision', 'yes')" in repr(current)
+        and "('override', True)" in repr(last_call)
+    ):
+        return "override_is_yes_for_every_item"
+    # One query lists received AND sent-by-us items from every arm at once:
+    # the question is a superset of what the legacy asked.
+    if _call(legacy, "store.block_stale_context") and _call(current, "store.block_stale_context"):
+        if _refs(legacy) <= _refs(current):
+            return "one_question_lists_every_newer_item"
+    if legacy_result is not None and current_result is not None:
+        if legacy_result.get("status") == current_result.get("status") == "needs_confirmation" and _refs(legacy_result.get("new_context")) <= _refs(
+            current_result.get("new_context")
+        ):
+            return "one_question_lists_every_newer_item"
+    # The legacy never looked where the one check now asks: its newer_inbound
+    # check covered prospect replies only, and a re-executed prepared (or
+    # waiting) row went to dispatch without any preflight look.
+    if asked and "store.block_stale_context" not in old:
+        return "asked_where_legacy_never_looked"
+    return None
+
+
+def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
+    """(name, where): IDENTICAL, SAME_OUTCOME, WORDING, a declared difference,
+    or raises AssertionError naming the first unexplained divergence."""
+    if legacy.events == current.events:
+        return IDENTICAL, ""
+    plain_old, plain_new = observable(legacy.events), observable(current.events)
+    if plain_old == plain_new:
+        return SAME_OUTCOME, ""
+    old, new = _mask_wording(tuple(plain_old)), _mask_wording(tuple(plain_new))
+    if old == new:
+        return WORDING, ""
+    index = next(i for i, (before, after) in enumerate(itertools.zip_longest(old, new)) if before != after)
+    if index == len(old) and plain_old[:index] != plain_new[:index]:
+        # The legacy stopped (a replayed test's assertion on the words failed)
+        # after an identical course that differed only in wording.
+        return WORDING, ""
+    logs = " | ".join(str(event[1][3]) for event in current.events if event[1][0] == "log")
+    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current.events)
+    name = _declared(old[index:], new[index:], prefix=old[:index], current_logs=logs, current_queried=queried)
+    before = old[index] if index < len(old) else None
+    after = new[index] if index < len(new) else None
+    where = f"observable event {index}:\n  legacy : {before!r}\n  current: {after!r}"
+    if name is None:
+        raise AssertionError(f"undeclared difference at {where}")
+    return name, where
+
+
+def record_declared(layer: str, name: str) -> None:
+    """Tally every comparison (PARITY_COUNTS_FILE=path appends `layer<TAB>name`)."""
+    path = os.environ.get("PARITY_COUNTS_FILE")
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{layer}\t{name}\n")
+
+
+async def assert_parity(scenario: Callable[[type], Any], *, layer: str = "generated", strict: bool = False) -> str:
+    """Run `scenario` through both sides. strict: the traces must be
+    identical (a harness self-test). Otherwise returns the comparison's name
+    (see compare) and fails only on an undeclared difference."""
     legacy, current = [await run_side(side, scenario) for side in SIDES]
-    if legacy.events != current.events:
-        raise AssertionError(_first_difference(legacy.events, current.events))
-    return current
+    if strict:
+        if legacy.events != current.events:
+            raise AssertionError(_first_difference(legacy.events, current.events))
+        return IDENTICAL
+    name, _where = compare(legacy, current)
+    record_declared(layer, name)
+    return name
 
 
 def _first_difference(legacy: list[Any], current: list[Any]) -> str:
@@ -311,10 +555,12 @@ def existing_scenarios(module: ModuleType) -> list[tuple[str, Callable[..., Any]
     return found
 
 
-async def replay_existing(module: ModuleType, function: Callable[..., Any], case: dict[str, Any], caplog: Any) -> Trace:
+async def replay_existing(module: ModuleType, function: Callable[..., Any], case: dict[str, Any], caplog: Any) -> str:
     """Run an existing test through both sides (its module's
-    OutboundActionService swapped for each), asserting identical traces.
-    The test's own assertions run on both sides too."""
+    OutboundActionService swapped for each). The test's own assertions
+    describe the current gateway: they must pass on the current side. The
+    two traces are compared like any scenario (see compare); a legacy-side
+    assertion failure is only the declared difference showing."""
 
     traces = []
     original = module.OutboundActionService
@@ -341,7 +587,15 @@ async def replay_existing(module: ModuleType, function: Callable[..., Any], case
             module.OutboundActionService = original
         traces.append(trace)
     legacy, current = traces
-    if legacy.events != current.events:
-        raise AssertionError(_first_difference(legacy.events, current.events))
     assert current.events[-1] == current.normalize(("test_passed",)), current.events[-1]
-    return current
+    if legacy.events[-1] != legacy.normalize(("test_passed",)):
+        # Red on the frozen judgment, green on the current gateway.
+        record_declared("existing_red_on_legacy", function.__name__)
+    # The verdict lines are the tests' own; compare what the gateway did.
+    legacy.events = [event for event in legacy.events if event[0] not in {"test_passed", "test_failed"}]
+    current.events = current.events[:-1]
+    name, _where = compare(legacy, current)
+    record_declared("existing", name)
+    if os.environ.get("PARITY_NAMES"):
+        record_declared("existing_names", f"{name}\t{function.__name__}")
+    return name

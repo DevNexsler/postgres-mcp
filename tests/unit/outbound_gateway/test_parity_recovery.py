@@ -1,11 +1,13 @@
 # pyright: reportArgumentType=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
-"""Parity: worker recovery in recovery.py vs the pre-split service.
+"""Parity: worker recovery (recovery.py) vs the frozen bf41be6 service.
 
-Every scenario runs through LegacyOutboundActionService (the service as it was
-before the split, with exhaust's hand-tracked lease flag) and
-OutboundActionService (delegating to ActionRecovery and its transition
-plans), and must produce the identical trace -- public results, store calls,
-adapter calls, log records. See parity.py.
+Worker recovery proved identical to the pre-split service when it was split
+out (PR #46). The same scenarios now run through LegacyJudgmentService (the
+service as deployed at bf41be6, legacy_judgment/) and OutboundActionService,
+so recovery stays proven unchanged by the one-stale-question simplification:
+traces must match, or differ only as parity.compare declares (a resume that
+used to hit the stale verdicts; a hand-built evidence object that reached the
+removed recipient/context checks). See parity.py.
 
 Layers:
 
@@ -319,7 +321,7 @@ async def _recovery_parity(core, variant) -> None:
         except Exception:  # noqa: BLE001 -- the raise is in the trace
             pass
 
-    await assert_parity(scenario)
+    await assert_parity(scenario, layer="recovery")
 
 
 @pytest.mark.asyncio

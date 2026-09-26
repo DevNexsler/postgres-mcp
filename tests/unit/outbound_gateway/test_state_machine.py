@@ -23,7 +23,9 @@ EXPECTED_TRANSITIONS = {
     ActionState.PROVIDER_ACCEPTED: {ActionState.COMPLETED, ActionState.UNKNOWN},
     ActionState.UNKNOWN: {ActionState.RECONCILING, ActionState.DEAD_LETTER},
     ActionState.RECONCILING: {ActionState.COMPLETED, ActionState.UNKNOWN, ActionState.RETRY_READY, ActionState.DEAD_LETTER},
-    ActionState.RETRY_READY: {ActionState.DISPATCHING, ActionState.DEFINITIVE_FAILED, ActionState.DEAD_LETTER},
+    # STALE: the retry_ready -> stale edge of the pending Comm-Data-Store
+    # migration (stale_context_unasked); re-verify once it lands.
+    ActionState.RETRY_READY: {ActionState.DISPATCHING, ActionState.DEFINITIVE_FAILED, ActionState.DEAD_LETTER, ActionState.STALE},
     ActionState.DEAD_LETTER: {ActionState.MANUAL_REVIEW},
     ActionState.MANUAL_REVIEW: {ActionState.COMPLETED, ActionState.DEFINITIVE_FAILED},
     ActionState.COMPLETED: set(),

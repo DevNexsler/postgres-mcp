@@ -1,25 +1,32 @@
-"""The stale-context question: needs_confirmation -> confirm yes | no | revise.
+"""The one judgment the gateway makes: "since your context was built, a new
+message was received from or sent to this recipient -- still send yours?"
 
-When newer activity reached a recipient after the agent's context was built,
-the gateway does not decide for the agent: it records the refused message as a
-`stale` no-send, shows the agent what it has not seen, and asks. That includes
-outbound we already sent to the action's own target after the source message
-(direction outbound, labelled as sent by us): the gateway never completes a
-send as "already handled" on the agent's behalf. The agent
-answers `yes` (send it unchanged), `no` (send nothing) or `revise` (send a
-corrected message, same operation, recipient and target).
+At the agent's own execute (and at a confirm's yes/revise), every message
+received from, or sent by us to, this action's recipient after the wake's
+context watermark, and not yet shown to this wake's agent, is listed in a
+`needs_confirmation` / `stale_context` result. Nothing is sent. The agent
+answers `yes` (send it unchanged), `no` (send nothing: the row stays a
+deliberate `stale` no-send) or `revise` (same recipient, new content).
+
+Nothing else about freshness is decided anywhere. Where nobody can be asked
+-- the worker resuming a saved action, Restate preparing one, confirmation
+disabled, a retry_ready row -- no answer means no send: if anything newer is
+unshown, the action ends as a deliberate `stale` no-send with detail
+`stale_context_unasked` (a retry_ready row too: the retry_ready -> stale
+edge comes with the Comm-Data-Store migration this change deploys after),
+never definitive_failed, and the items are logged. A newer inbound gets its own wake, whose agent sees everything. With
+nothing newer, the saved record is sent.
 
 Two layers:
 
 - a pure core -- what an execute or a confirm means for the question, whether
-  a revise is legal, which inbound was already shown, and the question itself;
-- `StaleContextQuestions`, the only I/O: the ledger (block, answer), the
-  traffic probe (what is newer, what was shown) and the context loader (a
+  a revise is legal, and the question itself;
+- `StaleContextQuestions`, the only I/O: the ledger (block, answer), the probe
+  (what is newer and unshown -- one query) and the context loader (a
   revise's context).
 
-Driving an answered successor through the send gate (traffic, preflight,
-dispatch) is the service's; it is handed in as `drive_answered`, and a block
-that cannot be recorded falls back to the service's `terminal_block`.
+Driving an answered successor through the send gate is the service's; it is
+handed in as `drive_answered`.
 """
 
 from __future__ import annotations
@@ -27,13 +34,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable
 from collections.abc import Callable
-from dataclasses import replace as dataclass_replace
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from typing import Mapping
+from typing import Protocol
+from uuid import UUID
 
 from pydantic import ValidationError
 
+from .adapters.base import ProviderDisposition
+from .adapters.base import ProviderObservation
 from .context import ActionContext
 from .context import ActionContextLoader
 from .identity import same_request
@@ -44,38 +55,102 @@ from .models import ActionState
 from .models import ConfirmRequest
 from .models import ContextItem
 from .models import ExecuteRequest
+from .models import NewerActivity
 from .models import PublicResult
 from .models import PublicStatus
 from .models import StaleContextDecision
-from .preflight import PreflightDecision
-from .preflight import PreflightEvidence
-from .preflight import PreflightOutcome
 from .record import ActionStore
 from .record import OutboundActionRecord
 from .record import action_result
 from .record import require_action
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
-from .traffic_control import CONFIRM_REFUSAL_NOTICE
-from .traffic_control import CONTEXT_ITEM_LIMIT
-from .traffic_control import CONTEXT_PREVIEW_CHARS
-from .traffic_control import NewerActivity
-from .traffic_control import TrafficProbe
-from .traffic_control import TrafficVerdict
-from .traffic_control import list_stale_context
-from .traffic_control import stale_context_question
-from .traffic_control import stale_context_verdict
 
 # The service's logger, as before the split: operators' filters key on it.
 logger = logging.getLogger("postgres_mcp.outbound_gateway.service")
 
 # States with a legal edge into `stale` (outbound_action_transition_allowed,
-# Comm-Data-Store migration 153): a stale_context refusal can become a
-# confirmable no-send only from these. retry_ready has no such edge.
+# Comm-Data-Store migration 153): only these can hold a question.
 STALE_BLOCKABLE_STATES = frozenset({ActionState.RECEIVED, ActionState.PREPARED, ActionState.DEPENDENCY_WAIT})
 
-STALE_CONTEXT_SUCCESSOR_REASONS = frozenset({"stale_context_confirmed", "stale_context_revised"})
-
 DECLINED_DETAIL = "Declined: nothing was sent for this action. This is a recorded no-send, not a failure."
+
+# Nobody could be asked and something newer was unshown: a deliberate no-send.
+# Not a stale_context question (confirm refuses it; STALE_CONTEXT_DETAILS).
+UNASKED_DETAIL_CODE = "stale_context_unasked"
+UNASKED_DETAIL = (
+    "Not sent: newer messages reached this recipient since your context was built, and nobody could be "
+    "asked about them. This is a deliberate no-send, not a failure."
+)
+
+# How many newer items a question lists. The newest are shown; anything older
+# stays unshown, so it asks again after the answer.
+CONTEXT_ITEM_LIMIT = 10
+CONTEXT_PREVIEW_CHARS = 300
+
+# Every refused confirm says this. A refused answer is a decision about the
+# message, never a gateway outage: it must not open the guarded Cliq DM
+# fallback or any other route around the gateway.
+CONFIRM_REFUSAL_NOTICE = (
+    "This refusal is not a gateway infrastructure failure: it does not permit the direct "
+    "Cliq fallback or any other route around the outbound gateway."
+)
+
+
+class NewerContextProbe(Protocol):
+    async def newer_context(self, context: ActionContext, *, limit: int, waive_shown: bool) -> list[NewerActivity]:
+        """Every message received from, or sent to, this action's recipient
+        after the wake's context watermark, newest first, at most `limit`.
+        waive_shown=True leaves out every item this wake's agent was already
+        shown for this recipient (by identity, never by timestamp)."""
+        ...
+
+
+@dataclass(frozen=True)
+class StaleQuestion:
+    newer: tuple[NewerActivity, ...]  # newest first, capped at CONTEXT_ITEM_LIMIT
+    truncated: bool
+
+    @property
+    def shown_refs(self) -> tuple[str, ...]:
+        return tuple(item.ref for item in self.newer)
+
+    @property
+    def detail(self) -> str:
+        newest = self.newer[0]
+        more = f" and {len(self.newer) - 1} more" if len(self.newer) > 1 else ""
+        omitted = " (older items omitted; you will be asked about them next)" if self.truncated else ""
+        return (
+            f"Refused - stale context: since your context was built, a message was {newest.label} "
+            f'({newest.ref.replace(":", " ")} via {newest.source} at {newest.occurred_at.isoformat()}: '
+            f'"{newest.preview}"){more}{omitted}. Still send? Answer with op=confirm: yes, no, or revise.'
+        )
+
+
+def stale_question(found: list[NewerActivity]) -> StaleQuestion | None:
+    if not found:
+        return None
+    ordered = tuple(sorted(found, key=lambda item: item.occurred_at, reverse=True))
+    return StaleQuestion(newer=ordered[:CONTEXT_ITEM_LIMIT], truncated=len(ordered) > CONTEXT_ITEM_LIMIT)
+
+
+def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
+    """The exact three-way question the agent answers: yes, no, or revise.
+
+    Wake 27138 was once told "resend with override=true", the override path
+    could not work, and the agent left the gateway for the provider directly.
+    The answer is a first-class gateway call, and the only one."""
+    base = f'"op": "confirm", "wakeup_event_id": {wakeup_event_id}, "action_id": "{action_id}"'
+    return (
+        "Refused - stale context: nothing was sent, because the messages in new_context are newer than "
+        "your context (direction received = from the recipient; sent by us = a message we already sent "
+        "this recipient). Read them, then answer exactly once with outbound_action. "
+        f'YES - send your message unchanged: {{{base}, "decision": "yes"}}. '
+        f'NO - send nothing (the new context makes it redundant or wrong): {{{base}, "decision": "no"}}. '
+        f'REVISE - send a corrected message instead: {{{base}, "decision": "revise", '
+        '"arguments": {<the same arguments with only the message content changed>}}; '
+        "the operation, intent, slot, recipient and target must stay the same. "
+        "One answer per action. Never send it any other way: circumventing the outbound gateway is never an option."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -92,7 +167,7 @@ def refusal(message: str) -> ValueError:
 def confirmation_disabled() -> ValueError:
     return refusal(
         "confirm refused: stale_context confirmation is not enabled on this gateway; "
-        "a stale_context refusal from it is final."
+        "there is no question to answer."
     )
 
 
@@ -102,10 +177,6 @@ def awaits_stale_confirmation(action: OutboundActionRecord) -> bool:
         and action.detail_code == STALE_CONTEXT_DETAIL
         and action.stale_context_decision is None
     )
-
-
-def is_stale_context_successor(action: OutboundActionRecord) -> bool:
-    return action.remediation_reason in STALE_CONTEXT_SUCCESSOR_REASONS
 
 
 class ExecuteAnswer(Enum):
@@ -209,138 +280,20 @@ def revised_request(parent: OutboundActionRecord, arguments: Mapping[str, Any]) 
     return revised
 
 
-def asks_on_block(action: OutboundActionRecord, verdict: TrafficVerdict, *, agent_facing: bool) -> bool:
-    """With confirmation enabled, an enforced stale_context block on the
-    agent's own execute/confirm becomes a question instead of a terminal
-    failure -- when there is something to show and the row can become
-    `stale`. Worker-driven resume()/prepare() have nobody to ask."""
-    return (
-        agent_facing
-        and verdict.reason == "stale_context"
-        and bool(verdict.shown_refs)
-        and action.state in STALE_BLOCKABLE_STATES
-    )
-
-
-def later_inbound(evidence: PreflightEvidence) -> tuple[int, ...]:
-    return tuple(
-        evidence.later_inbound_message_ids
-        or ((evidence.later_inbound_message_id,) if evidence.later_inbound_message_id is not None else ())
-    )
-
-
-def waive_shown(evidence: PreflightEvidence, shown: frozenset[str]) -> tuple[PreflightEvidence, tuple[int, ...]]:
-    """The evidence restricted to the newer inbound and outbound NOT in
-    `shown` (by message id, never by timestamp), and the unshown inbound ids."""
-    unshown = tuple(message_id for message_id in later_inbound(evidence) if f"message:{message_id}" not in shown)
-    unshown_outbound = tuple(
-        message_id for message_id in evidence.later_outbound_message_ids if f"message:{message_id}" not in shown
-    )
-    return (
-        dataclass_replace(
-            evidence,
-            later_inbound_message_id=max(unshown) if unshown else None,
-            later_inbound_message_ids=unshown,
-            later_outbound_message_ids=unshown_outbound,
-        ),
-        unshown,
-    )
-
-
-# Preflight outcomes that lead toward a send (now, or after the calendar
-# dependency): the ones an unshown newer outbound turns into a question.
-_SENDING_OUTCOMES = frozenset({PreflightOutcome.READY, PreflightOutcome.DEPENDENCY_WAIT})
-
-
-def asks_about_outbound(
-    action: OutboundActionRecord,
-    decision: PreflightDecision,
-    outbound: tuple[int, ...],
-    *,
-    agent_facing: bool,
-) -> bool:
-    """An outbound to this action's target, sent after the source message and
-    never shown to this wake's agent, is asked about before a send -- on the
-    agent's own execute or confirm, while the row can still become `stale`."""
-    return (
-        agent_facing
-        and bool(outbound)
-        and decision.outcome in _SENDING_OUTCOMES
-        and action.state in STALE_BLOCKABLE_STATES
-    )
-
-
-def sent_by_us(item: NewerActivity) -> NewerActivity:
-    """Label an outbound item as ours for the agent reading new_context."""
-    if item.direction != "outbound":
-        return item
-    return dataclass_replace(item, sender=f"sent by us ({item.sender})" if item.sender else "sent by us")
-
-
-def newer_outbound_verdict(items: list[NewerActivity]) -> TrafficVerdict | None:
-    """The question over outbound we already sent to the action's target."""
-    if not items:
-        return None
-    ordered = tuple(sorted((sent_by_us(item) for item in items), key=lambda item: item.occurred_at, reverse=True))
-    newer = ordered[:CONTEXT_ITEM_LIMIT]
-    newest = newer[0]
-    more = f" and {len(newer) - 1} more" if len(newer) > 1 else ""
-    omitted = " (older items omitted; you will be asked about them next)" if len(ordered) > CONTEXT_ITEM_LIMIT else ""
-    detail = (
-        "Not sent yet - stale context: since the message you are answering, we already sent this recipient "
-        f"a message (direction outbound, sent by us): {newest.ref.replace(':', ' ')} via {newest.source} at "
-        f'{newest.occurred_at.isoformat()}: "{newest.preview}"{more}{omitted}. Nothing was decided for you. '
-        "Read new_context, then answer with op=confirm: yes (send yours as well), no (it is already covered), "
-        "or revise."
-    )
-    return TrafficVerdict(
-        allowed=False,
-        reason="stale_context",
-        detail=detail,
-        check_failed=False,
-        newer=newer,
-        truncated=len(ordered) > CONTEXT_ITEM_LIMIT,
-    )
-
-
-def asks_about_unshown(
-    action: OutboundActionRecord,
-    decision: PreflightDecision,
-    unshown: tuple[int, ...],
-    *,
-    agent_facing: bool,
-) -> bool:
-    """After the agent answered, an inbound it was never shown asks again on
-    the successor instead of silently suppressing the send it confirmed."""
-    return (
-        agent_facing
-        and decision.outcome is PreflightOutcome.STALE
-        and decision.detail_code == "newer_inbound"
-        and bool(unshown)
-        and is_stale_context_successor(action)
-        and action.state in STALE_BLOCKABLE_STATES
-    )
-
-
-def needs_confirmation(action: OutboundActionRecord, verdict: TrafficVerdict | None) -> PublicResult:
+def needs_confirmation(action: OutboundActionRecord, question: StaleQuestion | None) -> PublicResult:
     """The question: the newer context (oldest first) and how to answer."""
-    newer = verdict.newer if verdict is not None else ()
+    newer = question.newer if question is not None else ()
     items = tuple(
         ContextItem(
             id=item.ref,
             source=item.source,
-            direction=item.direction,
+            direction=item.label,
             sender=item.sender,
             occurred_at=item.occurred_at,
             preview=item.preview[:CONTEXT_PREVIEW_CHARS],
         )
-        # verdict.newer is newest first; the agent reads oldest -> newest.
+        # question.newer is newest first; the agent reads oldest -> newest.
         for item in reversed(newer)
-    )
-    detail = (
-        verdict.detail
-        if verdict is not None and verdict.detail
-        else "Refused - stale context: this message is still awaiting your yes/no answer."
     )
     return PublicResult(
         status=PublicStatus.NEEDS_CONFIRMATION,
@@ -349,7 +302,7 @@ def needs_confirmation(action: OutboundActionRecord, verdict: TrafficVerdict | N
         provider_request_ref=None,
         retryable=True,
         detail_code=STALE_CONTEXT_DETAIL,
-        detail=detail,
+        detail=question.detail if question is not None else "Refused - stale context: this message is still awaiting your yes/no answer.",
         new_context=items,
         question=stale_context_question(wakeup_event_id=action.wakeup_event_id, action_id=action.action_id),
     )
@@ -362,9 +315,6 @@ def needs_confirmation(action: OutboundActionRecord, verdict: TrafficVerdict | N
 DriveAnswered = Callable[..., Awaitable[PublicResult]]
 """drive_answered(successor, *, dispatch) -> result: the service's send gate."""
 
-TerminalBlock = Callable[[OutboundActionRecord, ActionContext, TrafficVerdict], Awaitable[PublicResult]]
-"""terminal_block(action, context, verdict) -> result: the pre-192 traffic_blocked failure."""
-
 
 class StaleContextQuestions:
     """Asks, re-asks and records answers to the stale_context question."""
@@ -374,28 +324,114 @@ class StaleContextQuestions:
         *,
         store: ActionStore,
         context_loader: ActionContextLoader,
-        traffic_probe: TrafficProbe | None,
+        probe: NewerContextProbe | None,
         actor: str,
         enabled: bool,
+        mode: str,
         drive_answered: DriveAnswered,
-        terminal_block: TerminalBlock,
+        lease_seconds: int = 60,
     ):
         self._store = store
         self._context_loader = context_loader
-        self._probe = traffic_probe
+        self._probe = probe
         self._actor = actor
-        # OUTBOUND_STALE_CONFIRM_ENABLED. Off (default) is the pre-192 gateway:
-        # a stale_context block is the terminal traffic_blocked failure and
-        # confirm is refused. Turn it on only after Comm-Data-Store's reconciler
-        # (which reads a confirmed successor's outcome) is live and migration
-        # 192 is applied; before that a successor's failure would be invisible.
+        # OUTBOUND_STALE_CONFIRM_ENABLED. Off: never ask, and never send
+        # stale -- an action with unshown newer context ends as a
+        # `stale_context_unasked` no-send -- and confirm is refused.
         self.enabled = enabled
+        self._lease_seconds = lease_seconds
+        # OUTBOUND_TRAFFIC_CONTROL: off (never look), shadow (log what would
+        # be asked), enforce (ask).
+        self._mode = mode
         self._drive_answered = drive_answered
-        self._terminal_block = terminal_block
 
-    @property
-    def can_ask(self) -> bool:
-        return self.enabled and self._probe is not None
+    async def check(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        *,
+        agent_facing: bool,
+        confirm: bool = False,
+        dispatch: bool = True,
+    ) -> PublicResult | None:
+        """The one stale-context check, before any send. Returns the question
+        (or, where nobody can be asked, the `stale_context_unasked` no-send),
+        or None: send. confirm=True (override=true) records the question and
+        answers yes at once."""
+        if self._mode == "off" or self._probe is None:
+            return None
+        askable = agent_facing and self.enabled and action.state in STALE_BLOCKABLE_STATES
+        try:
+            question = stale_question(
+                await self._probe.newer_context(context, limit=CONTEXT_ITEM_LIMIT + 1, waive_shown=True)
+            )
+        except Exception:
+            # Fail-open: a broken check must never stop outbound traffic.
+            logger.warning(
+                "stale-context check failed for action %s on wake %s; the send proceeds",
+                action.action_id,
+                context.wakeup_event_id,
+                exc_info=True,
+            )
+            return None
+        if question is None:
+            return None
+        if self._mode == "shadow":
+            logger.warning(
+                "stale-context shadow would-%s: wake=%s action=%s newer=%s",
+                "ask" if askable else "not send",
+                context.wakeup_event_id,
+                action.action_id,
+                ",".join(question.shown_refs),
+            )
+            return None
+        if not askable:
+            return await self._end_unasked(action, context, question, agent_facing=agent_facing)
+        return await self._block(action, context, question, confirm=confirm, dispatch=dispatch)
+
+    async def _end_unasked(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        question: StaleQuestion,
+        *,
+        agent_facing: bool,
+    ) -> PublicResult | None:
+        """No answer means no send: end the action as a deliberate
+        `stale_context_unasked` no-send, retry_ready included (its edge into
+        `stale` comes with the Comm-Data-Store migration this change deploys
+        after). None (send as before) only for a state that cannot hold this,
+        which no caller reaches."""
+        if action.state not in STALE_BLOCKABLE_STATES | {ActionState.RETRY_READY}:
+            return None
+        target = ActionState.STALE
+        logger.warning(
+            "newer context and nobody to ask (%s): wake=%s action=%s state=%s newer=%s; not sent (%s)",
+            "confirmation disabled" if agent_facing and not self.enabled else ("agent" if agent_facing else "worker"),
+            context.wakeup_event_id,
+            action.action_id,
+            action.state.value,
+            ",".join(question.shown_refs),
+            target.value,
+        )
+        current, lease_owner = action, None
+        if action.state is not ActionState.RECEIVED:
+            # claim_outbound_action's whitelist: prepared, dependency_wait,
+            # retry_ready (a received row transitions without a lease).
+            current = await self._store.claim(action.action_id, action.state, self._actor, self._lease_seconds)
+            lease_owner = self._actor
+        ended = await self._store.transition(
+            current.action_id,
+            current.state,
+            target,
+            lease_owner,
+            ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                UNASKED_DETAIL_CODE,
+                evidence={"newer": list(question.shown_refs)},
+            ),
+        )
+        return action_result(ended, detail=UNASKED_DETAIL)
 
     async def confirm(self, request: ConfirmRequest, *, dispatch: bool) -> PublicResult:
         """Answer a needs_confirmation (stale_context) result.
@@ -403,10 +439,9 @@ class StaleContextQuestions:
         `no` records the decline and sends nothing. `yes` mints (once) a
         successor carrying the same payload; `revise` mints one carrying the
         revised content to the same target. Either successor is driven through
-        the same gate every execute passes -- in-flight lease, recipient
-        safety, intent lock, preflight -- with only the context items the agent
-        was SHOWN waived. With dispatch=False (TenantCloud) the successor is
-        preflighted and prepared for Restate instead of dispatched inline."""
+        the same gate every execute passes, with only the items the agent was
+        SHOWN waived. With dispatch=False (TenantCloud) the successor is
+        prepared for Restate instead of dispatched inline."""
         if not self.enabled:
             raise confirmation_disabled()
         parent = await require_action(self._store, request.action_id)
@@ -448,170 +483,65 @@ class StaleContextQuestions:
         return await self._drive_answered(successor, dispatch=dispatch)
 
     async def reask(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        """The agent re-executed a message whose stale_context question is
-        still unanswered. Ask again, listing everything newer than the wake's
+        """The agent re-executed a message whose question is still
+        unanswered. Ask again, listing everything newer than the wake's
         context, and add what it now saw to the shown set."""
-        verdict = None
+        question = None
         if self._probe is not None:
-            verdict = await list_stale_context(
-                self._probe,
-                recipient_key=context.prospect_id,
-                channel_id=context.channel_id,
-                wakeup_event_id=context.wakeup_event_id,
-                action_id=action.action_id,
-                logger=logger,
-            )
-        if verdict is not None and verdict.shown_refs:
             try:
-                action = await self._store.block_stale_context(action.action_id, ActionState.STALE, None, verdict.shown_refs)
+                question = stale_question(
+                    await self._probe.newer_context(context, limit=CONTEXT_ITEM_LIMIT + 1, waive_shown=False)
+                )
+            except Exception:
+                logger.warning("stale-context listing failed for wake %s", context.wakeup_event_id, exc_info=True)
+        if question is not None:
+            try:
+                action = await self._store.block_stale_context(action.action_id, ActionState.STALE, None, question.shown_refs)
             except Exception:
                 logger.warning("stale-context shown set could not be extended for action %s", action.action_id, exc_info=True)
-        return needs_confirmation(action, verdict)
+        return needs_confirmation(action, question)
 
-    async def block(
+    async def _block(
         self,
         action: OutboundActionRecord,
         context: ActionContext,
-        verdict: TrafficVerdict,
+        question: StaleQuestion,
         *,
         confirm: bool,
         dispatch: bool,
     ) -> PublicResult:
         """Record the refused message as a confirmable `stale` no-send and
-        ask; confirm=True (override=true) answers yes at once."""
+        ask. A question that cannot be recorded sends nothing and raises
+        (the MCP error means: nothing was sent; the same execute asks again)."""
         try:
-            blocked = await self._record_block(action, verdict)
-        except Exception:
-            # Migration 192 not applied (or a concurrent writer moved the
-            # row): keep the pre-192 contract rather than dispatching.
+            blocked = await self._store.block_stale_context(
+                action.action_id,
+                action.state,
+                None if action.state is ActionState.RECEIVED else self._actor,
+                question.shown_refs,
+            )
+        except Exception as exc:
             logger.error(
-                "stale_context block for action %s on wake %s could not be recorded as a "
-                "confirmable no-send; falling back to the terminal traffic block",
+                "stale_context question for action %s on wake %s could not be recorded; nothing was sent",
                 action.action_id,
                 context.wakeup_event_id,
                 exc_info=True,
             )
-            current = await require_action(self._store, action.action_id)
-            return await self._terminal_block(current, context, verdict)
+            raise RuntimeError(
+                f"stale_context: newer messages reached this recipient, and the question about them could not be "
+                f"recorded for action {action.action_id}; nothing was sent. Execute the same request again."
+            ) from exc
         if confirm:
             logger.warning(
                 "override=true answered stale_context yes: wake=%s action=%s shown=%s",
                 context.wakeup_event_id,
                 blocked.action_id,
-                ",".join(verdict.shown_refs),
+                ",".join(question.shown_refs),
             )
             return await self.answer_and_drive(
                 blocked, StaleContextDecision.YES, None, wakeup_event_id=context.wakeup_event_id, dispatch=dispatch
             )
-        return needs_confirmation(blocked, verdict)
-
-    async def _record_block(self, action: OutboundActionRecord, verdict: TrafficVerdict) -> OutboundActionRecord:
-        return await self._store.block_stale_context(
-            action.action_id,
-            action.state,
-            None if action.state is ActionState.RECEIVED else self._actor,
-            verdict.shown_refs,
-        )
-
-    async def waive_shown_inbound(
-        self,
-        context: ActionContext,
-        evidence: PreflightEvidence,
-    ) -> tuple[PreflightEvidence, tuple[int, ...]]:
-        """A prospect reply's preflight declines to send over ANY inbound newer
-        than its source message (`newer_inbound`), across channels. An inbound
-        this wake's agent was SHOWN in a stale_context question -- by message
-        id, never by timestamp -- is no longer unseen context and is waived;
-        every other one still counts. The same holds for newer outbound to the
-        action's target. Returns the evidence restricted to the unshown items,
-        and the unshown inbound ids."""
-        later = later_inbound(evidence)
-        if not (later or evidence.later_outbound_message_ids) or not self.can_ask:
-            return evidence, later
-        assert self._probe is not None
-        try:
-            shown = await self._probe.acknowledged_refs(context.wakeup_event_id, context.prospect_id)
-        except Exception:
-            logger.warning(
-                "shown-context read failed on wake %s; waiving no newer inbound",
-                context.wakeup_event_id,
-                exc_info=True,
-            )
-            return evidence, later
-        return waive_shown(evidence, frozenset(shown))
-
-    async def ask_about_unshown_inbound(
-        self,
-        action: OutboundActionRecord,
-        context: ActionContext,
-        decision: PreflightDecision,
-        unshown: tuple[int, ...],
-        *,
-        agent_facing: bool,
-        dispatch: bool,
-    ) -> PublicResult | None:
-        """After the agent answered a stale_context question, an inbound it
-        was never shown (another channel of the same prospect, ingested late,
-        or past the display cap) asks again -- on the successor -- instead of
-        silently suppressing the send it just confirmed."""
-        if not (self.can_ask and asks_about_unshown(action, decision, unshown, agent_facing=agent_facing)):
-            return None
-        assert self._probe is not None
-        try:
-            items = await self._probe.messages_by_id(list(unshown))
-        except Exception:
-            logger.warning("unshown-inbound read failed for action %s", action.action_id, exc_info=True)
-            return None
-        verdict = stale_context_verdict(items)
-        if verdict is None:
-            return None
-        return await self.block(action, context, verdict, confirm=False, dispatch=dispatch)
-
-    async def ask_about_newer_outbound(
-        self,
-        action: OutboundActionRecord,
-        context: ActionContext,
-        decision: PreflightDecision,
-        evidence: PreflightEvidence,
-        *,
-        agent_facing: bool,
-        dispatch: bool,
-    ) -> PublicResult | None:
-        """Outbound we already sent to this action's target after the source
-        message is information, not a verdict: the agent is shown it (sent by
-        us) and answers yes, no or revise. Where nobody can be asked -- the
-        worker, confirmation disabled, a row that cannot become `stale`, a
-        read or ledger write that fails -- the gateway does not decide either:
-        None, and the send proceeds."""
-        outbound = evidence.later_outbound_message_ids
-        if not outbound or decision.outcome not in _SENDING_OUTCOMES:
-            return None
-        refs = ",".join(f"message:{message_id}" for message_id in outbound)
-        if not (self.can_ask and asks_about_outbound(action, decision, outbound, agent_facing=agent_facing)):
-            logger.warning(
-                "newer outbound to %s on wake %s (%s) not shown to an agent: nobody can be asked here; "
-                "the send for action %s proceeds",
-                context.prospect_id,
-                context.wakeup_event_id,
-                refs,
-                action.action_id,
-            )
-            return None
-        assert self._probe is not None
-        try:
-            verdict = newer_outbound_verdict(await self._probe.messages_by_id(list(outbound)))
-            if verdict is None:
-                return None
-            blocked = await self._record_block(action, verdict)
-        except Exception:
-            logger.warning(
-                "newer outbound (%s) could not be shown for action %s; the send proceeds",
-                refs,
-                action.action_id,
-                exc_info=True,
-            )
-            return None
-        return needs_confirmation(blocked, verdict)
+        return needs_confirmation(blocked, question)
 
     async def _answer(
         self,

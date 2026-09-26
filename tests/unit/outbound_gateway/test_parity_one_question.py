@@ -1,23 +1,30 @@
 # pyright: reportArgumentType=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
-"""Parity: the stale-context question in stale_context.py vs the pre-split service.
+"""Parity: the one stale-context question vs the frozen bf41be6 judgment.
 
-Every scenario runs through LegacyOutboundActionService (the service as it was
-before the split) and OutboundActionService (delegating to
-StaleContextQuestions), and must produce the identical trace -- public
-results, store calls, adapter/probe/loader calls, log records. See parity.py.
+Every scenario runs through LegacyJudgmentService (traffic-control staleness,
+the preflight's newer_inbound / recipient / context checks and the
+newer-outbound question, exactly as deployed at bf41be6) and the current
+OutboundActionService. Traces must be identical, or have the same observable
+outcome (store writes, provider calls, public results), or differ only in the
+question's words -- or their first observable divergence must be one of the
+DECLARED differences (parity.compare / parity._declared). Nothing else.
 
-Three layers:
+Layers:
 
-1. every existing unit test of the service and of the stale-context question,
-   replayed through both sides (their own assertions run on both sides too);
+1. every existing unit test of the service, the stale-context question and
+   the newer-outbound question, replayed through both sides (the tests
+   assert the current behaviour; they must pass on the current side);
 2. generated rows: every action state x stale detail x recorded decision x
-   due/not-due x each way an agent can touch the row (execute the same
-   message, a different one, override, enqueue, confirm yes/no/revise, a
-   revise that moves the target, a malformed revise, another wake's answer),
-   with confirmation on and off;
+   due/not-due x each way an agent can touch the row, confirmation on/off;
 3. generated conversations: seeded random sequences of executes, confirms,
-   worker resumes/prepares, newly arriving activity and ledger failures over
-   one ledger, across traffic modes and dispatch modes.
+   worker resumes/prepares, newly arriving activity and ledger failures;
+4. the judgment matrix: newer item kind (received on the channel, received
+   on another channel, sent by us to the target, another wake's send, an
+   unrelated item, none) x shown/unshown x role x path (execute on a new,
+   prepared, waiting or retry_ready row, enqueue, override, confirm
+   yes/no/revise, worker resume, prepare) x confirmation on/off x traffic mode.
+
+PARITY_COUNTS_FILE=<path> tallies every comparison by name.
 """
 
 from __future__ import annotations
@@ -33,30 +40,32 @@ import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import ConfirmRequest
+from postgres_mcp.outbound_gateway.models import NewerActivity
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import StaleContextDecision
-from postgres_mcp.outbound_gateway.traffic_control import NewerActivity
+from postgres_mcp.outbound_gateway.service import OutboundActionService
 
+from . import test_newer_outbound as outbound_tests
 from . import test_service as service_tests
 from . import test_stale_context_confirm as stale_tests
 from .parity import assert_parity
 from .parity import existing_scenarios
 from .parity import replay_existing
 
-EXISTING = [*existing_scenarios(stale_tests), *existing_scenarios(service_tests)]
+MODULES = {module.__name__: module for module in (stale_tests, service_tests, outbound_tests)}
+EXISTING = [scenario for module in MODULES.values() for scenario in existing_scenarios(module)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("name", "function", "case"), EXISTING, ids=[name for name, _f, _c in EXISTING])
-async def test_existing_scenario_is_identical_through_both_sides(name, function, case, caplog):
+async def test_existing_scenario_matches_or_differs_only_as_declared(name, function, case, caplog):
     del name
-    module = stale_tests if function.__module__ == stale_tests.__name__ else service_tests
-    await replay_existing(module, function, case, caplog)
+    await replay_existing(MODULES[function.__module__], function, case, caplog)
 
 
 def test_the_replay_covers_every_existing_scenario():
     assert len(EXISTING) >= 90
-    assert {function.__module__ for _n, function, _c in EXISTING} == {stale_tests.__name__, service_tests.__name__}
+    assert {function.__module__ for _n, function, _c in EXISTING} == set(MODULES)
 
 
 # ----------------------------------------------------------------------------
@@ -99,9 +108,7 @@ class FlakyLedger(stale_tests.LedgerStore):
     async def confirm_stale_context(self, action_id, *, wakeup_event_id, decision, actor, revision=None):
         if self.fail_confirm:
             raise RuntimeError("")
-        return await super().confirm_stale_context(
-            action_id, wakeup_event_id=wakeup_event_id, decision=decision, actor=actor, revision=revision
-        )
+        return await super().confirm_stale_context(action_id, wakeup_event_id=wakeup_event_id, decision=decision, actor=actor, revision=revision)
 
 
 def _build(
@@ -225,9 +232,7 @@ async def _touch(service, touch: str) -> None:
         "confirm_yes": lambda: service.confirm(_confirm(BLOCKED, "yes")),
         "confirm_no": lambda: service.confirm(_confirm(BLOCKED, "no")),
         "confirm_revise": lambda: service.confirm(_confirm(BLOCKED, "revise", {"text": "pong v2", "channel_or_chat_id": CHAT})),
-        "confirm_revise_target": lambda: service.confirm(
-            _confirm(BLOCKED, "revise", {"text": "pong", "channel_or_chat_id": "another-chat"})
-        ),
+        "confirm_revise_target": lambda: service.confirm(_confirm(BLOCKED, "revise", {"text": "pong", "channel_or_chat_id": "another-chat"})),
         "confirm_revise_malformed": lambda: service.confirm(_confirm(BLOCKED, "revise", {"text": 7, "surprise": True})),
         "confirm_revise_without_arguments": lambda: service.confirm(_confirm(BLOCKED, "revise", None)),
         "confirm_other_wake": lambda: service.confirm(_confirm(BLOCKED, "yes", wake=WAKE + 1)),
@@ -247,7 +252,7 @@ async def _row_case_parity(case) -> None:
         service, _probe = _build(service_cls, store=store, activity=[stale_tests.CRON_ALERT], enabled=enabled)
         await _touch(service, touch)
 
-    await assert_parity(scenario)
+    await assert_parity(scenario, layer="rows")
 
 
 async def assert_all(cases, check, describe) -> None:
@@ -263,7 +268,7 @@ async def assert_all(cases, check, describe) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", list(ActionState), ids=[state.value for state in ActionState])
-async def test_every_row_shape_answers_identically(state):
+async def test_every_row_shape_matches_or_differs_only_as_declared(state):
     cases = [case for case in ROW_CASES if case[0] is state]
     assert len(cases) == len(DETAILS) * len(DECISIONS) * 2 * len(TOUCHES)
     await assert_all(cases, _row_case_parity, _row_case_id)
@@ -272,14 +277,14 @@ async def test_every_row_shape_answers_identically(state):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("touch", TOUCHES)
-async def test_every_touch_of_an_awaiting_row_is_identical_with_confirmation_on_and_off(touch, enabled):
+async def test_every_touch_of_an_awaiting_row_matches_with_confirmation_on_and_off(touch, enabled):
     async def scenario(service_cls):
         store = stale_tests.LedgerStore()
         await _seed(store, ActionState.STALE, "stale_context", None, True)
         service, _probe = _build(service_cls, store=store, activity=[stale_tests.CRON_ALERT], enabled=enabled)
         await _touch(service, touch)
 
-    await assert_parity(scenario)
+    await assert_parity(scenario, layer="awaiting")
 
 
 # ----------------------------------------------------------------------------
@@ -326,7 +331,7 @@ def _conversation(seed: int) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch", range(CONVERSATIONS // 50))
-async def test_generated_conversations_are_identical(batch):
+async def test_generated_conversations_match_or_differ_only_as_declared(batch):
     seeds = range(batch * 50, (batch + 1) * 50)
     await assert_all(seeds, _conversation_parity, lambda seed: f"seed {seed} {_conversation(seed)}")
 
@@ -380,9 +385,7 @@ async def _conversation_parity(seed: int) -> None:
             elif step == "status_blocked":
                 await _attempt(service.status(BLOCKED))
             elif step == "new_activity":
-                probe.activity.append(
-                    replace(stale_tests.DAN_FOLLOW_UP, message_id=770000 + len(probe.activity), occurred_at=NOW)
-                )
+                probe.activity.append(replace(stale_tests.DAN_FOLLOW_UP, message_id=770000 + len(probe.activity), occurred_at=NOW))
             elif step == "flood_activity":
                 probe.activity.extend(_activity(12))
             elif step == "wake_terminal":
@@ -394,15 +397,15 @@ async def _conversation_parity(seed: int) -> None:
             elif step == "toggle_enabled":
                 service._stale_confirm_enabled = not service._stale_confirm_enabled
 
-    await assert_parity(scenario)
+    await assert_parity(scenario, layer="conversations")
 
 
 @pytest.mark.asyncio
 async def test_the_parity_harness_sees_a_real_difference():
-    """Guard against a harness that compares nothing: a service whose
-    stale-context detail differs by one character must be caught."""
+    """Guard against a harness that compares nothing: strict mode catches a
+    one-character change, and the declared comparison refuses a change that
+    no declared difference names."""
     from postgres_mcp.outbound_gateway import stale_context
-    from postgres_mcp.outbound_gateway.service import OutboundActionService
 
     from . import parity
 
@@ -412,81 +415,160 @@ async def test_the_parity_harness_sees_a_real_difference():
         service, _probe = _build(service_cls, store=store, activity=[stale_tests.CRON_ALERT])
         await _attempt(service.confirm(_confirm(BLOCKED, "no")))
 
+    assert await parity.assert_parity(scenario) == parity.IDENTICAL
     original = stale_context.DECLINED_DETAIL
     stale_context.DECLINED_DETAIL = original + "!"
     try:
         with pytest.raises(AssertionError, match="traces diverge"):
+            await parity.assert_parity(scenario, strict=True)
+        with pytest.raises(AssertionError, match="undeclared difference"):
             await parity.assert_parity(scenario)
     finally:
         stale_context.DECLINED_DETAIL = original
-    trace = await parity.run_side(OutboundActionService, scenario)
+    trace = await parity.run_side(parity.SIDES[1], scenario)
     assert ("call", "store.confirm_stale_context") in trace.kinds
 
 
 # ----------------------------------------------------------------------------
-# 4. Declared difference: newer outbound is a question (wake 27279)
+# 4. The judgment matrix
 # ----------------------------------------------------------------------------
 
+ITEM_KINDS = ("none", "received_channel", "received_elsewhere", "sent_to_target", "other_wake_send", "unrelated")
+ROLES = ("internal_reply", "prospect_reply")
+PATHS = (
+    "execute",
+    "execute_prepared",
+    "execute_dependency_wait",
+    "execute_retry_ready",
+    "enqueue",
+    "override",
+    "confirm_yes",
+    "confirm_no",
+    "confirm_revise",
+    "resume_prepared",
+    "resume_dependency_wait",
+    "resume_retry_ready",
+    "prepare_received",
+)
+MATRIX = list(itertools.product(ITEM_KINDS, (False, True), ROLES, PATHS, (True, False), ("enforce", "shadow")))
+ITEM_AT = stale_tests.CRON_ALERT_AT
 
-class _NewerOutboundEvidence(stale_tests.StaticEvidence):
-    """Evidence with an outbound we already sent to the action's target after
-    the source message (evidence.outbound_target)."""
 
-    def __init__(self, *outbound: int) -> None:
-        super().__init__()
-        self.outbound = tuple(outbound)
+def _matrix_item(kind: str) -> NewerActivity | None:
+    if kind == "none":
+        return None
+    if kind == "other_wake_send":
+        return NewerActivity(
+            direction="outbound",
+            source="outbound_actions",
+            occurred_at=ITEM_AT,
+            preview="another wake already replied",
+            message_id=None,
+            action_id=stale_tests.action_id_for(WAKE - 1, "prospect_reply", 0),
+            sender="outbound gateway (quo.sms.send)",
+        )
+    direction = "outbound" if kind == "sent_to_target" else "inbound"
+    return replace(stale_tests.QUO_TEXT, message_id=780000, direction=direction, preview=f"{kind} item")
 
-    async def load(self, ctx):
-        return replace(await super().load(ctx), later_outbound_message_ids=self.outbound)
+
+def _matrix_id(case) -> str:
+    kind, shown, role, path, enabled, mode = case
+    return f"{kind}-{'shown' if shown else 'unshown'}-{role}-{path}-{'on' if enabled else 'off'}-{mode}"
+
+
+async def _matrix_case_parity(case) -> None:
+    kind, shown, role, path, enabled, mode = case
+    item = _matrix_item(kind)
+
+    async def scenario(service_cls):
+        store = FlakyLedger()
+        request = stale_tests.execute_request() if role == "internal_reply" else stale_tests.quo_reply_request()
+        inbound: tuple[int, ...] = ()
+        outbound: tuple[int, ...] = ()
+        activity: list[NewerActivity] = []
+        if item is not None and kind in {"received_channel", "other_wake_send"}:
+            activity.append(item)
+        service, probe = _build(service_cls, store=store, activity=activity, enabled=enabled, traffic_mode=mode)
+        if item is not None and kind in {"received_elsewhere", "sent_to_target", "unrelated"}:
+            probe.elsewhere.append(item)
+        if kind == "received_elsewhere":
+            inbound = (780000,)
+        if kind == "sent_to_target":
+            outbound = (780000,)
+        evidence = stale_tests.StaticEvidence(*inbound, outbound=outbound)
+        service._evidence_loader = evidence
+        probe.related = inbound + outbound
+        ctx = await stale_tests.FakeLoader().load(request)
+        if shown and item is not None:
+            # Another of this wake's actions already showed the agent this item.
+            store.rows[SUCCESSOR] = replace(
+                await store.create_or_load(replace(ctx, action_id=SUCCESSOR)),
+                state=ActionState.STALE,
+                detail_code="stale_context",
+                stale_context_shown_refs=(item.ref,),
+            )
+        seeded = {
+            "execute_prepared": ActionState.PREPARED,
+            "execute_dependency_wait": ActionState.DEPENDENCY_WAIT,
+            "execute_retry_ready": ActionState.RETRY_READY,
+            "resume_prepared": ActionState.PREPARED,
+            "resume_dependency_wait": ActionState.DEPENDENCY_WAIT,
+            "resume_retry_ready": ActionState.RETRY_READY,
+            "prepare_received": ActionState.RECEIVED,
+        }.get(path)
+        if seeded is not None:
+            row = await store.create_or_load(ctx)
+            store.rows[row.action_id] = replace(row, state=seeded, action_uid=row.action_id if seeded is not ActionState.RECEIVED else None)
+        if path.startswith("execute"):
+            await _attempt(service.execute(request))
+        elif path == "enqueue":
+            await _attempt(service.enqueue(request))
+        elif path == "override":
+            await _attempt(service.execute(request.model_copy(update={"override": True})))
+        elif path.startswith("confirm_"):
+            first = await service.execute(request)
+            decision = path.removeprefix("confirm_")
+            arguments = None
+            if decision == "revise":
+                arguments = {**request.arguments.model_dump(mode="json", exclude_none=True), "text": "revised text"}
+            await _attempt(service.confirm(_confirm(first.action_id, decision, arguments)))
+        elif path.startswith("resume_"):
+            await _attempt(service.resume(ctx.action_id))
+        elif path == "prepare_received":
+            await _attempt(service.prepare(ctx.action_id))
+        if issubclass(service_cls, OutboundActionService):
+            unshown_item = item is not None and kind != "unrelated" and not shown and mode == "enforce"
+            _one_question_invariants(store, path, service=service, unshown_item=unshown_item, request=request)
+
+    await assert_parity(scenario, layer="matrix")
+
+
+def _one_question_invariants(store, path: str, *, service, unshown_item: bool, request) -> None:
+    """The design, checked on the current side of every matrix case: nothing
+    ends definitive_failed over staleness; the worker never asks, and over
+    unshown newer context it never sends -- a `stale_context_unasked`
+    no-send (retry_ready included); `no` is a deliberate `stale` no-send."""
+    states = {row.state for row in store.rows.values()}
+    assert ActionState.DEFINITIVE_FAILED not in states, path
+    if path.startswith(("resume_", "prepare_")):
+        assert not [call for call in store.calls if call[0] == "block_stale"], path
+        (adapter,) = {id(a): a for a in service._adapters.values()}.values()
+        action = store.rows[stale_tests.action_id_for(WAKE, request.action_role.value, 0)]
+        if unshown_item:
+            assert adapter.sent == [], path
+            assert action.detail_code == "stale_context_unasked", (path, action.state, action.detail_code)
+            assert action.state is ActionState.STALE, path
+        else:
+            assert action.detail_code != "stale_context_unasked", path
+    if path == "confirm_no":
+        declined = [row for row in store.rows.values() if row.stale_context_decision == "no"]
+        for row in declined:
+            assert row.state is ActionState.STALE and row.detail_code == "stale_context_declined"
 
 
 @pytest.mark.asyncio
-async def test_declared_difference_a_newer_outbound_to_the_target_is_asked_only_by_the_new_side():
-    """DECLARED, not a regression. The frozen pre-split service never saw newer
-    outbound as its own evidence: its only use was the retired already_handled
-    verdict, which completed wake 27279's email as a duplicate of a Cliq cron
-    post. The current service shows it to the agent as a stale_context
-    question; the legacy side, given the same evidence, simply sends. With no
-    newer outbound the two stay identical."""
-    from postgres_mcp.outbound_gateway.legacy_service import LegacyOutboundActionService
-    from postgres_mcp.outbound_gateway.service import OutboundActionService
-
-    from . import parity
-
-    ours = replace(
-        stale_tests.CRON_ALERT, direction="outbound", source="quo", message_id=760100, sender="Nigel Pine",
-        preview="ok great, I have you scheduled",
-    )
-
-    def scenario_with(outbound: tuple[int, ...]):
-        async def scenario(service_cls):
-            store = stale_tests.LedgerStore()
-            probe = stale_tests.LedgerProbe(store)
-            probe.elsewhere.append(ours)
-            adapter = stale_tests.CliqAdapter()
-            service = service_cls(
-                store=store,
-                context_loader=stale_tests.FakeLoader(),
-                evidence_loader=_NewerOutboundEvidence(*outbound),
-                adapters={Operation.QUO_SMS_SEND: adapter},
-                provider_client=object(),
-                clock=lambda: NOW,
-                lease_owner="outbound-gateway",
-                traffic_mode="enforce",
-                traffic_probe=probe,
-                stale_confirm_enabled=True,
-            )
-            await _attempt(service.execute(stale_tests.quo_reply_request()))
-
-        return scenario
-
-    await assert_parity(scenario_with(()))
-
-    legacy = await parity.run_side(LegacyOutboundActionService, scenario_with((760100,)))
-    current = await parity.run_side(OutboundActionService, scenario_with((760100,)))
-    assert legacy.events != current.events
-    assert ("call", "adapter.invoke") in legacy.kinds
-    assert ("call", "store.block_stale_context") not in legacy.kinds
-    assert ("call", "adapter.invoke") not in current.kinds
-    assert ("call", "probe.messages_by_id") in current.kinds
-    assert ("call", "store.block_stale_context") in current.kinds
+@pytest.mark.parametrize("kind", ITEM_KINDS)
+async def test_the_judgment_matrix_matches_or_differs_only_as_declared(kind):
+    cases = [case for case in MATRIX if case[0] == kind]
+    assert len(cases) == 2 * len(ROLES) * len(PATHS) * 2 * 2
+    await assert_all(cases, _matrix_case_parity, _matrix_id)

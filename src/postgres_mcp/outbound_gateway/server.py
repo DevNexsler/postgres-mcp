@@ -269,7 +269,7 @@ def create_server(
             "only: you may pass any target id you like to execute, including ones that "
             "disagree with suggest. If execute returns status needs_confirmation "
             "(detail_code stale_context), nothing was sent: read new_context -- the newer "
-            "messages, including any we already sent to that recipient (direction outbound) -- and answer "
+            "messages, including any we already sent to that recipient (direction \"sent by us\") -- and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
             "message content changed). Every send, from any wake, goes through this tool: "
@@ -681,8 +681,9 @@ async def build_runtime() -> GatewayRuntime:
         retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
         traffic_mode=_traffic_mode(),
         traffic_probe=context_repository,
-        # Off by default: the pre-192 terminal stale_context block. Enable only
-        # after Comm-Data-Store's reconciler is live and migration 192 applied.
+        # On: newer context is a stale_context question for the agent. Off
+        # (default): never ask, and never send stale -- an action with unshown
+        # newer context ends as a `stale_context_unasked` no-send.
         stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
     )
     return GatewayRuntime(
