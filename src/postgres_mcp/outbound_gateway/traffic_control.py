@@ -47,7 +47,7 @@ async def in_flight_hold(
     try:
         in_flight = await probe.in_flight_actions(recipient_key, action_id)
     except Exception:
-        logger.warning("traffic control check failed (in_flight) for %s", recipient_key, exc_info=True)
+        logger.error("traffic control check failed (in_flight) for %s action %s", recipient_key, action_id, exc_info=True)
         return None
     if not in_flight:
         return None

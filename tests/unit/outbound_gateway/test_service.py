@@ -1884,6 +1884,152 @@ async def test_resume_swallows_post_dispatch_exception_and_returns_durable_row_s
     assert any("post-dispatch exception" in m for m in messages)
 
 
+# ----------------------------------------------------------------------------
+# An error before the provider is called: say "not sent" and let the agent
+# decide. A TypeError in a fake evidence loader used to come back `pending`
+# while the row sat in `received`, which the worker never lists: a silent
+# no-send. Executing the same request again re-runs the send.
+# ----------------------------------------------------------------------------
+
+
+def _assert_not_sent(result, adapter, caplog, error_type):
+    assert result.status is PublicStatus.FAILED
+    assert result.detail_code == "gateway_internal_error"
+    assert result.detail.startswith("Not sent: the gateway hit an internal error before sending")
+    assert f"({error_type}: " in result.detail
+    assert "Nothing went out. Execute the same request again to retry, or record needs_human." in result.detail
+    assert ("invoke",) not in adapter.calls
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
+
+
+@pytest.mark.asyncio
+async def test_an_evidence_loading_error_is_reported_not_sent(caplog):
+    store = FakeStore()
+    adapter = FakeAdapter()
+    svc = service(store, adapter)
+    svc._evidence_loader.load.side_effect = TypeError("load() got an unexpected keyword argument 'as_of'")
+
+    with caplog.at_level(logging.ERROR):
+        result = await svc.execute(request())
+
+    _assert_not_sent(result, adapter, caplog, "TypeError")
+    assert store.current.state is ActionState.RECEIVED
+    assert not any(call[0] == "schedule" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_preflight_error_is_reported_not_sent(caplog):
+    store = FakeStore()
+    adapter = FakeAdapter()
+    svc = service(store, adapter)
+
+    with (
+        patch(
+            "postgres_mcp.outbound_gateway.service.SafetyPreflight.evaluate",
+            side_effect=AttributeError("'NoneType' object has no attribute 'calendar_dependency'"),
+        ),
+        caplog.at_level(logging.ERROR),
+    ):
+        result = await svc.execute(request())
+
+    _assert_not_sent(result, adapter, caplog, "AttributeError")
+    assert store.current.state is ActionState.RECEIVED
+
+
+def _accepted(ref="req-1"):
+    return ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref=ref,
+        message_id="mail-1",
+        accepted_at=NOW,
+        evidence={"kind": "provider_message_id"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_evidence_error_then_the_same_request_again_sends_once(caplog):
+    store = FakeStore()
+    adapter = FakeAdapter(_accepted())
+    svc = service(store, adapter)
+    svc._evidence_loader.load.side_effect = [TypeError("boom"), evidence()]
+
+    with caplog.at_level(logging.ERROR):
+        first = await svc.execute(request())
+        _assert_not_sent(first, adapter, caplog, "TypeError")
+        assert store.current.state is ActionState.RECEIVED
+        second = await svc.execute(request())
+
+    assert second.status is PublicStatus.SENT
+    assert second.action_id == first.action_id
+    assert adapter.calls.count(("invoke",)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_request_build_error_goes_back_to_retry_ready_and_the_same_request_again_sends_once(caplog):
+    """The row was already marked dispatching, which a re-execute only
+    reports: the provider was provably not called, so it goes back to
+    retry_ready, which a re-execute dispatches."""
+    store = FakeStore()
+    adapter = FakeAdapter(_accepted())
+    build = adapter.build_request
+    failures = [KeyError("sender_domain")]
+
+    def build_once(ctx, action_uid):
+        if failures:
+            raise failures.pop()
+        return build(ctx, action_uid)
+
+    adapter.build_request = build_once
+    svc = service(store, adapter)
+
+    with caplog.at_level(logging.ERROR):
+        first = await svc.execute(request())
+        _assert_not_sent(first, adapter, caplog, "KeyError")
+        assert store.current.state is ActionState.RETRY_READY
+        second = await svc.execute(request())
+
+    assert ("transition", ActionState.DISPATCHING, ActionState.RETRY_READY, "gateway_internal_error", "gateway-test") in store.calls
+    assert second.status is PublicStatus.SENT
+    assert adapter.calls.count(("invoke",)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left_for_the_worker(caplog):
+    store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
+    adapter = FakeAdapter()
+    svc = service(store, adapter)
+    svc._evidence_loader.load.side_effect = TypeError("boom")
+
+    with caplog.at_level(logging.ERROR):
+        result = await svc.resume(ACTION_ID)
+
+    _assert_not_sent(result, adapter, caplog, "TypeError")
+    # Claimed (one attempt spent), still listed by the worker.
+    assert store.current.state is ActionState.DEPENDENCY_WAIT
+    assert [call[0] for call in store.calls] == ["claim"]
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_the_provider_call_started_stays_uncertain_not_not_sent(caplog):
+    """The provider may have the request: unknown/reconcile, never 'not sent'."""
+    store = FakeStore()
+    pending = ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1", provider_call_id="req-1")
+    adapter = FakeAdapter(pending)
+    adapter.poll = AsyncMock(side_effect=TypeError("poll() bug"))
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, adapter).execute(request())
+
+    assert result.status is PublicStatus.PENDING
+    assert result.detail_code != "gateway_internal_error"
+    assert store.current.state is ActionState.DISPATCHING
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("post-dispatch exception" in m for m in messages)
+    assert not any("pre-send exception" in m for m in messages)
+
+
 @pytest.mark.asyncio
 async def test_execute_still_raises_context_derivation_error_before_dispatch():
     """Regression guard: context load/validation is deliberately NOT
@@ -2011,3 +2157,4 @@ async def test_when_the_provider_cannot_say_reconcile_proceeds_from_the_saved_re
 
     assert result.status is PublicStatus.SENT
     assert adapter.calls == [("poll", "req-1"), ("reconcile",)]
+

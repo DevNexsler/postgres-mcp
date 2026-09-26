@@ -31,6 +31,7 @@ from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
+from .models import PublicStatus
 from .models import StaleContextDecision
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
@@ -302,28 +303,20 @@ class OutboundActionService:
         adapter.poll() provider I/O, so all three are covered by the same
         try/except below.
 
-        A post-dispatch exception (e.g. a network timeout *after* the
-        provider already accepted the HTTP request -- the row is durably
-        DISPATCHING with a lease by the time adapter.invoke() runs, since
-        claim()+transition() to DISPATCHING happen before it) must never
-        escape to the MCP caller as a raised error: FastMCP wraps any
-        uncaught exception as "Error executing tool outbound_action: ...",
-        and the CDS reconciler's rejection-prefix rule treats that wrapper
-        as proof nothing was sent. If a real send's post-accept timeout
-        propagated that far, the reconciler would uncount a REAL send and
-        let the wake complete while the message was actually delivered --
-        exactly the false negative the prefix rule is only safe without.
+        An exception here never escapes to the MCP caller as a raised error:
+        FastMCP wraps it as "Error executing tool outbound_action: ...", which
+        the CDS reconciler reads as proof nothing was sent.
 
-        So: catch broadly here, log at ERROR (wake + action id, for
-        operator visibility), and return whatever the row's durable state
-        already is -- DISPATCHING/RECONCILING with a lease, recovered by the
-        existing lease-expiry/reconcile/worker machinery, same as any other
-        expired-lease crash recovery. This restores the invariant that an
-        MCP error wrapper strictly implies "rejected before any provider
-        interaction": context load/validation (in execute(), everything
-        before this call) is deliberately NOT covered by this except clause
-        and still raises, so a true pre-dispatch rejection keeps the error
-        wrapper the reconciler depends on.
+        - Once adapter.invoke() has started (_ProviderCallAttemptedError) the
+          provider may have the request: log at ERROR and return the row's
+          durable state (dispatching -> lease expiry -> reconcile).
+        - Before it, nothing was sent: log at ERROR and tell the caller so.
+          The row stays where it was left; executing the same request again
+          re-runs the send from there. Nothing is retried on the agent's
+          behalf -- it decides.
+
+        Context load/validation (everything in execute() before this call)
+        still raises.
         """
         try:
             if action.state is ActionState.DEPENDENCY_WAIT:
@@ -331,16 +324,35 @@ class OutboundActionService:
             if action.state in {ActionState.PREPARED, ActionState.RETRY_READY}:
                 return await self._dispatch(action, context)
             return await otherwise()
-        except Exception:
+        except _ProviderCallAttemptedError as attempted:
             logger.error(
                 "post-dispatch exception on wake %s action %s -- provider call outcome "
                 "unknown, returning durable row state for lease-expiry/reconcile recovery",
                 context.wakeup_event_id,
                 action.action_id,
-                exc_info=True,
+                exc_info=attempted.__cause__,
             )
             return action_result(await self._require_action(action.action_id))
-
+        except Exception as error:
+            logger.error(
+                "pre-send exception on wake %s action %s -- nothing was sent",
+                context.wakeup_event_id,
+                action.action_id,
+                exc_info=True,
+            )
+            lines = str(error).strip().splitlines()
+            reason = f"{type(error).__name__}: {lines[0][:200]}" if lines else type(error).__name__
+            return PublicResult(
+                status=PublicStatus.FAILED,
+                action_id=action.action_id,
+                action_uid=action.action_uid,
+                provider_request_ref=None,
+                detail_code="gateway_internal_error",
+                detail=(
+                    f"Not sent: the gateway hit an internal error before sending ({reason}). Nothing went out. "
+                    "Execute the same request again to retry, or record needs_human."
+                ),
+            )
 
     async def _hold_in_flight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult | None:
         """Another wake's send to this recipient still in flight: wait. Not a
@@ -489,9 +501,34 @@ class OutboundActionService:
             self._lease_owner,
             ProviderObservation(ProviderDisposition.PENDING, "dispatch_started"),
         )
-        if dispatching.action_uid is None:
-            raise RuntimeError("prepared action has no deterministic action UID")
-        provider_request = adapter.build_request(context, dispatching.action_uid)
+        try:
+            if dispatching.action_uid is None:
+                raise RuntimeError("prepared action has no deterministic action UID")
+            provider_request = adapter.build_request(context, dispatching.action_uid)
+        except Exception:
+            # The provider was provably not called: back to retry_ready, which
+            # a re-execute dispatches (a dispatching row it only reports).
+            await self._store.transition(
+                dispatching.action_id,
+                dispatching.state,
+                ActionState.RETRY_READY,
+                self._lease_owner,
+                ProviderObservation(ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE, "gateway_internal_error", retryable=True),
+            )
+            raise
+        try:
+            return await self._invoke(dispatching, context, adapter, provider_request)
+        except Exception as error:
+            raise _ProviderCallAttemptedError() from error
+
+    async def _invoke(
+        self,
+        dispatching: OutboundActionRecord,
+        context: ActionContext,
+        adapter: ProviderAdapter,
+        provider_request: Any,
+    ) -> PublicResult:
+        """The provider call and everything after it: an uncertain outcome."""
         observation = await adapter.invoke(self._provider_client, provider_request)
         if observation.provider_request_ref:
             dispatching = await self._store.record_provider_request(
@@ -690,6 +727,10 @@ class OutboundActionService:
 
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return is_due(action, self._clock())
+
+
+class _ProviderCallAttemptedError(Exception):
+    """Raised from once adapter.invoke() started (the cause is __cause__)."""
 
 
 _RECORDED_ID_LISTS = frozenset({"cross_channel_duplicate_message_ids", "certified_older_message_ids"})

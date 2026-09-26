@@ -392,6 +392,13 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     current = current_rest[0] if current_rest else None
     old, new = repr(_this_call(legacy_rest)), repr(_this_call(current_rest))
     legacy_result, current_result = _result(legacy), _result(current)
+    # An unexpected error before the provider was called: the legacy
+    # swallowed it and returned the row as it stood (`pending`, often still
+    # `received`, which the worker never lists -- a silent no-send). Now the
+    # result says "not sent" (and a row already marked dispatching goes back
+    # to retry_ready, where a re-execute dispatches it).
+    if "gateway_internal_error" in new and "gateway_internal_error" not in old:
+        return "pre_send_error_is_reported_not_sent"
     # The override resend of a legacy traffic_blocked row needed the terminal
     # block that no longer exists.
     if _call(legacy, "store.remediate_traffic_block"):

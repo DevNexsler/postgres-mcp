@@ -367,7 +367,7 @@ class StaleContextQuestions:
             )
         except Exception:
             # Fail-open: a broken check must never stop outbound traffic.
-            logger.warning(
+            logger.error(
                 "stale-context check failed for action %s on wake %s; the send proceeds",
                 action.action_id,
                 context.wakeup_event_id,
@@ -493,12 +493,12 @@ class StaleContextQuestions:
                     await self._probe.newer_context(context, limit=CONTEXT_ITEM_LIMIT + 1, waive_shown=False)
                 )
             except Exception:
-                logger.warning("stale-context listing failed for wake %s", context.wakeup_event_id, exc_info=True)
+                logger.error("stale-context listing failed for action %s on wake %s", action.action_id, context.wakeup_event_id, exc_info=True)
         if question is not None:
             try:
                 action = await self._store.block_stale_context(action.action_id, ActionState.STALE, None, question.shown_refs)
             except Exception:
-                logger.warning("stale-context shown set could not be extended for action %s", action.action_id, exc_info=True)
+                logger.error("stale-context shown set could not be extended for action %s", action.action_id, exc_info=True)
         return needs_confirmation(action, question)
 
     async def _block(
