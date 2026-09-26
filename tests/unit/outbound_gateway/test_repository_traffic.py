@@ -141,7 +141,8 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
     ]
     for clause in (
         "coalesce(event.webui_accepted_at, event.created_at)",  # the wake's context watermark
-        "message.created_at > watermark.at",  # the wake's channel: when a message reached CDS
+        "message.channel_id = p.channel_id AND message.received_at > watermark.at",  # the wake's channel
+        "seen.received_at <= watermark.at",  # a re-ingest / re-scrape of what had reached CDS
         "(message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)",  # other channels
         "unnest(action.stale_context_shown_refs)",  # shown, by identity
         "coalesce(message.canonical_message_id, message.id) = ANY(p.equivalent_ids)",

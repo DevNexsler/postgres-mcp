@@ -537,19 +537,30 @@ async def _matrix_case_parity(case) -> None:
         elif path == "prepare_received":
             await _attempt(service.prepare(ctx.action_id))
         if issubclass(service_cls, OutboundActionService):
-            _one_question_invariants(store, path)
+            unshown_item = item is not None and kind != "unrelated" and not shown and mode == "enforce"
+            _one_question_invariants(store, path, service=service, unshown_item=unshown_item, request=request)
 
     await assert_parity(scenario, layer="matrix")
 
 
-def _one_question_invariants(store, path: str) -> None:
+def _one_question_invariants(store, path: str, *, service, unshown_item: bool, request) -> None:
     """The design, checked on the current side of every matrix case: nothing
-    ends definitive_failed over staleness; the worker never asks; `no` is a
-    deliberate `stale` no-send."""
+    ends definitive_failed over staleness; the worker never asks, and over
+    unshown newer context it never sends -- a `stale_context_unasked`
+    no-send (retry_ready: dead_letter); `no` is a deliberate `stale` no-send."""
     states = {row.state for row in store.rows.values()}
     assert ActionState.DEFINITIVE_FAILED not in states, path
     if path.startswith(("resume_", "prepare_")):
         assert not [call for call in store.calls if call[0] == "block_stale"], path
+        (adapter,) = {id(a): a for a in service._adapters.values()}.values()
+        action = store.rows[stale_tests.action_id_for(WAKE, request.action_role.value, 0)]
+        if unshown_item:
+            assert adapter.sent == [], path
+            assert action.detail_code == "stale_context_unasked", (path, action.state, action.detail_code)
+            expected = ActionState.DEAD_LETTER if path == "resume_retry_ready" else ActionState.STALE
+            assert action.state is expected, path
+        else:
+            assert action.detail_code != "stale_context_unasked", path
     if path == "confirm_no":
         declined = [row for row in store.rows.values() if row.stale_context_decision == "no"]
         for row in declined:

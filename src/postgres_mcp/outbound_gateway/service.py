@@ -151,6 +151,7 @@ class OutboundActionService:
             enabled=stale_confirm_enabled,
             mode=traffic_mode,
             drive_answered=self._drive_answered,
+            lease_seconds=lease_seconds,
         )
         self._recovery = ActionRecovery(
             store=store,
@@ -382,9 +383,9 @@ class OutboundActionService:
 
     async def resume(self, action_id: UUID) -> PublicResult:
         """The worker (or Restate) advancing a saved action. Nobody can be
-        asked here: the stale-context question was the agent's at execute
-        time, so the saved record is sent as confirmed (newer context is
-        logged, not judged). The in-flight lease still applies."""
+        asked here, and no answer means no send: with unshown newer context
+        the action ends as a `stale_context_unasked` no-send; with nothing
+        newer the saved record is sent. The in-flight lease still applies."""
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return action_result(action)
@@ -394,7 +395,9 @@ class OutboundActionService:
         held = await self._hold_in_flight(action, context)
         if held is not None:
             return held
-        await self._stale.check(action, context, agent_facing=False)
+        unasked = await self._stale.check(action, context, agent_facing=False)
+        if unasked is not None:
+            return unasked
 
         async def _unchanged_fallback() -> PublicResult:
             return action_result(action)

@@ -786,10 +786,10 @@ async def test_a_different_message_executed_after_the_refusal_is_the_revise_answ
 
 
 @pytest.mark.asyncio
-async def test_worker_resume_sends_the_saved_record_as_confirmed_and_logs_the_newer_context(caplog):
-    """resume() is the worker: nobody can be asked, and the question was the
-    agent's at execute time. The saved record is sent (never a terminal
-    traffic_blocked failure); what was newer is logged."""
+async def test_worker_resume_over_newer_context_is_a_deliberate_no_send_never_a_failure(caplog):
+    """resume() is the worker: nobody can be asked, so no answer means no
+    send. The action ends `stale` / stale_context_unasked (never the old
+    definitive_failed/traffic_blocked) and the newer items are logged."""
     service, store, _probe, adapter = harness(CRON_ALERT)
     ctx = await FakeLoader().load(execute_request())
     await store.create_or_load(ctx)
@@ -798,12 +798,44 @@ async def test_worker_resume_sends_the_saved_record_as_confirmed_and_logs_the_ne
     with caplog.at_level("WARNING"):
         result = await service.resume(BLOCKED)
 
-    assert result.status is PublicStatus.SENT
-    assert store.rows[BLOCKED].state is ActionState.COMPLETED
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked")
+    assert store.rows[BLOCKED].state is ActionState.STALE
     assert store.rows[BLOCKED].error_category is None
-    assert adapter.sent == ["pong"]
+    assert ("claim", BLOCKED, ActionState.PREPARED) in store.calls
+    assert adapter.sent == []
     logged = [record.getMessage() for record in caplog.records]
-    assert any("not asked about (worker)" in line and "message:750824" in line for line in logged), logged
+    assert any("nobody to ask (worker)" in line and "message:750824" in line for line in logged), logged
+    # And it is not a question: confirm refuses it.
+    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+        await service.confirm(confirm(BLOCKED, "yes"))
+
+
+@pytest.mark.asyncio
+async def test_worker_resume_with_nothing_newer_sends_the_saved_record():
+    service, store, _probe, adapter = harness()
+    ctx = await FakeLoader().load(execute_request())
+    await store.create_or_load(ctx)
+    await store.prepare(ctx, ActionState.RECEIVED)
+
+    result = await service.resume(BLOCKED)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.sent == ["pong"]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_ready_row_over_newer_context_is_parked_not_sent():
+    """retry_ready has no edge into `stale` (migration 153): no send, parked
+    in dead_letter with the same detail -- still never definitive_failed."""
+    service, store, _probe, adapter = harness(CRON_ALERT)
+    ctx = await FakeLoader().load(execute_request())
+    row = await store.create_or_load(ctx)
+    store.rows[BLOCKED] = replace(row, state=ActionState.RETRY_READY, action_uid=BLOCKED)
+
+    result = await service.resume(BLOCKED)
+
+    assert (store.rows[BLOCKED].state, result.detail_code) == (ActionState.DEAD_LETTER, "stale_context_unasked")
+    assert adapter.sent == []
 
 
 def quo_reply_request(text: str = "Yes, Friday at 10 still works.") -> ExecuteRequest:

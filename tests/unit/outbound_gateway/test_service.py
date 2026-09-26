@@ -1378,9 +1378,10 @@ async def test_due_dependency_retry_is_claimed_so_retry_budget_advances():
 
 
 @pytest.mark.asyncio
-async def test_worker_resume_of_a_waiting_reply_sends_over_newer_inbound():
-    """The worker has nobody to ask: a reply that waited (dependency_wait)
-    is sent as saved, never turned into a `stale` no-send by the preflight."""
+async def test_with_traffic_control_off_a_waiting_reply_is_not_staled_by_the_preflight():
+    """OUTBOUND_TRAFFIC_CONTROL=off (here: no probe) switches off the one
+    stale check; the preflight's newer_inbound no-send no longer exists, so a
+    reply that waited (dependency_wait) is sent as saved."""
     store = FakeStore(
         row(
             ActionState.DEPENDENCY_WAIT,
@@ -1630,51 +1631,50 @@ async def test_resume_enforce_defers_lease_held_on_an_already_prepared_action():
 
 
 @pytest.mark.asyncio
-async def test_with_confirmation_disabled_newer_context_is_logged_and_the_send_proceeds(caplog):
-    """Confirmation disabled: nobody can be asked, so the saved record is sent
-    as confirmed and the newer context is logged. Never the old terminal
-    definitive_failed/traffic_blocked."""
+async def test_with_confirmation_disabled_newer_context_is_a_deliberate_no_send(caplog):
+    """Confirmation disabled: never ask, and never send stale. The row ends
+    `stale` / stale_context_unasked -- never the old terminal
+    definitive_failed/traffic_blocked -- and the newer items are logged."""
     store = FakeStore()
     adapter = FakeAdapter(_accepted_observation())
     probe = FakeProbe(newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        ))
+        direction="inbound",
+        source="zillow",
+        occurred_at=NOW,
+        preview="Are you still available Friday?",
+        message_id=999,
+        action_id=None,
+    ))
 
     with caplog.at_level(logging.WARNING):
         result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
-    assert result.status is PublicStatus.SENT
-    assert adapter.calls
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked")
+    assert adapter.calls == []
     assert not any(call[0] == "definitive_fail" for call in store.calls)
     messages = [record.getMessage() for record in caplog.records]
-    assert any("not asked about (confirmation disabled)" in message and "message:999" in message for message in messages)
+    assert any("nobody to ask (confirmation disabled)" in message and "message:999" in message for message in messages)
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_override_bypasses_stale_context_block():
+async def test_override_does_not_bypass_newer_context_when_nobody_can_be_asked():
+    """override=true is the "yes" of a question; with confirmation disabled
+    there is no question, so it cannot send over newer context."""
     store = FakeStore()
     adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
-    )
+    probe = FakeProbe(newer=NewerActivity(
+        direction="inbound",
+        source="zillow",
+        occurred_at=NOW,
+        preview="Are you still available Friday?",
+        message_id=999,
+        action_id=None,
+    ))
 
     result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request(override=True))
 
-    assert result.status is PublicStatus.SENT
-    assert adapter.calls
-    assert not any(call[0] == "definitive_fail" for call in store.calls)
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked")
+    assert adapter.calls == []
 
 
 @pytest.mark.asyncio
@@ -1763,30 +1763,31 @@ def test_traffic_mode_off_without_probe_does_not_warn(caplog):
 
 
 @pytest.mark.asyncio
-async def test_worker_resume_sends_the_saved_record_over_newer_context_and_logs_it(caplog):
+async def test_worker_resume_over_newer_context_ends_stale_unasked_and_logs_it(caplog):
     """worker.py routes dependency_wait/prepared/retry_ready through resume():
-    nobody can be asked there. The stale-context question was the agent's at
-    execute time; the worker sends the saved record as confirmed and logs
-    what was newer -- never the old terminal traffic_blocked failure."""
+    nobody can be asked there, so no answer means no send. The prepared row
+    is claimed and ends `stale` / stale_context_unasked (never the old
+    terminal traffic_blocked failure); the items are logged."""
     store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
     adapter = FakeAdapter(_accepted_observation())
     probe = FakeProbe(newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        ))
+        direction="inbound",
+        source="zillow",
+        occurred_at=NOW,
+        preview="Are you still available Friday?",
+        message_id=999,
+        action_id=None,
+    ))
 
     with caplog.at_level(logging.WARNING):
         result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
 
-    assert result.status is PublicStatus.SENT
-    assert adapter.calls
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked")
+    assert adapter.calls == []
     assert not any(call[0] == "definitive_fail" for call in store.calls)
+    assert any(call[0] == "claim" for call in store.calls)
     messages = [record.getMessage() for record in caplog.records]
-    assert any("not asked about (worker)" in message and "message:999" in message for message in messages)
+    assert any("nobody to ask (worker)" in message and "message:999" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -1815,20 +1816,12 @@ async def test_a_legacy_traffic_blocked_row_stays_terminal_and_override_does_not
 
 
 @pytest.mark.asyncio
-async def test_a_contended_intent_lock_still_waits_with_newer_context_present():
+async def test_a_contended_intent_lock_waits_instead_of_terminalizing():
     """A fresh row whose prepare() hits a contended intent lock lands in
-    DEPENDENCY_WAIT and waits (the worker retries); newer context changes
-    nothing about that and never terminalizes it."""
+    DEPENDENCY_WAIT and waits (the worker retries); it never terminalizes."""
     store = FakeStore()
     adapter = FakeAdapter()
-    probe = FakeProbe(newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        ))
+    probe = FakeProbe()
 
     async def contended_prepare(ctx, expected_state):
         store.calls.append(("prepare", expected_state))

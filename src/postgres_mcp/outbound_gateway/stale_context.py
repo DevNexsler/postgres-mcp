@@ -9,9 +9,13 @@ answers `yes` (send it unchanged), `no` (send nothing: the row stays a
 deliberate `stale` no-send) or `revise` (same recipient, new content).
 
 Nothing else about freshness is decided anywhere. Where nobody can be asked
--- the worker resuming a saved action, confirmation disabled, a row that can
-no longer become `stale` -- the saved record is sent as confirmed:
-staleness was the agent's call at execute time. That is logged.
+-- the worker resuming a saved action, Restate preparing one, confirmation
+disabled, a retry_ready row -- no answer means no send: if anything newer is
+unshown, the action ends as a deliberate `stale` no-send with detail
+`stale_context_unasked` (a retry_ready row, which has no edge into `stale`,
+is parked in dead_letter), never definitive_failed, and the items are
+logged. A newer inbound gets its own wake, whose agent sees everything. With
+nothing newer, the saved record is sent.
 
 Two layers:
 
@@ -39,6 +43,8 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from .adapters.base import ProviderDisposition
+from .adapters.base import ProviderObservation
 from .context import ActionContext
 from .context import ActionContextLoader
 from .identity import same_request
@@ -67,6 +73,14 @@ logger = logging.getLogger("postgres_mcp.outbound_gateway.service")
 STALE_BLOCKABLE_STATES = frozenset({ActionState.RECEIVED, ActionState.PREPARED, ActionState.DEPENDENCY_WAIT})
 
 DECLINED_DETAIL = "Declined: nothing was sent for this action. This is a recorded no-send, not a failure."
+
+# Nobody could be asked and something newer was unshown: a deliberate no-send.
+# Not a stale_context question (confirm refuses it; STALE_CONTEXT_DETAILS).
+UNASKED_DETAIL_CODE = "stale_context_unasked"
+UNASKED_DETAIL = (
+    "Not sent: newer messages reached this recipient since your context was built, and nobody could be "
+    "asked about them. This is a deliberate no-send, not a failure."
+)
 
 # How many newer items a question lists. The newest are shown; anything older
 # stays unshown, so it asks again after the answer.
@@ -315,14 +329,17 @@ class StaleContextQuestions:
         enabled: bool,
         mode: str,
         drive_answered: DriveAnswered,
+        lease_seconds: int = 60,
     ):
         self._store = store
         self._context_loader = context_loader
         self._probe = probe
         self._actor = actor
-        # OUTBOUND_STALE_CONFIRM_ENABLED. Off: nobody is asked -- every send
-        # proceeds and newer context is only logged -- and confirm is refused.
+        # OUTBOUND_STALE_CONFIRM_ENABLED. Off: never ask, and never send
+        # stale -- an action with unshown newer context ends as a
+        # `stale_context_unasked` no-send -- and confirm is refused.
         self.enabled = enabled
+        self._lease_seconds = lease_seconds
         # OUTBOUND_TRAFFIC_CONTROL: off (never look), shadow (log what would
         # be asked), enforce (ask).
         self._mode = mode
@@ -337,14 +354,13 @@ class StaleContextQuestions:
         confirm: bool = False,
         dispatch: bool = True,
     ) -> PublicResult | None:
-        """The one stale-context check, before any send. Returns the question,
+        """The one stale-context check, before any send. Returns the question
+        (or, where nobody can be asked, the `stale_context_unasked` no-send),
         or None: send. confirm=True (override=true) records the question and
         answers yes at once."""
         if self._mode == "off" or self._probe is None:
             return None
-        if not (agent_facing and self.enabled and action.state in STALE_BLOCKABLE_STATES):
-            await self._note_unasked(action, context, agent_facing=agent_facing)
-            return None
+        askable = agent_facing and self.enabled and action.state in STALE_BLOCKABLE_STATES
         try:
             question = stale_question(
                 await self._probe.newer_context(context, limit=CONTEXT_ITEM_LIMIT + 1, waive_shown=True)
@@ -362,33 +378,63 @@ class StaleContextQuestions:
             return None
         if self._mode == "shadow":
             logger.warning(
-                "stale-context shadow would-ask: wake=%s action=%s newer=%s",
+                "stale-context shadow would-%s: wake=%s action=%s newer=%s",
+                "ask" if askable else "not send",
                 context.wakeup_event_id,
                 action.action_id,
                 ",".join(question.shown_refs),
             )
             return None
+        if not askable:
+            return await self._end_unasked(action, context, question, agent_facing=agent_facing)
         return await self._block(action, context, question, confirm=confirm, dispatch=dispatch)
 
-    async def _note_unasked(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool) -> None:
-        """Nobody can be asked: the saved record is sent as confirmed. Log
-        what was newer, for the audit trail (best effort)."""
-        assert self._probe is not None
-        try:
-            newer = await self._probe.newer_context(context, limit=CONTEXT_ITEM_LIMIT, waive_shown=True)
-        except Exception:
-            logger.warning("stale-context audit read failed for action %s", action.action_id, exc_info=True)
-            return
-        if newer:
-            logger.warning(
-                "newer context not asked about (%s): wake=%s action=%s state=%s newer=%s; "
-                "the saved record is sent as confirmed -- staleness was the agent's call at execute time",
-                "confirmation disabled" if agent_facing and not self.enabled else ("agent" if agent_facing else "worker"),
-                context.wakeup_event_id,
-                action.action_id,
-                action.state.value,
-                ",".join(item.ref for item in newer),
-            )
+    async def _end_unasked(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        question: StaleQuestion,
+        *,
+        agent_facing: bool,
+    ) -> PublicResult | None:
+        """No answer means no send: end the action as a deliberate
+        `stale_context_unasked` no-send. A retry_ready row has no edge into
+        `stale` (Comm-Data-Store migration 153) and is parked in dead_letter
+        instead. None (send as before) only for a state that cannot hold
+        this, which no caller reaches."""
+        if action.state is ActionState.RETRY_READY:
+            target = ActionState.DEAD_LETTER
+        elif action.state in STALE_BLOCKABLE_STATES:
+            target = ActionState.STALE
+        else:
+            return None
+        logger.warning(
+            "newer context and nobody to ask (%s): wake=%s action=%s state=%s newer=%s; not sent (%s)",
+            "confirmation disabled" if agent_facing and not self.enabled else ("agent" if agent_facing else "worker"),
+            context.wakeup_event_id,
+            action.action_id,
+            action.state.value,
+            ",".join(question.shown_refs),
+            target.value,
+        )
+        current, lease_owner = action, None
+        if action.state is not ActionState.RECEIVED:
+            # claim_outbound_action's whitelist: prepared, dependency_wait,
+            # retry_ready (a received row transitions without a lease).
+            current = await self._store.claim(action.action_id, action.state, self._actor, self._lease_seconds)
+            lease_owner = self._actor
+        ended = await self._store.transition(
+            current.action_id,
+            current.state,
+            target,
+            lease_owner,
+            ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                UNASKED_DETAIL_CODE,
+                evidence={"newer": list(question.shown_refs)},
+            ),
+        )
+        return action_result(ended, detail=UNASKED_DETAIL)
 
     async def confirm(self, request: ConfirmRequest, *, dispatch: bool) -> PublicResult:
         """Answer a needs_confirmation (stale_context) result.

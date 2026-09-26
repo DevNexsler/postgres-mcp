@@ -254,9 +254,10 @@ class OutboundGatewayRepository:
         """The stale-context question's one query: every message received
         from, or sent by us to, this action's recipient that is not in the
         agent's context, newest first, at most `limit`. Not in its context: on
-        the wake's own channel, reached CDS after the wake's context watermark
-        (hermes_wakeup_events accepted/created time); on any other channel,
-        sent after the message being answered or reached CDS after the
+        the wake's own channel, reached CDS (received_at) after the wake's
+        context watermark (hermes_wakeup_events accepted/created time); on
+        any other channel, sent after the message being answered. Never a
+        re-ingest or re-scrape of a message that had reached CDS by the
         watermark. waive_shown leaves out what this wake's agent was already
         shown for this recipient (migration 192), by identity.
 
@@ -328,6 +329,7 @@ class OutboundGatewayRepository:
                     message.created_at,
                     message.channel_id,
                     message.sent_at,
+                    message.received_at,
                     message.canonical_message_id,
                     message.source,
                     message.source_message_id,
@@ -350,21 +352,49 @@ class OutboundGatewayRepository:
                 CROSS JOIN watermark
                 LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
                 LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
-                WHERE (p.as_of IS NULL OR message.created_at <= p.as_of)
+                -- received_at is when a message reached CDS. created_at is a
+                -- generated alias of sent_at, and a web-extract scrape's
+                -- sent_at is the scraped timestamp, a day before it lands.
+                WHERE (p.as_of IS NULL OR message.received_at <= p.as_of)
                   AND (
                       -- The wake's own channel is in the agent's context up
                       -- to the watermark; anything that reached CDS after it
                       -- is new.
-                      message.created_at > watermark.at
+                      (message.channel_id = p.channel_id AND message.received_at > watermark.at)
                       -- Other channels are not in its context: anything sent
-                      -- after the message it is answering is new too.
+                      -- after the message it is answering is new.
                       OR (
                           message.channel_id IS DISTINCT FROM p.channel_id
                           AND (message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)
                       )
                   )
+                  -- The message being answered, its duplicates, and the
+                  -- scrapes certified older than it are the context itself.
                   AND NOT (coalesce(message.canonical_message_id, message.id) = ANY(p.equivalent_ids))
-                  AND NOT (lower(message.source) = 'zillow_rm_web_extract' AND message.id = ANY(p.certified_older_ids))
+                  AND NOT (message.id = ANY(p.certified_older_ids))
+                  AND NOT (coalesce(message.canonical_message_id, message.id) = ANY(p.certified_older_ids))
+                  -- A re-ingest or re-scrape of a message that had reached
+                  -- CDS by the watermark is not new: the same canonical
+                  -- message, or -- a scrape carries no canonical id -- the
+                  -- same source, sender, text and send time (within a minute:
+                  -- scrapes round to it), on any channel.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages AS seen
+                      WHERE message.canonical_message_id IS NOT NULL
+                        AND (seen.id = message.canonical_message_id OR seen.canonical_message_id = message.canonical_message_id)
+                        AND seen.id <> message.id
+                        AND seen.received_at <= watermark.at
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages AS seen
+                      WHERE seen.source = message.source
+                        AND seen.sent_at BETWEEN message.sent_at - interval '1 minute' AND message.sent_at + interval '1 minute'
+                        AND seen.id <> message.id
+                        AND seen.received_at <= watermark.at
+                        AND seen.sender_participant_id IS NOT DISTINCT FROM message.sender_participant_id
+                        AND nullif(regexp_replace(lower(coalesce(seen.body, '')), '[^a-z0-9]', '', 'g'), '')
+                            = regexp_replace(lower(coalesce(message.body, '')), '[^a-z0-9]', '', 'g')
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM own_send
                       WHERE own_send.message_key = regexp_replace(replace(regexp_replace(

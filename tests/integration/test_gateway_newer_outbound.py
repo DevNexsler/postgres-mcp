@@ -135,7 +135,8 @@ SCHEMA = """
         id bigint PRIMARY KEY, canonical_message_id bigint, source text, source_message_id text,
         sent_at timestamptz, created_at timestamptz, updated_at timestamptz, subject text, body text,
         user_account_id text, channel_id bigint, sender_participant_id bigint,
-        recipient_participant_id bigint, raw_event_id bigint, direction text
+        recipient_participant_id bigint, raw_event_id bigint, direction text,
+        received_at timestamptz  -- when it reached CDS (created_at is sent_at in production)
     );
     CREATE TEMP TABLE hermes_wakeup_events (
         id bigint PRIMARY KEY, source text, source_event_id text, created_at timestamptz,
@@ -154,6 +155,11 @@ SCHEMA = """
         stale_context_shown_refs text[], provider_message_id text
     );
     CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
+    -- These scenario rows reach CDS when they are sent.
+    CREATE FUNCTION pg_temp.received_when_sent() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN NEW.received_at := coalesce(NEW.received_at, NEW.sent_at); RETURN NEW; END $$;
+    CREATE TRIGGER received_when_sent BEFORE INSERT ON messages
+        FOR EACH ROW EXECUTE FUNCTION pg_temp.received_when_sent();
 """
 
 

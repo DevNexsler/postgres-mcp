@@ -70,7 +70,10 @@ async def traffic(traffic_database):
                 id bigint PRIMARY KEY, channel_id bigint, created_at timestamptz,
                 direction text, body text, source text, raw_event_id bigint,
                 sender_participant_id bigint, recipient_participant_id bigint,
-                source_message_id text, canonical_message_id bigint, sent_at timestamptz
+                source_message_id text, canonical_message_id bigint, sent_at timestamptz,
+                -- production: created_at is a generated alias of sent_at;
+                -- received_at is when the message reached CDS.
+                received_at timestamptz
             );
             CREATE TEMP TABLE channels (id bigint PRIMARY KEY, source_channel_id text);
             CREATE TEMP TABLE raw_events (id bigint PRIMARY KEY, payload jsonb);
@@ -115,15 +118,16 @@ async def add_message(conn, *, sender=GUNTHER, recipient=LINE, direction="inboun
         (message_id, Jsonb({"data": {"object": {"from": sender, "to": recipient}}})),
     )
     await conn.execute(
-        "INSERT INTO messages VALUES (%s,%s,%s,%s,'showing update','quo',%s,NULL,NULL,%s,NULL,%s)",
+        "INSERT INTO messages VALUES (%s,%s,%s,%s,'showing update','quo',%s,NULL,NULL,%s,NULL,%s,%s)",
         (
             message_id,
             channel,
-            WATERMARK.replace(minute=minute),
+            WATERMARK.replace(minute=minute if sent_minute is None else sent_minute),
             direction,
             message_id,
             f"AC-{message_id}",
             WATERMARK.replace(minute=minute if sent_minute is None else sent_minute),
+            WATERMARK.replace(minute=minute),
         ),
     )
 
@@ -246,16 +250,16 @@ async def test_a_non_sms_wake_channel_is_the_conversation(traffic, operation):
 async def test_cliq_internal_reply_ignores_cron_alert_but_lists_a_new_human_message(traffic):
     conn, repository = traffic
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source,sender_participant_id) "
-        "VALUES (750824,18,%s,%s,'outbound',%s,'zoho_cliq',918)",
-        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source,sender_participant_id) "
+        "VALUES (750824,18,%s,%s,%s,'outbound',%s,'zoho_cliq',918)",
+        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
     )
     assert await refs(repository, **INTERNAL_REPLY) == []
 
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source) "
-        "VALUES (750825,18,%s,%s,'inbound',%s,'zoho_cliq')",
-        (WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), "Could you call me?"),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source) "
+        "VALUES (750825,18,%s,%s,%s,'inbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), "Could you call me?"),
     )
     assert await refs(repository, **INTERNAL_REPLY) == ["message:750825"]
 
@@ -264,9 +268,9 @@ async def test_cliq_internal_reply_ignores_cron_alert_but_lists_a_new_human_mess
 async def test_cliq_internal_reply_lists_our_own_non_alert_post_as_sent_by_us(traffic):
     conn, repository = traffic
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source) "
-        "VALUES (750825,18,%s,%s,'outbound',%s,'zoho_cliq')",
-        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "I already sent pong."),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source) "
+        "VALUES (750825,18,%s,%s,%s,'outbound',%s,'zoho_cliq')",
+        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "I already sent pong."),
     )
     items = await newer(repository, **INTERNAL_REPLY)
     assert [(item.ref, item.label) for item in items] == [("message:750825", "sent by us")]
@@ -380,9 +384,9 @@ async def test_cliq_internal_reply_ignores_a_cron_alert_stored_as_inbound(traffi
     only for Cliq chat posts."""
     conn, repository = traffic
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source,sender_participant_id) "
-        "VALUES (750824,18,%s,%s,'inbound',%s,'zoho_cliq',918)",
-        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source,sender_participant_id) "
+        "VALUES (750824,18,%s,%s,%s,'inbound',%s,'zoho_cliq',918)",
+        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch"),
     )
     assert await refs(repository, **INTERNAL_REPLY) == []
     assert await refs(repository, operation=Operation.EMAIL_SEND) == ["message:750824"]
@@ -392,9 +396,14 @@ async def test_cliq_internal_reply_ignores_a_cron_alert_stored_as_inbound(traffi
 async def test_a_human_pasting_a_cron_alert_is_not_exempt(traffic):
     conn, repository = traffic
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source,sender_participant_id) "
-        "VALUES (750830,18,%s,%s,'inbound',%s,'zoho_cliq',720)",
-        (WATERMARK.replace(minute=10), WATERMARK.replace(minute=10), "⚠️ Cron issue — comms-review-stall-watch\nis this the gateway?"),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source,sender_participant_id) "
+        "VALUES (750830,18,%s,%s,%s,'inbound',%s,'zoho_cliq',720)",
+        (
+            WATERMARK.replace(minute=10),
+            WATERMARK.replace(minute=10),
+            WATERMARK.replace(minute=10),
+            "⚠️ Cron issue — comms-review-stall-watch\nis this the gateway?",
+        ),
     )
     assert await refs(repository, **INTERNAL_REPLY) == ["message:750830"]
     await conn.execute("UPDATE messages SET sender_participant_id = NULL WHERE id = 750830")
@@ -410,9 +419,10 @@ async def add_quo_elsewhere(conn, message_id, *, channel=19, minute=13, sent_min
     payload = {"data": {"object": {"from": frm, "to": [LINE], "phoneNumberId": line, "conversationId": conversation}}}
     await conn.execute("INSERT INTO raw_events VALUES (%s,%s)", (message_id, Jsonb(payload)))
     await conn.execute(
-        "INSERT INTO messages VALUES (%s,%s,%s,'inbound','are you there?','quo',%s,NULL,NULL,%s,NULL,%s)",
-        (message_id, channel, WATERMARK.replace(minute=minute), message_id, f"AC-{message_id}",
-         WATERMARK.replace(minute=minute if sent_minute is None else sent_minute)),
+        "INSERT INTO messages VALUES (%s,%s,%s,'inbound','are you there?','quo',%s,NULL,NULL,%s,NULL,%s,%s)",
+        (message_id, channel, WATERMARK.replace(minute=minute if sent_minute is None else sent_minute), message_id,
+         f"AC-{message_id}", WATERMARK.replace(minute=minute if sent_minute is None else sent_minute),
+         WATERMARK.replace(minute=minute)),
     )
 
 
@@ -432,8 +442,8 @@ async def test_a_zillow_relay_message_on_another_channel_is_listed(traffic):
     relay = "lead-7@convo.zillow.com"
     await conn.execute("INSERT INTO raw_events VALUES (40, %s)", (Jsonb({"proxy_email": relay}),))
     await conn.execute(
-        "INSERT INTO messages VALUES (40,77,%s,'inbound','still available?','zillow',40,NULL,NULL,'z-40',NULL,%s)",
-        (WATERMARK.replace(minute=12), WATERMARK.replace(minute=12)),
+        "INSERT INTO messages VALUES (40,77,%s,'inbound','still available?','zillow',40,NULL,NULL,'z-40',NULL,%s,%s)",
+        (WATERMARK.replace(minute=12), WATERMARK.replace(minute=12), WATERMARK.replace(minute=12)),
     )
     zillow = dict(
         operation=Operation.EMAIL_SEND,
@@ -488,9 +498,9 @@ async def test_an_internal_notification_lists_what_was_received_not_its_chats_ot
     )
     await add_message(conn, sender=JESSICA, minute=10, message_id=70)
     await conn.execute(
-        "INSERT INTO messages (id,channel_id,created_at,sent_at,direction,body,source) "
-        "VALUES (71,19,%s,%s,'outbound','lead alert about someone else','zoho_cliq')",
-        (WATERMARK.replace(minute=11), WATERMARK.replace(minute=11)),
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source) "
+        "VALUES (71,19,%s,%s,%s,'outbound','lead alert about someone else','zoho_cliq')",
+        (WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), WATERMARK.replace(minute=11)),
     )
     assert await refs(repository, **notification) == ["message:70"]
 
@@ -502,3 +512,86 @@ async def test_as_of_replays_the_world_as_it_stood(traffic):
     await add_message(conn, sender=JESSICA, minute=14, message_id=81)
     items = await repository.newer_context(context(), limit=11, waive_shown=True, as_of=WATERMARK.replace(minute=12))
     assert [item.ref for item in items] == ["message:80"]
+
+
+# ----------------------------------------------------------------------------
+# Re-ingests and re-scrapes are not new messages
+# ----------------------------------------------------------------------------
+
+RELAY = "lead-9@convo.zillow.com"
+ZILLOW_REPLY = dict(
+    operation=Operation.EMAIL_SEND,
+    source="zillow",
+    target=DerivedTarget("email_thread", RELAY, True),
+    recipient_phone=None,
+    channel_id=30235,
+)
+
+
+SCRAPED_TEXT = "Is the unit still available for a tour this week?"
+
+
+async def add_scrape(conn, message_id, *, channel, received_minute, sent_minute=8, sender=59237, text=SCRAPED_TEXT):
+    """A zillow_rm_web_extract row as production stores it (messages 29008 /
+    29052, 2026-06-02): the scraped timestamp as sent_at (and so created_at),
+    the relay address in the payload, no direction, no canonical id; a later
+    extraction batch re-scrapes the same message onto another channel under a
+    new source_message_id, 1.9 hours later."""
+    await conn.execute("INSERT INTO raw_events VALUES (%s,%s)", (message_id, Jsonb({"proxy_email": RELAY})))
+    await conn.execute(
+        "INSERT INTO messages VALUES (%s,%s,%s,NULL,%s,'zillow_rm_web_extract',%s,%s,NULL,%s,NULL,%s,%s)",
+        (message_id, channel, WATERMARK.replace(minute=sent_minute), text, message_id, sender,
+         f"zrm-msg:{message_id}", WATERMARK.replace(minute=sent_minute), WATERMARK.replace(minute=received_minute)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_re_scrape_of_a_message_already_in_cds_is_not_new(traffic):
+    conn, repository = traffic
+    await add_scrape(conn, 29008, channel=30235, received_minute=8)  # the wake's channel, in context
+    await add_scrape(conn, 29052, channel=30572, received_minute=14)  # the later batch, another channel
+    assert await refs(repository, **ZILLOW_REPLY) == []
+
+
+@pytest.mark.asyncio
+async def test_a_re_scrape_does_not_hide_a_new_message_or_another_senders_words(traffic):
+    conn, repository = traffic
+    await add_scrape(conn, 29008, channel=30235, received_minute=8)
+    await add_scrape(conn, 29052, channel=30572, received_minute=14)
+    await add_scrape(conn, 29060, channel=30572, received_minute=14, sent_minute=12, text="Actually, can we do Saturday?")
+    await add_scrape(conn, 29061, channel=30572, received_minute=14, sender=59999)
+    assert await refs(repository, **ZILLOW_REPLY) == ["message:29060", "message:29061"]
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_that_first_reached_cds_after_the_watermark_is_still_new(traffic):
+    """Only a copy of something that had reached CDS by the watermark is old."""
+    conn, repository = traffic
+    await add_scrape(conn, 29008, channel=30572, received_minute=11)
+    await add_scrape(conn, 29052, channel=30573, received_minute=14)
+    assert await refs(repository, **ZILLOW_REPLY) == ["message:29008", "message:29052"]
+
+
+@pytest.mark.asyncio
+async def test_a_re_ingest_of_a_canonical_message_already_in_cds_is_not_new(traffic):
+    conn, repository = traffic
+    email = {"operation": Operation.EMAIL_SEND}
+    await add_message(conn, sender=JESSICA, minute=8, message_id=90)  # in context (before the watermark)
+    await add_message(conn, sender=JESSICA, minute=12, sent_minute=8, message_id=91)
+    await conn.execute("UPDATE messages SET canonical_message_id = 90, body = 'resent copy' WHERE id = 91")
+    assert await refs(repository, **email) == []
+    await conn.execute("UPDATE messages SET canonical_message_id = NULL WHERE id = 91")
+    assert await refs(repository, **email) == ["message:91"]
+
+
+@pytest.mark.asyncio
+async def test_reaching_cds_is_received_at_not_the_send_time(traffic):
+    """messages.created_at is a generated alias of sent_at in production. A
+    text Jessica sent before the watermark that reached CDS only after it was
+    not in the agent's context (zoho_mail's median ingest lag is ~7 min)."""
+    conn, repository = traffic
+    await add_message(conn, sender=JESSICA, minute=12, sent_minute=8, message_id=95)
+    assert await refs(repository) == ["message:95"]
+    # Received before the watermark, it was context.
+    await conn.execute("UPDATE messages SET received_at = %s WHERE id = 95", (WATERMARK.replace(minute=8),))
+    assert await refs(repository) == []

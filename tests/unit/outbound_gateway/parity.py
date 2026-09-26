@@ -384,6 +384,7 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     *,
     prefix: tuple[Any, ...],
     current_logs: str,
+    current_queried: bool = True,
 ) -> str | None:
     """Name the declared difference that explains the FIRST observable
     divergence; `*_rest` start at it. Everything after it follows from it."""
@@ -404,6 +405,12 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # raises (was: the terminal traffic_blocked failure).
     if current is not None and current[0] == "service_raise" and "could not be recorded" in new:
         return "unrecordable_question_raises_nothing_sent"
+    # No answer means no send: where nobody can be asked (worker, Restate
+    # prepare, confirmation off, retry_ready) unshown newer context ends the
+    # action as a `stale_context_unasked` no-send (retry_ready: dead_letter).
+    # The legacy terminal-failed, preflight-staled, deferred -- or sent.
+    if "stale_context_unasked" in new and "stale_context_unasked" not in old:
+        return "unasked_newer_context_is_a_stale_no_send"
     asked = "store.block_stale_context" in new or (current_result is not None and current_result.get("status") == "needs_confirmation")
     legacy_stale_verdict = (
         "newer_inbound" in old
@@ -413,13 +420,21 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # One switch: in OUTBOUND_TRAFFIC_CONTROL=shadow the question is only
     # logged. The legacy's preflight newer_inbound and newer-outbound
     # question ignored the mode.
-    if not asked and "stale-context shadow would-ask" in current_logs and (legacy_stale_verdict or "store.block_stale_context" in old):
+    if not asked and "stale-context shadow would-" in current_logs and (legacy_stale_verdict or "store.block_stale_context" in old):
         return "shadow_mode_only_logs"
     # A stale verdict of the legacy (preflight newer_inbound `stale`, the
     # terminal traffic_blocked failure, the stale_context deferral): now the
     # question -- or, where nobody can be asked, the normal gate goes on.
     if legacy_stale_verdict and "store.block_stale_context" not in old:
-        return "newer_inbound_is_the_question" if asked else "nobody_can_be_asked_no_stale_verdict"
+        if asked:
+            return "newer_inbound_is_the_question"
+        # OUTBOUND_TRAFFIC_CONTROL=off (or no probe) now switches off every
+        # stale check; the legacy preflight's newer_inbound ignored it.
+        if not current_queried:
+            return "traffic_control_off_means_no_stale_check"
+        # The one query waives what this wake's agent was already shown, with
+        # confirmation on or off; the legacy waived nothing while it was off.
+        return "already_shown_items_are_not_new"
     # The legacy newer-outbound question ignored override=true (the
     # historical "yes"); the one question takes it as yes for every item.
     last_call = next((event for event in reversed(prefix) if event[0] == "service"), None)
@@ -466,7 +481,8 @@ def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
         # after an identical course that differed only in wording.
         return WORDING, ""
     logs = " | ".join(str(event[1][3]) for event in current.events if event[1][0] == "log")
-    name = _declared(old[index:], new[index:], prefix=old[:index], current_logs=logs)
+    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current.events)
+    name = _declared(old[index:], new[index:], prefix=old[:index], current_logs=logs, current_queried=queried)
     before = old[index] if index < len(old) else None
     after = new[index] if index < len(new) else None
     where = f"observable event {index}:\n  legacy : {before!r}\n  current: {after!r}"
@@ -580,4 +596,6 @@ async def replay_existing(module: ModuleType, function: Callable[..., Any], case
     current.events = current.events[:-1]
     name, _where = compare(legacy, current)
     record_declared("existing", name)
+    if os.environ.get("PARITY_NAMES"):
+        record_declared("existing_names", f"{name}\t{function.__name__}")
     return name

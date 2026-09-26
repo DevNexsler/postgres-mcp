@@ -39,7 +39,6 @@ from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import CompletionKind
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
-from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import NewerActivity
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
@@ -342,24 +341,40 @@ async def test_newer_inbound_and_our_newer_send_are_one_question():
 
 
 @pytest.mark.asyncio
-async def test_with_confirmation_disabled_nobody_can_be_asked_so_the_send_proceeds(caplog):
-    """The gateway is a recorder: when it cannot ask, it does not decide."""
+async def test_with_confirmation_disabled_nobody_is_asked_and_nothing_stale_is_sent(caplog):
+    """Confirmation off: never ask, and never send stale. Our newer email to
+    the target ends the action as a deliberate stale_context_unasked no-send."""
     service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,), enabled=False)
     with caplog.at_level(logging.WARNING, logger="postgres_mcp.outbound_gateway"):
         result = await service.execute(email_request())
 
-    assert result.status is PublicStatus.SENT, result
-    assert adapter.sent == [EMAIL_TEXT]
-    assert store.rows[FIRST].completion_kind is CompletionKind.SENT
-    assert any("806300" in record.getMessage() for record in caplog.records)
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked"), result
+    assert "deliberate no-send" in result.detail
+    assert adapter.sent == []
+    assert store.rows[FIRST].state is ActionState.STALE
+    assert any("806300" in record.getMessage() and "nobody to ask" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_the_worker_has_nobody_to_ask_and_sends():
-    """A calendar-dependent reply resumed by the worker: no agent to ask."""
+async def test_the_worker_has_nobody_to_ask_so_newer_context_means_no_send():
+    """A reply resumed by the worker over our newer email to the target: no
+    answer means no send -- never 9 hours late over newer messages."""
     service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
     ctx = await Loader().load(email_request())
-    ctx = replace(ctx, intent_kind=IntentKind.INQUIRY_REPLY)
+    await store.create_or_load(ctx)
+    store.rows[FIRST] = replace(store.rows[FIRST], state=ActionState.DEPENDENCY_WAIT, action_role=ActionRole.PROSPECT_REPLY)
+
+    result = await service.resume(FIRST)
+
+    assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_unasked"), result
+    assert store.rows[FIRST].state is ActionState.STALE
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_worker_sends_the_saved_record_when_nothing_is_newer():
+    service, store, _probe, adapter = harness()
+    ctx = await Loader().load(email_request())
     await store.create_or_load(ctx)
     store.rows[FIRST] = replace(store.rows[FIRST], state=ActionState.DEPENDENCY_WAIT, action_role=ActionRole.PROSPECT_REPLY)
 
