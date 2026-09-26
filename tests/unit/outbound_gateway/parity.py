@@ -407,7 +407,7 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
         return "unrecordable_question_raises_nothing_sent"
     # No answer means no send: where nobody can be asked (worker, Restate
     # prepare, confirmation off, retry_ready) unshown newer context ends the
-    # action as a `stale_context_unasked` no-send (retry_ready: dead_letter).
+    # action as a `stale_context_unasked` no-send (retry_ready included).
     # The legacy terminal-failed, preflight-staled, deferred -- or sent.
     if "stale_context_unasked" in new and "stale_context_unasked" not in old:
         return "unasked_newer_context_is_a_stale_no_send"

@@ -65,6 +65,11 @@ ALLOWED_TRANSITIONS: dict[ActionState, set[ActionState]] = {
         ActionState.DISPATCHING,
         ActionState.DEFINITIVE_FAILED,
         ActionState.DEAD_LETTER,
+        # A retry nobody can be asked about, over newer context: the
+        # stale_context_unasked no-send. The edge is added by the pending
+        # Comm-Data-Store migration that deploys before this gateway change;
+        # mirrored here (and pinned in test_state_machine) until it lands.
+        ActionState.STALE,
     },
     ActionState.DEAD_LETTER: {ActionState.MANUAL_REVIEW},
     ActionState.MANUAL_REVIEW: {ActionState.COMPLETED, ActionState.DEFINITIVE_FAILED},

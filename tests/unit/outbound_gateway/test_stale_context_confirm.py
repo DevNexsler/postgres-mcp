@@ -824,9 +824,10 @@ async def test_worker_resume_with_nothing_newer_sends_the_saved_record():
 
 
 @pytest.mark.asyncio
-async def test_a_retry_ready_row_over_newer_context_is_parked_not_sent():
-    """retry_ready has no edge into `stale` (migration 153): no send, parked
-    in dead_letter with the same detail -- still never definitive_failed."""
+async def test_a_retry_ready_row_over_newer_context_ends_stale_unasked_not_sent():
+    """A retry nobody can be asked about, over newer context: the same
+    deliberate stale_context_unasked no-send (the retry_ready -> stale edge
+    comes with the pending Comm-Data-Store migration), never definitive_failed."""
     service, store, _probe, adapter = harness(CRON_ALERT)
     ctx = await FakeLoader().load(execute_request())
     row = await store.create_or_load(ctx)
@@ -834,7 +835,8 @@ async def test_a_retry_ready_row_over_newer_context_is_parked_not_sent():
 
     result = await service.resume(BLOCKED)
 
-    assert (store.rows[BLOCKED].state, result.detail_code) == (ActionState.DEAD_LETTER, "stale_context_unasked")
+    assert (store.rows[BLOCKED].state, result.detail_code) == (ActionState.STALE, "stale_context_unasked")
+    assert ("claim", BLOCKED, ActionState.RETRY_READY) in store.calls
     assert adapter.sent == []
 
 

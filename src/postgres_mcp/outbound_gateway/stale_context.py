@@ -12,9 +12,9 @@ Nothing else about freshness is decided anywhere. Where nobody can be asked
 -- the worker resuming a saved action, Restate preparing one, confirmation
 disabled, a retry_ready row -- no answer means no send: if anything newer is
 unshown, the action ends as a deliberate `stale` no-send with detail
-`stale_context_unasked` (a retry_ready row, which has no edge into `stale`,
-is parked in dead_letter), never definitive_failed, and the items are
-logged. A newer inbound gets its own wake, whose agent sees everything. With
+`stale_context_unasked` (a retry_ready row too: the retry_ready -> stale
+edge comes with the Comm-Data-Store migration this change deploys after),
+never definitive_failed, and the items are logged. A newer inbound gets its own wake, whose agent sees everything. With
 nothing newer, the saved record is sent.
 
 Two layers:
@@ -398,16 +398,13 @@ class StaleContextQuestions:
         agent_facing: bool,
     ) -> PublicResult | None:
         """No answer means no send: end the action as a deliberate
-        `stale_context_unasked` no-send. A retry_ready row has no edge into
-        `stale` (Comm-Data-Store migration 153) and is parked in dead_letter
-        instead. None (send as before) only for a state that cannot hold
-        this, which no caller reaches."""
-        if action.state is ActionState.RETRY_READY:
-            target = ActionState.DEAD_LETTER
-        elif action.state in STALE_BLOCKABLE_STATES:
-            target = ActionState.STALE
-        else:
+        `stale_context_unasked` no-send, retry_ready included (its edge into
+        `stale` comes with the Comm-Data-Store migration this change deploys
+        after). None (send as before) only for a state that cannot hold this,
+        which no caller reaches."""
+        if action.state not in STALE_BLOCKABLE_STATES | {ActionState.RETRY_READY}:
             return None
+        target = ActionState.STALE
         logger.warning(
             "newer context and nobody to ask (%s): wake=%s action=%s state=%s newer=%s; not sent (%s)",
             "confirmation disabled" if agent_facing and not self.enabled else ("agent" if agent_facing else "worker"),

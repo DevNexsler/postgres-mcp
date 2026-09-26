@@ -547,7 +547,7 @@ def _one_question_invariants(store, path: str, *, service, unshown_item: bool, r
     """The design, checked on the current side of every matrix case: nothing
     ends definitive_failed over staleness; the worker never asks, and over
     unshown newer context it never sends -- a `stale_context_unasked`
-    no-send (retry_ready: dead_letter); `no` is a deliberate `stale` no-send."""
+    no-send (retry_ready included); `no` is a deliberate `stale` no-send."""
     states = {row.state for row in store.rows.values()}
     assert ActionState.DEFINITIVE_FAILED not in states, path
     if path.startswith(("resume_", "prepare_")):
@@ -557,8 +557,7 @@ def _one_question_invariants(store, path: str, *, service, unshown_item: bool, r
         if unshown_item:
             assert adapter.sent == [], path
             assert action.detail_code == "stale_context_unasked", (path, action.state, action.detail_code)
-            expected = ActionState.DEAD_LETTER if path == "resume_retry_ready" else ActionState.STALE
-            assert action.state is expected, path
+            assert action.state is ActionState.STALE, path
         else:
             assert action.detail_code != "stale_context_unasked", path
     if path == "confirm_no":
