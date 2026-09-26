@@ -1,3 +1,4 @@
+import itertools
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -8,7 +9,10 @@ import pytest
 
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.legacy_judgment.preflight import PreflightEvidence as LegacyEvidence
+from postgres_mcp.outbound_gateway.legacy_judgment.preflight import SafetyPreflight as LegacyPreflight
 from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
@@ -53,73 +57,8 @@ def context(**overrides):
     return ActionContext(**values)
 
 
-def evidence(ctx, **overrides):
-    values = {
-        "current_recipient_id": ctx.target.target_id,
-        "current_property_id": ctx.property_id,
-        "current_appointment_slot": ctx.appointment_slot,
-        "later_inbound_message_id": None,
-        "calendar_dependency": CalendarDependencyState.NOT_REQUIRED,
-        "calendar_already_applied": False,
-        "calendar_context_changed": False,
-        "overlapping_showing_prospect_ids": (),
-        "refresh_required_through": NOW,
-        "refresh": None,
-    }
-    values.update(overrides)
-    return PreflightEvidence(**values)
-
-
-def test_later_prospect_turn_is_stale_and_a_newer_outbound_is_never_a_verdict():
-    ctx = context(source="quo")
-    stale = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, later_inbound_message_id=701),
-        now=NOW,
-    )
-    assert stale.outcome == PreflightOutcome.STALE
-    assert stale.detail_code == "newer_inbound"
-    # Wake 27279: the preflight no longer decides a send was already handled
-    # from outbound activity. The service shows it to the agent instead.
-    shown_not_decided = SafetyPreflight.evaluate(ctx, evidence(ctx, later_outbound_message_ids=(702,)), now=NOW)
-    assert shown_not_decided.outcome == PreflightOutcome.READY
-    assert shown_not_decided.detail_code == "ready"
-
-
-def test_unrelated_messages_do_not_suppress_calendar_or_internal_roles():
-    calendar = context(
-        source="zillow",
-        action_role=ActionRole.CALENDAR_MUTATION,
-        operation=Operation.CALENDAR_CREATE,
-        intent_kind=IntentKind.SHOWING_CREATE,
-        target=DerivedTarget("calendar", "nigel", True),
-    )
-    internal = context(
-        source="zoho_cliq",
-        action_role=ActionRole.INTERNAL_NOTIFICATION,
-        operation=Operation.CLIQ_CHANNEL_POST,
-        intent_kind=IntentKind.LEAD_ALERT,
-        appointment_slot=None,
-        target=DerivedTarget("cliq_channel", "tenant-leads", True),
-    )
-    noisy = {"later_inbound_message_id": 999, "later_outbound_message_ids": (1000,)}
-    assert SafetyPreflight.evaluate(calendar, evidence(calendar, **noisy), now=NOW).outcome == PreflightOutcome.READY
-    assert SafetyPreflight.evaluate(internal, evidence(internal, **noisy), now=NOW).outcome == PreflightOutcome.READY
-
-
-@pytest.mark.parametrize(
-    ("changed", "detail"),
-    [
-        ({"current_recipient_id": "wrong"}, "recipient_mismatch"),
-        ({"current_property_id": "building:other"}, "context_mismatch"),
-        ({"current_appointment_slot": datetime(2026, 7, 17, 15, 0, tzinfo=timezone.utc)}, "context_mismatch"),
-    ],
-)
-def test_recipient_property_and_slot_changes_reject(changed, detail):
-    ctx = context(source="quo")
-    decision = SafetyPreflight.evaluate(ctx, evidence(ctx, **changed), now=NOW)
-    assert decision.outcome == PreflightOutcome.REJECTED
-    assert decision.detail_code == detail
+def evidence(state=CalendarDependencyState.NOT_REQUIRED):
+    return PreflightEvidence(calendar_dependency=state)
 
 
 @pytest.mark.parametrize(
@@ -136,71 +75,132 @@ def test_confirmation_reschedule_and_cancellation_wait_for_calendar(intent):
         intent_kind=intent,
         appointment_slot=None if intent is IntentKind.SHOWING_CANCELLATION else context().appointment_slot,
     )
-    waiting = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, calendar_dependency=CalendarDependencyState.PENDING),
-        now=NOW,
-    )
+    waiting = SafetyPreflight.evaluate(ctx, evidence(CalendarDependencyState.PENDING))
     assert waiting.outcome == PreflightOutcome.DEPENDENCY_WAIT
     assert waiting.detail_code == "calendar_dependency_pending"
-    ready = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, calendar_dependency=CalendarDependencyState.COMPLETED),
-        now=NOW,
-    )
+    failed = SafetyPreflight.evaluate(ctx, evidence(CalendarDependencyState.FAILED))
+    assert failed.outcome == PreflightOutcome.MANUAL_REVIEW
+    assert failed.detail_code == "calendar_dependency_failed"
+    ready = SafetyPreflight.evaluate(ctx, evidence(CalendarDependencyState.COMPLETED))
     assert ready.outcome == PreflightOutcome.READY
 
 
-def test_inquiry_and_offer_need_no_calendar_dependency_and_group_showings_pass():
-    for intent in (IntentKind.INQUIRY_REPLY, IntentKind.SHOWING_OFFER):
-        ctx = context(
-            source="quo",
-            intent_kind=intent,
-            appointment_slot=None if intent is IntentKind.INQUIRY_REPLY else context().appointment_slot,
-        )
-        decision = SafetyPreflight.evaluate(
-            ctx,
-            evidence(
-                ctx,
-                calendar_dependency=CalendarDependencyState.NOT_REQUIRED,
-                overlapping_showing_prospect_ids=("prospect:b", "prospect:c"),
-            ),
-            now=NOW,
-        )
-        assert decision.outcome == PreflightOutcome.READY
-        assert "staff" not in decision.detail_code
+@pytest.mark.parametrize("role", list(ActionRole))
+@pytest.mark.parametrize("intent", list(IntentKind))
+@pytest.mark.parametrize("state", list(CalendarDependencyState))
+def test_the_preflight_is_the_calendar_dependency_and_nothing_else(role, intent, state):
+    """Only a prospect reply confirming, moving or cancelling a showing waits
+    on the calendar; everything else is ready -- no freshness, recipient or
+    context verdict exists any more."""
+    decision = SafetyPreflight.evaluate(context(action_role=role, intent_kind=intent), evidence(state))
+    waits = role is ActionRole.PROSPECT_REPLY and intent in {
+        IntentKind.SHOWING_CONFIRMATION,
+        IntentKind.SHOWING_RESCHEDULE,
+        IntentKind.SHOWING_CANCELLATION,
+    }
+    if not waits or state is CalendarDependencyState.COMPLETED:
+        assert decision.outcome is PreflightOutcome.READY
+    elif state is CalendarDependencyState.FAILED:
+        assert decision.outcome is PreflightOutcome.MANUAL_REVIEW
+    else:
+        assert decision.outcome is PreflightOutcome.DEPENDENCY_WAIT
+    assert {outcome.value for outcome in PreflightOutcome} == {"ready", "dependency_wait", "manual_review"}
 
 
-def test_calendar_duplicate_and_changed_revision_are_role_specific():
-    ctx = context(
-        source="zillow",
-        action_role=ActionRole.CALENDAR_MUTATION,
-        operation=Operation.CALENDAR_CREATE,
-        intent_kind=IntentKind.SHOWING_CREATE,
-        target=DerivedTarget("calendar", "nigel", True),
+# ----------------------------------------------------------------------------
+# Why recipient_mismatch / context_mismatch could go: they were unreachable.
+# ----------------------------------------------------------------------------
+
+
+def bf41be6_loader_evidence(ctx):
+    """The evidence the deployed loader built at bf41be6 (evidence.py:315-318):
+    the "current" recipient, property and slot were copied FROM the context
+    being judged, so comparing them with that context compared a value with
+    itself."""
+    return LegacyEvidence(
+        current_recipient_id=ctx.target.target_id,
+        current_property_id=ctx.property_id,
+        current_appointment_slot=ctx.appointment_slot,
+        later_inbound_message_id=None,
+        calendar_dependency=CalendarDependencyState.COMPLETED,
+        calendar_already_applied=False,
+        calendar_context_changed=False,
+        overlapping_showing_prospect_ids=(),
+        refresh_required_through=NOW,
+        refresh=None,
     )
-    duplicate = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, calendar_already_applied=True),
-        now=NOW,
+
+
+TARGETS = (
+    DerivedTarget("email_thread", "a@convo.zillow.com", True),
+    DerivedTarget("quo_conversation", "+15705550143", True),
+    DerivedTarget("cliq_chat", "1424728044450751028", True),
+    DerivedTarget("tenantcloud_thread", "6001", True),
+    DerivedTarget("calendar", "nigel", True),
+)
+PROPERTIES = (None, "building:bullman", "building:other")
+SLOTS = (None, datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc), datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc))
+
+
+def test_recipient_and_context_mismatch_are_unreachable_through_the_deployed_loader():
+    """Try every target kind, property and slot (including values that moved
+    in CDS: the evidence is built per call from whatever context is judged)
+    through the frozen bf41be6 preflight with the bf41be6 loader's evidence.
+    With a verified target -- the only kind the context loader derives -- the
+    mismatch branches never fire."""
+    tried = 0
+    for role, target, property_id, slot in itertools.product(list(ActionRole), TARGETS, PROPERTIES, SLOTS):
+        ctx = context(action_role=role, target=target, property_id=property_id, appointment_slot=slot)
+        decision = LegacyPreflight.evaluate(ctx, bf41be6_loader_evidence(ctx), now=NOW)
+        assert decision.detail_code not in {"recipient_mismatch", "context_mismatch"}, (role, target, property_id, slot)
+        tried += 1
+    assert tried == len(ActionRole) * len(TARGETS) * len(PROPERTIES) * len(SLOTS)
+
+
+def test_the_one_residual_path_was_an_unverified_target_which_nothing_writes():
+    """The branch fired only on target.verified False. The context loader
+    raises instead of deriving one (context.py: "verified target could not be
+    derived"), every DerivedTarget it builds is verified, the store records
+    recipient_scope from that target, and Comm-Data-Store migration 206
+    freezes the record. Only a hand-written record without "verified" would
+    reach it (prod: 0 of 844 rows, 2026-09-26)."""
+    ctx = context(target=DerivedTarget("email_thread", "a@convo.zillow.com", False))
+    assert LegacyPreflight.evaluate(ctx, bf41be6_loader_evidence(ctx), now=NOW).detail_code == "recipient_mismatch"
+    # The current preflight has no such verdict: the record decides who receives what.
+    assert SafetyPreflight.evaluate(ctx, evidence()).outcome is PreflightOutcome.READY
+
+
+@pytest.mark.asyncio
+async def test_the_worker_sends_the_recorded_recipient_property_and_slot_when_cds_moved_them():
+    """The legitimate-change case: property and appointment slot (and even
+    the live target) moved in CDS between record and dispatch. The worker
+    executes the saved record (migration 206 lock + _recorded_context), so
+    the preflight judges -- and the adapter receives -- the recorded values;
+    there is nothing left to mismatch against."""
+    from postgres_mcp.outbound_gateway.service import _recorded_context
+
+    from .test_service import row
+
+    recorded = context()
+    record = row(
+        ActionState.PREPARED,
+        action_id=recorded.action_id,
+        intent_kind=recorded.intent_kind,
+        appointment_slot=recorded.appointment_slot,
+        canonical_context={"property_id": recorded.property_id, "source_message_id": 700},
+        recipient_scope={"kind": "email_thread", "target_id": recorded.target.target_id, "verified": True},
+        payload_hash="b" * 64,
     )
-    assert duplicate.outcome == PreflightOutcome.DUPLICATE
-    assert duplicate.detail_code == "calendar_already_applied"
-    stale = SafetyPreflight.evaluate(
-        ctx,
-        evidence(ctx, calendar_context_changed=True),
-        now=NOW,
+    moved = context(
+        property_id="building:moved",
+        appointment_slot=datetime(2026, 7, 19, 11, 0, tzinfo=timezone.utc),
+        target=DerivedTarget("email_thread", "someone-else@convo.zillow.com", True),
     )
-    assert stale.outcome == PreflightOutcome.STALE
-    assert stale.detail_code == "calendar_context_changed"
 
+    executed = _recorded_context(record, moved)
 
-@pytest.mark.parametrize("age", [timedelta(minutes=29), timedelta(minutes=30), timedelta(hours=3)])
-def test_zillow_refresh_policy_is_skill_owned_not_duplicated_in_gateway(age):
-    ctx = context(source_sent_at=NOW - age)
-
-    decision = SafetyPreflight.evaluate(ctx, evidence(ctx, refresh=None), now=NOW)
-
-    assert decision.outcome == PreflightOutcome.READY
-    assert decision.detail_code == "ready"
-    assert "staff" not in decision.detail_code
+    assert executed.target == recorded.target
+    assert executed.property_id == recorded.property_id
+    assert executed.appointment_slot == recorded.appointment_slot
+    legacy = LegacyPreflight.evaluate(executed, bf41be6_loader_evidence(executed), now=NOW)
+    assert legacy.detail_code not in {"recipient_mismatch", "context_mismatch"}

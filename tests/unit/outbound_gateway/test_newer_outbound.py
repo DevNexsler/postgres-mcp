@@ -29,30 +29,27 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from types import MappingProxyType
-from typing import Any
-from unittest.mock import AsyncMock
-from unittest.mock import patch
 
 import pytest
 
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.context import canonical_payload_hash
-from postgres_mcp.outbound_gateway.evidence import DatabasePreflightEvidenceLoader
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import CompletionKind
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import IntentKind
+from postgres_mcp.outbound_gateway.models import NewerActivity
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.service import OutboundActionService
-from postgres_mcp.outbound_gateway.traffic_control import NewerActivity
 
 from .test_stale_context_confirm import CliqAdapter
 from .test_stale_context_confirm import LedgerProbe
 from .test_stale_context_confirm import LedgerStore
+from .test_stale_context_confirm import StaticEvidence
 from .test_stale_context_confirm import action_id_for
 from .test_stale_context_confirm import confirm
 
@@ -181,54 +178,27 @@ class Loader:
         return {}
 
 
-class Row:
-    def __init__(self, cells: dict[str, Any]) -> None:
-        self.cells = cells
-
-
-# What the database returns for wake 27279's email.send. The pre-fix query
-# selected the Cliq cron post (806236) as "verified outbound"; the fixed query
-# selects only outbound to the action's target, and there is none. The one row
-# carries both shapes so each version of the loader reads its own columns;
-# tests/integration/test_gateway_newer_outbound.py proves the SQL itself.
-WAKE_27279_EVIDENCE_ROW = {
-    "later_inbound_message_id": None,
-    "later_inbound_message_ids": None,
-    "verified_outbound_message_id": 806236,
-    "verified_outbound_request_ref": "1790427950439_7335230729575",
-    "later_outbound_message_ids": None,
-    "latest_sent_at": CRON_POST_AT,
-    "calendar_dependency_state": "not_required",
-    "calendar_already_applied": False,
-}
-
-
 def harness(
     *,
-    evidence_row: dict[str, Any] | None = None,
     later_outbound: tuple[int, ...] = (),
     later_inbound: tuple[int, ...] = (),
     known: tuple[NewerActivity, ...] = (),
     enabled: bool = True,
 ):
+    """The world of wake 27279: what the current gateway's newer_context
+    query finds (`later_inbound` + `later_outbound`, looked up in `known`),
+    carried as the world evidence the frozen bf41be6 judgment read. The Cliq
+    cron post in the source DM is in neither: it is not the email's target
+    (tests/integration/test_gateway_newer_outbound.py proves that in SQL)."""
     store = LedgerStore()
     probe = LedgerProbe(store)
     probe.elsewhere.extend(known)
+    probe.related = later_inbound + later_outbound
     adapter = CliqAdapter()
-    row = dict(evidence_row or WAKE_27279_EVIDENCE_ROW)
-    if evidence_row is None:
-        row.update(
-            verified_outbound_message_id=None,
-            verified_outbound_request_ref=None,
-            later_outbound_message_ids=list(later_outbound) or None,
-            later_inbound_message_ids=list(later_inbound) or None,
-            later_inbound_message_id=max(later_inbound) if later_inbound else None,
-        )
-    evidence = DatabasePreflightEvidenceLoader(object())
     service = OutboundActionService(
         store=store,
         context_loader=Loader(),
-        evidence_loader=evidence,
+        evidence_loader=StaticEvidence(*later_inbound, outbound=later_outbound),
         adapters={Operation.EMAIL_SEND: adapter, Operation.QUO_SMS_SEND: adapter},
         provider_client=object(),
         clock=lambda: EXECUTED_AT,
@@ -237,22 +207,14 @@ def harness(
         traffic_probe=probe,
         stale_confirm_enabled=enabled,
     )
-    return service, store, probe, adapter, row
-
-
-def database_returns(row: dict[str, Any]):
-    return patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(return_value=[Row(row)]),
-    )
+    return service, store, probe, adapter
 
 
 @pytest.mark.asyncio
 async def test_wake_27279_an_unrelated_cliq_post_never_completes_the_email_as_already_handled():
-    service, store, _probe, adapter, _row = harness(evidence_row=WAKE_27279_EVIDENCE_ROW)
+    service, store, _probe, adapter = harness()
 
-    with database_returns(WAKE_27279_EVIDENCE_ROW):
-        first = await service.execute(email_request())
+    first = await service.execute(email_request())
 
     record = store.rows[FIRST]
     assert (first.status, first.detail_code) == (PublicStatus.SENT, "provider_receipt_verified"), (
@@ -270,22 +232,21 @@ async def test_a_newer_outbound_to_the_target_is_a_question_listing_it_as_sent_b
     """(a) A genuine earlier email to the same prospect, after the source
     message: nothing is decided for the agent -- it is asked, and shown the
     email with direction outbound, labelled as ours."""
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
 
-    with database_returns(row):
-        result = await service.execute(email_request())
+    result = await service.execute(email_request())
 
     assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
     assert result.detail_code == "stale_context"
     assert result.action_id == FIRST
     assert result.new_context is not None and len(result.new_context) == 1
     item = result.new_context[0]
-    assert (item.id, item.source, item.direction) == ("message:806300", "zoho_mail", "outbound")
-    assert item.sender == "sent by us (Nigel Pine)"
+    assert (item.id, item.source, item.direction) == ("message:806300", "zoho_mail", "sent by us")
+    assert item.sender == "Nigel Pine"
     assert item.occurred_at == EARLIER_EMAIL.occurred_at
     assert "application link" in item.preview
     assert result.detail and "sent by us" in result.detail
-    assert result.question and "outbound" in result.question
+    assert result.question and "sent by us = a message we already sent" in result.question
     assert adapter.sent == []
     blocked = store.rows[FIRST]
     assert (blocked.state, blocked.detail_code, blocked.error_category) == (ActionState.STALE, "stale_context", None)
@@ -295,11 +256,10 @@ async def test_a_newer_outbound_to_the_target_is_a_question_listing_it_as_sent_b
 
 @pytest.mark.asyncio
 async def test_yes_sends_once_with_the_shown_outbound_waived():
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
-    with database_returns(row):
-        await service.execute(email_request())
-        result = await service.confirm(confirm(FIRST, "yes", wake=WAKE))
-        again = await service.confirm(confirm(FIRST, "yes", wake=WAKE))
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
+    await service.execute(email_request())
+    result = await service.confirm(confirm(FIRST, "yes", wake=WAKE))
+    again = await service.confirm(confirm(FIRST, "yes", wake=WAKE))
 
     assert result.status is PublicStatus.SENT, result
     assert result.action_id == SUCCESSOR
@@ -310,10 +270,9 @@ async def test_yes_sends_once_with_the_shown_outbound_waived():
 
 @pytest.mark.asyncio
 async def test_no_sends_nothing_and_records_the_decline():
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
-    with database_returns(row):
-        await service.execute(email_request())
-        result = await service.confirm(confirm(FIRST, "no", wake=WAKE))
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
+    await service.execute(email_request())
+    result = await service.confirm(confirm(FIRST, "no", wake=WAKE))
 
     assert (result.status, result.detail_code) == (PublicStatus.STALE, "stale_context_declined")
     assert adapter.sent == []
@@ -322,11 +281,10 @@ async def test_no_sends_nothing_and_records_the_decline():
 
 @pytest.mark.asyncio
 async def test_revise_sends_the_revised_text_to_the_same_recipient():
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
     revised = email_request("Following up: did the application link come through?").arguments.model_dump(mode="json", exclude_none=True)
-    with database_returns(row):
-        await service.execute(email_request())
-        result = await service.confirm(confirm(FIRST, "revise", revised, wake=WAKE))
+    await service.execute(email_request())
+    result = await service.confirm(confirm(FIRST, "revise", revised, wake=WAKE))
 
     assert result.status is PublicStatus.SENT, result
     assert adapter.sent == ["Following up: did the application link come through?"]
@@ -336,10 +294,9 @@ async def test_revise_sends_the_revised_text_to_the_same_recipient():
 @pytest.mark.asyncio
 async def test_the_identical_request_again_is_the_same_action_and_never_a_second_send():
     """(b) Exact-request dedupe is what stops the agent's own retries."""
-    service, store, _probe, adapter, row = harness()
-    with database_returns(row):
-        first = await service.execute(email_request())
-        second = await service.execute(email_request())
+    service, store, _probe, adapter = harness()
+    first = await service.execute(email_request())
+    second = await service.execute(email_request())
 
     assert first.status is PublicStatus.SENT
     assert second.status is PublicStatus.DUPLICATE
@@ -353,32 +310,42 @@ async def test_a_same_thread_reply_with_a_newer_outbound_in_the_thread_is_asked(
     """(c) A Quo reply in the prospect's own conversation after we already
     texted them there (15 of the 20 historical already_handled rows)."""
     earlier_text = replace(EARLIER_EMAIL, source="quo", message_id=806400, preview="ok great, I have you scheduled")
-    service, store, _probe, adapter, row = harness(later_outbound=(806400,), known=(earlier_text,))
-    with database_returns(row):
-        result = await service.execute(sms_request())
+    service, store, _probe, adapter = harness(later_outbound=(806400,), known=(earlier_text,))
+    result = await service.execute(sms_request())
 
     assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
-    assert [(item.id, item.direction) for item in result.new_context] == [("message:806400", "outbound")]
+    assert [(item.id, item.direction) for item in result.new_context] == [("message:806400", "sent by us")]
     assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_newer_inbound_keeps_its_existing_suppression_on_first_execute():
-    """Newer INBOUND is unchanged: the first execute is stale/newer_inbound,
-    whatever outbound there is too."""
-    service, _store, _probe, adapter, row = harness(later_outbound=(806300,), later_inbound=(806310,), known=(EARLIER_EMAIL,))
-    with database_returns(row):
-        result = await service.execute(email_request())
+async def test_newer_inbound_and_our_newer_send_are_one_question():
+    """Received and sent-by-us items come from one query and are listed in
+    one question -- no separate newer_inbound no-send."""
+    reply = replace(
+        EARLIER_EMAIL,
+        direction="inbound",
+        message_id=806310,
+        sender="Alberto",
+        occurred_at=EARLIER_EMAIL.occurred_at + timedelta(minutes=1),
+        preview="got it, thanks",
+    )
+    service, _store, _probe, adapter = harness(later_outbound=(806300,), later_inbound=(806310,), known=(EARLIER_EMAIL, reply))
+    result = await service.execute(email_request())
 
-    assert (result.status, result.detail_code) == (PublicStatus.STALE, "newer_inbound")
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
+    assert [(item.id, item.direction) for item in result.new_context] == [
+        ("message:806300", "sent by us"),
+        ("message:806310", "received"),
+    ]
     assert adapter.sent == []
 
 
 @pytest.mark.asyncio
 async def test_with_confirmation_disabled_nobody_can_be_asked_so_the_send_proceeds(caplog):
     """The gateway is a recorder: when it cannot ask, it does not decide."""
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,), enabled=False)
-    with caplog.at_level(logging.WARNING, logger="postgres_mcp.outbound_gateway"), database_returns(row):
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,), enabled=False)
+    with caplog.at_level(logging.WARNING, logger="postgres_mcp.outbound_gateway"):
         result = await service.execute(email_request())
 
     assert result.status is PublicStatus.SENT, result
@@ -390,14 +357,13 @@ async def test_with_confirmation_disabled_nobody_can_be_asked_so_the_send_procee
 @pytest.mark.asyncio
 async def test_the_worker_has_nobody_to_ask_and_sends():
     """A calendar-dependent reply resumed by the worker: no agent to ask."""
-    service, store, _probe, adapter, row = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
+    service, store, _probe, adapter = harness(later_outbound=(806300,), known=(EARLIER_EMAIL,))
     ctx = await Loader().load(email_request())
     ctx = replace(ctx, intent_kind=IntentKind.INQUIRY_REPLY)
     await store.create_or_load(ctx)
     store.rows[FIRST] = replace(store.rows[FIRST], state=ActionState.DEPENDENCY_WAIT, action_role=ActionRole.PROSPECT_REPLY)
 
-    with database_returns(row):
-        result = await service.resume(FIRST)
+    result = await service.resume(FIRST)
 
     assert result.status is PublicStatus.SENT, result
     assert adapter.sent == [EMAIL_TEXT]

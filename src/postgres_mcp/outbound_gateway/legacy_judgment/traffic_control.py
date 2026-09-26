@@ -14,6 +14,9 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+# Shared data type (same fields, ref and arm as at bf41be6).
+from ..models import NewerActivity
+
 
 @dataclass(frozen=True)
 class InFlightAction:
@@ -22,27 +25,6 @@ class InFlightAction:
     state: str
     created_at: datetime
     preview: str
-
-
-@dataclass(frozen=True)
-class NewerActivity:
-    direction: str
-    source: str
-    occurred_at: datetime
-    preview: str
-    message_id: int | None
-    action_id: UUID | None
-    sender: str | None = None
-
-    @property
-    def ref(self) -> str:
-        """Stable identity of this item: what a stale_context question records
-        as shown, and the only thing a later answer can waive."""
-        return f"message:{self.message_id}" if self.message_id else f"action:{self.action_id}"
-
-    @property
-    def arm(self) -> str:
-        return "messages" if self.message_id else "outbound_actions"
 
 
 @dataclass(frozen=True)

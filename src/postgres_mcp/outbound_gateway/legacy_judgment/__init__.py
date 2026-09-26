@@ -9,7 +9,8 @@ scenario through both and declare each intended difference by name.
 
 Only shared data types and I/O helpers (models, record, context, adapters,
 recovery) come from the live package; every decision module is a copy.
-Delete this package (and legacy_service.py, which imports it) once the
+It also stands in for the pre-split oracle (legacy_service.py, retired): the
+recovery parity compares against it. Delete this package once the
 simplification has been in production long enough to retire the comparison.
 """
 

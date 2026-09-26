@@ -15,13 +15,13 @@ from pglast import parse_sql
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.evidence import DatabasePreflightEvidenceLoader
-from postgres_mcp.outbound_gateway.evidence import OutboundTarget
-from postgres_mcp.outbound_gateway.evidence import outbound_target
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
-from postgres_mcp.outbound_gateway.preflight import RefreshStatus
+from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
+from postgres_mcp.outbound_gateway.repository import OutboundTarget
+from postgres_mcp.outbound_gateway.repository import outbound_target
 
 NOW = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
 
@@ -75,239 +75,13 @@ class Row:
 
 
 @pytest.mark.asyncio
-async def test_evidence_loader_reads_message_receipts_and_refresh_without_staff_gate():
+@pytest.mark.parametrize("state", list(CalendarDependencyState))
+async def test_the_evidence_loader_reads_the_calendar_dependency_only(state):
     calls = []
 
     async def execute(_driver, query, params):
         calls.append((query, params))
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "later_outbound_message_ids": [701],
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    loader = DatabasePreflightEvidenceLoader(object())
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        proof = await loader.load(context())
-
-    assert proof.later_outbound_message_ids == (701,)
-    assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED
-    assert proof.refresh.status is RefreshStatus.COVERED
-    assert proof.refresh.covered_thread_identity == "zrm-thread-1"
-    query = calls[0][0].casefold()
-    parse_sql(calls[0][0].replace("{}", "NULL"))
-    assert "verified_staff" not in query
-    assert "showing_slot_validation" not in query
-    assert "calendar_events" not in query
-    assert "related_messages" in query
-    assert "'{{data,object,conversationid}}'" in query
-    assert "'{{data,object,phonenumberid}}'" in query
-    assert "'{{data,object,direction}}'" in query
-    assert "recipient.value->>'address'" in query
-    # max and array_agg of later inbound share one filter. Newer outbound is
-    # keyed on the action's target, not on the source conversation.
-    assert query.count("(related.sent_at, related.id) > (") == 2
-    assert "verified_outbound" not in query
-    assert "as later_outbound_message_ids" in query
-    assert "candidate.source = any({}::text[])" in query
-    assert "(candidate.sent_at, candidate.id) > (" in query
-    assert "as later_inbound_message_ids" in query
-    assert "related.id = any({}::bigint[])" in query
-    assert calls[0][1] == [
-        "zillow",
-        "lead@convo.zillow.com",
-        "lead@convo.zillow.com",
-        "zillow",
-        "nigel-zoho",
-        "zrm-thread-1",
-        "zrm-thread-1",
-        "",
-        "",
-        "zillow",
-        44,
-        NOW,
-        700,
-        [700],
-        [],
-        NOW,
-        700,
-        [700],
-        [],
-        ["zoho_mail", "nigel_mail"],
-        NOW,
-        NOW,
-        700,
-        "email",
-        "lead@convo.zillow.com",
-        "lead@convo.zillow.com",
-        "lead@convo.zillow.com",
-        7,
-        "showing_offer",
-        7,
-        7,
-        NOW,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_evidence_excludes_only_canonical_cross_channel_duplicate_from_newer_inbound():
-    calls = []
-
-    async def execute(_driver, query, params):
-        calls.append((query, params))
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    duplicate_context = context(cross_channel_duplicate_message_ids=(196337,))
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        await DatabasePreflightEvidenceLoader(object()).load(duplicate_context)
-
-    query, params = calls[0]
-    normalized_query = " ".join(query.split())
-    assert ("NOT ( coalesce(related.canonical_message_id, related.id) = ANY({}::bigint[]) )") in normalized_query
-    assert params[13] == [700, 196337]
-
-
-@pytest.mark.asyncio
-async def test_evidence_excludes_durable_same_message_canonical_duplicates():
-    calls = []
-
-    async def execute(_driver, query, params):
-        calls.append((query, params))
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        await DatabasePreflightEvidenceLoader(object()).load(context())
-
-    query, params = calls[0]
-    normalized_query = " ".join(query.split())
-    assert "message_row.canonical_message_id" in normalized_query
-    assert "coalesce(related.canonical_message_id, related.id)" in normalized_query
-    assert "= ANY({}::bigint[])" in normalized_query
-    assert params[13] == [700]
-
-
-@pytest.mark.asyncio
-async def test_evidence_excludes_only_certified_zillow_scrape_rows_from_newer_inbound():
-    calls = []
-
-    async def execute(_driver, query, params):
-        calls.append((query, params))
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    certified_context = context(certified_older_message_ids=(197065, 197067))
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        await DatabasePreflightEvidenceLoader(object()).load(certified_context)
-
-    query, params = calls[0]
-    normalized_query = " ".join(query.split())
-    expected = "NOT ( lower(related.source) = 'zillow_rm_web_extract' AND related.id = ANY({}::bigint[]) )"
-    assert expected in normalized_query
-    assert params[14] == [197065, 197067]
-
-
-@pytest.mark.asyncio
-async def test_quo_evidence_query_binds_conversation_line_target_and_nested_receipt():
-    calls = []
-
-    async def execute(_driver, query, params):
-        calls.append((query, params))
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "later_outbound_message_ids": [702],
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    quo_context = context(
-        operation=Operation.QUO_SMS_SEND,
-        source="quo",
-        target=DerivedTarget("quo_conversation", "conversation-live", True),
-        provider_account="PN-line-live",
-        thread_identity="conversation-live",
-        recipient_phone="+19085550199",
-    )
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        proof = await DatabasePreflightEvidenceLoader(object()).load(quo_context)
-
-    assert proof.later_outbound_message_ids == (702,)
-    query = calls[0][0].casefold()
-    assert "regexp_replace" in query
-    assert "lower(message_row.source) in ('quo', 'openphone')" in query
-    assert calls[0][1][4:9] == [
-        "PN-line-live",
-        "conversation-live",
-        "conversation-live",
-        "19085550199",
-        "19085550199",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_same_building_calendar_overlap_is_not_loaded_as_blocking_evidence():
-    async def execute(_driver, _query, _params):
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": None,
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
+        return [Row({"calendar_dependency_state": state.value})]
 
     with patch(
         "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
@@ -315,59 +89,13 @@ async def test_same_building_calendar_overlap_is_not_loaded_as_blocking_evidence
     ):
         proof = await DatabasePreflightEvidenceLoader(object()).load(context())
 
-    assert proof.overlapping_showing_prospect_ids == ()
-
-
-@pytest.mark.asyncio
-async def test_evidence_query_survives_literal_json_path_braces():
-    class Driver:
-        async def execute_query(self, query, *args, **kwargs):
-            assert "#>>'{data,object,phoneNumberId}'" in query
-            assert "#>>'{data,object,conversationId}'" in query
-            assert "#>>'{data,object,direction}'" in query
-            return [
-                Row(
-                    {
-                        "later_inbound_message_id": None,
-                        "latest_sent_at": NOW,
-                        "calendar_dependency_state": "not_required",
-                        "calendar_already_applied": False,
-                    }
-                )
-            ]
-
-    proof = await DatabasePreflightEvidenceLoader(Driver()).load(context())
-
-    assert proof.calendar_dependency is CalendarDependencyState.NOT_REQUIRED
-
-
-
-@pytest.mark.asyncio
-async def test_every_later_inbound_id_is_returned_not_only_the_newest():
-    """The stale_context waiver must see every newer inbound, not just max(id):
-    one shown and one unseen must not be waived as a set."""
-
-    async def execute(_driver, _query, _params):
-        return [
-            Row(
-                {
-                    "later_inbound_message_id": 902,
-                    "later_inbound_message_ids": [901, 902],
-                    "latest_sent_at": NOW,
-                    "calendar_dependency_state": "not_required",
-                    "calendar_already_applied": False,
-                }
-            )
-        ]
-
-    with patch(
-        "postgres_mcp.outbound_gateway.evidence.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=execute),
-    ):
-        evidence = await DatabasePreflightEvidenceLoader(object()).load(context())
-
-    assert evidence.later_inbound_message_id == 902
-    assert evidence.later_inbound_message_ids == (901, 902)
+    assert proof == PreflightEvidence(calendar_dependency=state)
+    query, params = calls[0]
+    parse_sql(query.replace("{}", "NULL"))
+    lowered = query.casefold()
+    # Newer messages are the stale-context question's, not the preflight's.
+    assert "messages" not in lowered and "later_inbound" not in lowered and "later_outbound" not in lowered
+    assert params == ["showing_offer", 7, 7]
 
 
 @pytest.mark.parametrize(
@@ -390,9 +118,15 @@ async def test_every_later_inbound_id_is_returned_not_only_the_newest():
             {"operation": Operation.TENANTCLOUD_MESSAGE_SEND, "target": DerivedTarget("tenantcloud_thread", "1861792", True)},
             OutboundTarget(("tenantcloud_api",), "channel", "tenantcloud:thread:1861792"),
         ),
-        # only a prospect reply asks about earlier sends to its recipient
+        # an internal reply answers in its own chat: our other posts there count
         (
             {"action_role": ActionRole.INTERNAL_REPLY, "operation": Operation.CLIQ_CHAT_POST,
+             "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
+            OutboundTarget(("zoho_cliq",), "channel", "1424728044450751028"),
+        ),
+        # a notification's chat carries other subjects' notifications: never context
+        (
+            {"action_role": ActionRole.INTERNAL_NOTIFICATION, "operation": Operation.CLIQ_CHAT_POST,
              "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
             OutboundTarget((), "none", ""),
         ),
@@ -403,5 +137,5 @@ async def test_every_later_inbound_id_is_returned_not_only_the_newest():
         ),
     ],
 )
-def test_newer_outbound_is_keyed_on_the_actions_own_target(overrides, expected):
+def test_sent_by_us_is_keyed_on_the_actions_own_target(overrides, expected):
     assert outbound_target(context(**overrides)) == expected

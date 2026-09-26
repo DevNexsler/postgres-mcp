@@ -11,6 +11,9 @@ from ..context import ActionContext
 from ..models import ActionRole
 from ..models import IntentKind
 
+# Shared data type (unchanged): one enum both sides compare by identity.
+from ..preflight import CalendarDependencyState
+
 
 class PreflightOutcome(StrEnum):
     READY = "ready"
@@ -19,13 +22,6 @@ class PreflightOutcome(StrEnum):
     REJECTED = "rejected"
     DEPENDENCY_WAIT = "dependency_wait"
     MANUAL_REVIEW = "manual_review"
-
-
-class CalendarDependencyState(StrEnum):
-    NOT_REQUIRED = "not_required"
-    PENDING = "pending"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 
 class RefreshStatus(StrEnum):

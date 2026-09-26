@@ -29,17 +29,22 @@ from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.context import canonical_payload_hash
+
+# The world evidence both sides of the parity replay read: the current
+# service reads only calendar_dependency; the frozen bf41be6 judgment also
+# read newer inbound and the (tautological) recipient/context copies.
+from postgres_mcp.outbound_gateway.legacy_judgment.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.metrics import CircuitStatus
 from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import CompletionKind
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import IntentKind
+from postgres_mcp.outbound_gateway.models import NewerActivity
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
-from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.provider_client import McpProviderClient
 from postgres_mcp.outbound_gateway.provider_client import McpServerConfig
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
@@ -47,7 +52,6 @@ from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_persisted_arguments
 from postgres_mcp.outbound_gateway.traffic_control import InFlightAction
-from postgres_mcp.outbound_gateway.traffic_control import NewerActivity
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -390,6 +394,10 @@ class FakeProbe:
     async def context_watermark(self, wakeup_event_id):
         self.calls.append(("watermark", wakeup_event_id))
         return self.watermark
+
+    async def newer_context(self, context, *, limit, waive_shown, as_of=None):
+        self.calls.append(("newer_context", context.prospect_id, context.action_id))
+        return [self.newer] if self.newer is not None else []
 
 
 @pytest.mark.asyncio
@@ -1278,16 +1286,18 @@ async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch()
 
 
 @pytest.mark.asyncio
-async def test_newer_inbound_marks_action_stale_before_lock_or_provider_io():
+async def test_the_preflight_never_refuses_over_newer_inbound():
+    """newer_inbound is gone from the preflight: a newer message is the
+    stale-context question's (asked of the agent), never a silent `stale`.
+    Here nobody can be asked (no probe), so the send proceeds."""
     store = FakeStore()
-    adapter = FakeAdapter()
+    adapter = FakeAdapter(_accepted_observation())
     proof = evidence(later_inbound_message_id=701)
 
     result = await service(store, adapter, proof=proof).execute(request())
 
-    assert result.status is PublicStatus.STALE
-    assert adapter.calls == []
-    assert [call[0] for call in store.calls] == ["create", "transition"]
+    assert result.status is PublicStatus.SENT
+    assert not any(call[0] == "transition" and call[2] is ActionState.STALE for call in store.calls)
 
 
 @pytest.mark.asyncio
@@ -1368,28 +1378,25 @@ async def test_due_dependency_retry_is_claimed_so_retry_budget_advances():
 
 
 @pytest.mark.asyncio
-async def test_due_dependency_terminal_preflight_uses_held_lease():
+async def test_worker_resume_of_a_waiting_reply_sends_over_newer_inbound():
+    """The worker has nobody to ask: a reply that waited (dependency_wait)
+    is sent as saved, never turned into a `stale` no-send by the preflight."""
     store = FakeStore(
         row(
             ActionState.DEPENDENCY_WAIT,
             action_uid=ACTION_UID,
-            detail_code="zillow_refresh_required",
+            detail_code="calendar_dependency_pending",
             attempt_count=2,
         )
     )
-    adapter = FakeAdapter()
+    adapter = FakeAdapter(_accepted_observation())
     proof = evidence(later_inbound_message_id=701)
 
     result = await service(store, adapter, proof=proof).resume(ACTION_ID)
 
-    assert result.status is PublicStatus.STALE
-    assert store.calls[-1] == (
-        "transition",
-        ActionState.DEPENDENCY_WAIT,
-        ActionState.STALE,
-        "newer_inbound",
-        "gateway-test",
-    )
+    assert result.status is PublicStatus.SENT
+    assert store.calls[0][:2] == ("claim", ActionState.DEPENDENCY_WAIT)
+    assert not any(call[0] == "transition" and call[2] is ActionState.STALE for call in store.calls)
 
 
 @pytest.mark.asyncio
@@ -1623,37 +1630,29 @@ async def test_resume_enforce_defers_lease_held_on_an_already_prepared_action():
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_blocks_on_stale_context():
+async def test_with_confirmation_disabled_newer_context_is_logged_and_the_send_proceeds(caplog):
+    """Confirmation disabled: nobody can be asked, so the saved record is sent
+    as confirmed and the newer context is logged. Never the old terminal
+    definitive_failed/traffic_blocked."""
     store = FakeStore()
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
+    adapter = FakeAdapter(_accepted_observation())
+    probe = FakeProbe(newer=NewerActivity(
             direction="inbound",
             source="zillow",
             occurred_at=NOW,
             preview="Are you still available Friday?",
             message_id=999,
             action_id=None,
-        )
-    )
+        ))
 
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
+    with caplog.at_level(logging.WARNING):
+        result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
-    assert result.status is PublicStatus.FAILED
-    assert result.detail_code == "stale_context"
-    assert result.detail is not None
-    assert "Are you still available Friday?" in result.detail
-    assert "needs_human" in result.detail
-    assert "stale_context, reply still needed" in result.detail
-    assert "override" not in result.detail.casefold()
-    assert adapter.calls == []
-    definitive_calls = [call for call in store.calls if call[0] == "definitive_fail"]
-    assert len(definitive_calls) == 1
-    observation = definitive_calls[0][2]
-    assert observation.category == "traffic_blocked"
-    assert "Are you still available Friday?" in observation.evidence["detail"]
-    assert "needs_human" in observation.evidence["detail"]
-    assert "override" not in observation.evidence["detail"].casefold()
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls
+    assert not any(call[0] == "definitive_fail" for call in store.calls)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("not asked about (confirmation disabled)" in message and "message:999" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -1679,19 +1678,17 @@ async def test_traffic_control_override_bypasses_stale_context_block():
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_shadow_logs_would_block_and_dispatches(caplog):
+async def test_traffic_control_shadow_logs_and_dispatches(caplog):
     store = FakeStore()
     adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        newer=NewerActivity(
+    probe = FakeProbe(newer=NewerActivity(
             direction="inbound",
             source="zillow",
             occurred_at=NOW,
             preview="Are you still available Friday?",
             message_id=999,
             action_id=None,
-        )
-    )
+        ))
 
     with caplog.at_level(logging.WARNING):
         result = await service(store, adapter, traffic_mode="shadow", traffic_probe=probe).execute(request())
@@ -1700,7 +1697,7 @@ async def test_traffic_control_shadow_logs_would_block_and_dispatches(caplog):
     assert adapter.calls
     assert not any(call[0] == "definitive_fail" for call in store.calls)
     messages = [record.getMessage() for record in caplog.records]
-    assert any("traffic control shadow" in message and "stale_context" in message and "prospect:amanda" in message for message in messages)
+    assert any("newer=message:999" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -1766,151 +1763,72 @@ def test_traffic_mode_off_without_probe_does_not_warn(caplog):
 
 
 @pytest.mark.asyncio
-async def test_resume_runs_traffic_gate_with_override_forced_false(caplog):
-    """The IMPORTANT gap: worker.py's list_work routes dependency_wait/
-    prepared/retry_ready actions through resume(), never execute() -- the
-    highest-staleness-risk case (longest wait) must not skip the gate.
-    resume() has no ExecuteRequest, so override is unavailable and must be
-    treated as False, not True."""
-    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
-    )
-
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
-
-    assert result.status is PublicStatus.FAILED
-    assert result.detail_code == "stale_context"
-    assert adapter.calls == []
-    assert any(call[0] == "definitive_fail" for call in store.calls)
-
-
-@pytest.mark.asyncio
-async def test_resume_shadow_mode_logs_would_block_and_dispatches(caplog):
+async def test_worker_resume_sends_the_saved_record_over_newer_context_and_logs_it(caplog):
+    """worker.py routes dependency_wait/prepared/retry_ready through resume():
+    nobody can be asked there. The stale-context question was the agent's at
+    execute time; the worker sends the saved record as confirmed and logs
+    what was newer -- never the old terminal traffic_blocked failure."""
     store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
     adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        newer=NewerActivity(
+    probe = FakeProbe(newer=NewerActivity(
             direction="inbound",
             source="zillow",
             occurred_at=NOW,
             preview="Are you still available Friday?",
             message_id=999,
             action_id=None,
-        )
-    )
+        ))
 
     with caplog.at_level(logging.WARNING):
-        result = await service(store, adapter, traffic_mode="shadow", traffic_probe=probe).resume(ACTION_ID)
+        result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
 
     assert result.status is PublicStatus.SENT
     assert adapter.calls
+    assert not any(call[0] == "definitive_fail" for call in store.calls)
     messages = [record.getMessage() for record in caplog.records]
-    assert any("traffic control shadow" in message and "stale_context" in message for message in messages)
+    assert any("not asked about (worker)" in message and "message:999" in message for message in messages)
 
 
 @pytest.mark.asyncio
-async def test_override_resend_of_traffic_blocked_action_dispatches_a_successor():
-    """CRITICAL 2's red-green: block, then override-resend. The successor
-    action (next effect_ordinal, retry_of_action_id set -- via the same
-    create_outbound_remediation_context() operator remediation uses,
-    Comm-Data-Store migrations/067_outbound_action_gateway.sql:1200-1267)
-    must reach dispatch; the original blocked action_id is never reused
-    (it is permanently DEFINITIVE_FAILED and unclaimable)."""
-    successor_id = uuid4()
-    store = FakeStore(remediation_successor_id=successor_id)
-    adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
+async def test_a_legacy_traffic_blocked_row_stays_terminal_and_override_does_not_resend_it():
+    """The traffic_blocked remediation path is gone with the block itself:
+    an old definitive_failed/stale_context row is reported as it is."""
+    store = FakeStore(
+        row(ActionState.DEFINITIVE_FAILED, action_uid=ACTION_UID, detail_code="stale_context", error_category="traffic_blocked")
     )
-    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
-
-    blocked = await svc.execute(request())
-    assert blocked.status is PublicStatus.FAILED
-    assert blocked.detail_code == "stale_context"
-    assert blocked.action_id == ACTION_ID
-
-    resent = await svc.execute(request(override=True))
-
-    assert resent.status is PublicStatus.SENT
-    assert resent.action_id == successor_id
-    assert resent.action_id != blocked.action_id
-    assert adapter.calls
-    assert any(call[0] == "remediate" and call[1] == ACTION_ID for call in store.calls)
-
-
-@pytest.mark.asyncio
-async def test_override_resend_without_operator_remediation_stays_blocked():
-    """create_outbound_remediation_context requires an evidence-resolved
-    outbound_action_resolutions row (067:1221-1228), which only
-    resolve_outbound_action_from_evidence (operator-only, never granted to
-    the gateway role) can write. Until an operator resolves the block,
-    override must fail soft -- stay on the original terminal result -- not
-    raise the DB's unhandled precondition-violation exception."""
-    store = FakeStore(remediation_error=RuntimeError("remediation requires evidence-resolved definitive failure"))
     adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
+    probe = FakeProbe(newer=NewerActivity(
             direction="inbound",
             source="zillow",
             occurred_at=NOW,
             preview="Are you still available Friday?",
             message_id=999,
             action_id=None,
-        )
-    )
-    svc = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
+        ))
 
-    blocked = await svc.execute(request())
-    assert blocked.status is PublicStatus.FAILED
+    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request(override=True))
 
-    resent = await svc.execute(request(override=True))
-
-    assert resent.status is PublicStatus.FAILED
-    assert resent.action_id == ACTION_ID
-    assert resent.detail is not None
-    assert "operator" in resent.detail
+    assert result.status is PublicStatus.FAILED
+    assert result.action_id == ACTION_ID
+    assert not any(call[0] == "remediate" for call in store.calls)
     assert adapter.calls == []
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_of_terminalizing():
-    """Residual Critical from re-review: outbound_action_transition_allowed()
-    has no ('dependency_wait', 'definitive_failed') edge (Comm-Data-Store
-    migrations/067_outbound_action_gateway.sql:346-389). A fresh RECEIVED row
-    whose prepare() hits a contended intent lock lands in DEPENDENCY_WAIT
-    (067:556-564) -- claim()+definitive_fail() on that state would raise the
-    DB's unhandled 'invalid outbound definitive failure state'. The gate must
-    defer (leave the row in DEPENDENCY_WAIT, return a PENDING blocked result)
-    instead, exactly like _preflight()'s READY branch already does for the
-    same lock-contention outcome."""
+async def test_a_contended_intent_lock_still_waits_with_newer_context_present():
+    """A fresh row whose prepare() hits a contended intent lock lands in
+    DEPENDENCY_WAIT and waits (the worker retries); newer context changes
+    nothing about that and never terminalizes it."""
     store = FakeStore()
     adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
+    probe = FakeProbe(newer=NewerActivity(
             direction="inbound",
             source="zillow",
             occurred_at=NOW,
             preview="Are you still available Friday?",
             message_id=999,
             action_id=None,
-        )
-    )
+        ))
 
     async def contended_prepare(ctx, expected_state):
         store.calls.append(("prepare", expected_state))
@@ -1927,44 +1845,7 @@ async def test_traffic_control_enforce_defers_contended_dependency_wait_instead_
     result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
 
     assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "stale_context"
-    assert result.detail is not None
-    assert "needs_human" in result.detail
-    assert "override" not in result.detail.casefold()
-    assert store.current.state is ActionState.DEPENDENCY_WAIT
-    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
-    assert adapter.calls == []
-
-
-@pytest.mark.asyncio
-async def test_resume_enforce_defers_dependency_wait_instead_of_terminalizing():
-    """Same residual Critical, second reachable path: worker.py routes an
-    already-dependency_wait action straight to resume(), never through
-    execute()'s prepare() at all -- the gate must defer here too."""
-    store = FakeStore(
-        row(
-            ActionState.DEPENDENCY_WAIT,
-            action_uid=ACTION_UID,
-            detail_code="intent_lock_contended",
-        )
-    )
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        newer=NewerActivity(
-            direction="inbound",
-            source="zillow",
-            occurred_at=NOW,
-            preview="Are you still available Friday?",
-            message_id=999,
-            action_id=None,
-        )
-    )
-
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
-
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "stale_context"
-    assert result.detail is not None
+    assert result.detail_code == "intent_lock_contended"
     assert store.current.state is ActionState.DEPENDENCY_WAIT
     assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
     assert adapter.calls == []

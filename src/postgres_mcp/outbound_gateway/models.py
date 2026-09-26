@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
 from datetime import timezone
@@ -18,8 +19,8 @@ from uuid import UUID
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
-from pydantic import ValidationInfo
 from pydantic import TypeAdapter
+from pydantic import ValidationInfo
 from pydantic import field_validator
 from pydantic import model_validator
 
@@ -756,6 +757,39 @@ _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 def parse_outbound_request(payload: Any) -> OutboundRequest:
     return _REQUEST_ADAPTER.validate_python(payload)
+
+
+_SENT_DIRECTIONS = frozenset({"outbound", "outgoing", "sent"})
+
+
+@dataclass(frozen=True)
+class NewerActivity:
+    """One message newer than the wake's context: received from the
+    recipient, or sent by us to it (a message, or another wake's gateway
+    send)."""
+
+    direction: str
+    source: str
+    occurred_at: datetime
+    preview: str
+    message_id: int | None
+    action_id: UUID | None
+    sender: str | None = None
+
+    @property
+    def ref(self) -> str:
+        """Stable identity of this item: what a question records as shown,
+        and the only thing a later answer can waive."""
+        return f"message:{self.message_id}" if self.message_id else f"action:{self.action_id}"
+
+    @property
+    def arm(self) -> str:
+        return "messages" if self.message_id else "outbound_actions"
+
+    @property
+    def label(self) -> str:
+        """What the agent reads: received, or sent by us."""
+        return "sent by us" if self.direction.casefold() in _SENT_DIRECTIONS else "received"
 
 
 class ContextItem(StrictModel):

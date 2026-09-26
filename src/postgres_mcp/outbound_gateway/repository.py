@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Protocol
 from uuid import UUID
 
 from postgres_mcp.sql import SafeSqlDriver
 
+from .models import ActionRole
+from .models import NewerActivity
+from .models import Operation
 from .traffic_control import InFlightAction
-from .traffic_control import NewerActivity
+
+if TYPE_CHECKING:
+    from .context import ActionContext
 
 # Non-terminal outbound_actions.state values: an action in one of these
 # states still has an in-flight lease on its recipient. Everything else
@@ -91,21 +97,14 @@ class ContextRepository(Protocol):
         self, recipient_key: str, exclude_action_id: UUID
     ) -> list[InFlightAction]: ...
 
-    async def activity_after(
+    async def newer_context(
         self,
-        recipient_key: str,
-        channel_id: int,
-        watermark: datetime,
-        exclude_action_id: UUID,
+        context: ActionContext,
+        *,
         limit: int,
-        exclude_refs: frozenset[str] = frozenset(),
+        waive_shown: bool,
+        as_of: datetime | None = None,
     ) -> list[NewerActivity]: ...
-
-    async def context_watermark(self, wakeup_event_id: int) -> datetime | None: ...
-
-    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]: ...
-
-    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]: ...
 
 
 class OutboundGatewayRepository:
@@ -244,252 +243,401 @@ class OutboundGatewayRepository:
             for row in rows or []
         ]
 
-    async def newest_activity_after(
-        self, recipient_key: str, channel_id: int, watermark: datetime, exclude_action_id: UUID
-    ) -> NewerActivity | None:
-        """The single newest item of activity_after (kept for callers that
-        only need to know whether anything is newer)."""
-        items = await self.activity_after(recipient_key, channel_id, watermark, exclude_action_id, 1)
-        return items[0] if items else None
-
-    async def activity_after(
+    async def newer_context(
         self,
-        recipient_key: str,
-        channel_id: int,
-        watermark: datetime,
-        exclude_action_id: UUID,
+        context: ActionContext,
+        *,
         limit: int,
-        exclude_refs: frozenset[str] = frozenset(),
+        waive_shown: bool,
+        as_of: datetime | None = None,
     ) -> list[NewerActivity]:
-        """Every ledger send and message newer than `watermark` that this
-        recipient's context depends on, newest first, at most `limit`. The
-        two arms apply the same exclusions the staleness gate always did;
-        what changed is that a needs_confirmation result lists them all
-        instead of naming only the newest."""
-        limit = max(1, int(limit))
-        excluded_actions = sorted(ref.removeprefix("action:") for ref in exclude_refs if ref.startswith("action:"))
-        excluded_messages = sorted(
-            int(ref.removeprefix("message:")) for ref in exclude_refs if ref.startswith("message:")
-        )
-        ledger_rows = await SafeSqlDriver.execute_param_query(
+        """The stale-context question's one query: every message received
+        from, or sent by us to, this action's recipient that is not in the
+        agent's context, newest first, at most `limit`. Not in its context: on
+        the wake's own channel, reached CDS after the wake's context watermark
+        (hermes_wakeup_events accepted/created time); on any other channel,
+        sent after the message being answered or reached CDS after the
+        watermark. waive_shown leaves out what this wake's agent was already
+        shown for this recipient (migration 192), by identity.
+
+        Received: a message in the recipient's conversation that is not ours
+        -- the wake's own channel (a Quo reply only from/to that phone, since a
+        Quo channel is a line), the Zillow relay address across channels, or
+        the same Quo line, conversation and phone across channels.
+        Sent by us: a message to this action's own target on the operation's
+        channel family (an email to the address, a text to the phone, a post
+        in that Cliq chat, a message in that TenantCloud thread), and another
+        wake's gateway send to the same subject that started dispatch.
+        Never this wake's own sends, the source message or its duplicates,
+        certified-older Zillow scrapes, or Nigel's automated cron alerts.
+
+        as_of: replay only -- the world as it stood at that time."""
+        target = outbound_target(context)
+        rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
-            WITH RECURSIVE retry_lineage AS (
-                SELECT action_id, retry_of_action_id
-                FROM outbound_actions
-                WHERE action_id = {}
-
-                UNION
-
-                SELECT ancestor.action_id, ancestor.retry_of_action_id
-                FROM outbound_actions AS ancestor
-                JOIN retry_lineage AS child
-                  ON ancestor.action_id = child.retry_of_action_id
-            )
-            SELECT
-                action_id,
-                operation,
-                created_at,
-                left(coalesce(arguments->>'text', arguments::text, ''), 300) AS preview
-            FROM outbound_actions
-            WHERE subject_key = {}
-              AND action_id NOT IN (SELECT action_id FROM retry_lineage)
-              -- The wake's own earlier actions: its agent sent them, so they
-              -- are not newer context it has not seen (wake 27235).
-              AND wakeup_event_id IS DISTINCT FROM (
-                  SELECT own.wakeup_event_id FROM outbound_actions AS own
-                  WHERE own.action_id = {}
-              )
-              AND NOT (action_id::text = ANY({}::text[]))
-              AND created_at > {}
-              AND (dispatch_started_at IS NOT NULL OR state = 'completed')
-            ORDER BY created_at DESC
-            LIMIT {}
-            """,
-            [exclude_action_id, recipient_key, exclude_action_id, excluded_actions, watermark, limit],
-        )
-        message_rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT
-                message.id AS message_id,
-                message.created_at,
-                message.direction,
-                message.source,
-                sender.display_name AS sender_name,
-                left(coalesce(message.body,''), 300) AS preview
-            FROM messages AS message
-            LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
-            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
-            LEFT JOIN outbound_actions AS sending ON sending.action_id = {}
-            WHERE message.channel_id = {}
-              AND message.created_at > {}
-              AND NOT (message.id = ANY({}::bigint[]))
-              -- A message the wake's own sends produced (the gateway records
-              -- a TenantCloud send as a CDS message; a Cliq post is ingested
-              -- back) is the agent's own work. Providers spell the id
-              -- differently in the two places ("tenantcloud-message:1" vs
-              -- "tenantcloud:thread-message:1", "a%20b" vs "a_b"), so compare
-              -- the id after its last colon with punctuation removed.
-              AND NOT EXISTS (
-                  SELECT 1 FROM outbound_actions AS own
-                  WHERE own.wakeup_event_id = sending.wakeup_event_id
-                    AND nullif(regexp_replace(replace(regexp_replace(
-                            own.provider_message_id, '^.*:', ''), '%20', ''),
-                            '[^0-9A-Za-z]', '', 'g'), '')
-                        = regexp_replace(replace(regexp_replace(
-                            message.source_message_id, '^.*:', ''), '%20', ''),
-                            '[^0-9A-Za-z]', '', 'g')
-              )
-              AND NOT (
-                  -- Automated operations alerts share Nigel's Cliq DM with Dan.
-                  -- They do not answer an inbound DM and must not stale its
-                  -- internal_reply action. Keep human follow-ups in the probe.
-                  -- Direction is not part of the test: the same bot-posted
-                  -- alerts are stored `outbound` or `inbound` (14 days to
-                  -- 2026-09-24: 101 vs 37, all from Nigel's own account), and
-                  -- wake 27164's refusal was one labelled `inbound`. The
-                  -- SENDER is: only Nigel's own Cliq user (agency_identifiers
-                  -- cliq_user_id labelled nigel-zoho, the gateway's Nigel
-                  -- account) posts these. A human pasting an alert still counts.
-                  sending.operation = 'cliq.chat.post'
-                  AND message.source = 'zoho_cliq'
-                  AND message.body LIKE '⚠️ Cron issue —%'
-                  -- coalesce: an unknown sender must never make NOT(...) NULL
-                  -- and silently drop the row.
-                  AND coalesce(sender.participant_key, '') IN (
-                      SELECT agency.value
-                      FROM agency_identifiers AS agency
-                      WHERE agency.kind = 'cliq_user_id'
-                        AND agency.label = 'nigel-zoho'
-                  )
-              )
-              AND (
-                  sending.operation IS DISTINCT FROM 'quo.sms.send'
-                  OR (
-                      -- Quo channels identify shared business lines, not people.
-                      -- Match either endpoint: direction labels can be missing
-                      -- or incorrect on imported messages. Never match empties.
-                      lower(message.source) IN ('quo', 'openphone')
-                      AND EXISTS (
-                          SELECT 1
-                          FROM (VALUES
-                              (raw.payload#>'{{data,object,from}}'),
-                              (raw.payload#>'{{data,object,to}}')
-                          ) AS endpoint(value)
-                          CROSS JOIN LATERAL jsonb_array_elements_text(
-                              CASE WHEN jsonb_typeof(endpoint.value) = 'array'
-                                   THEN endpoint.value
-                                   ELSE jsonb_build_array(endpoint.value) END
-                          ) AS phone(value)
-                          WHERE nullif(regexp_replace(phone.value, '[^0-9]', '', 'g'), '')
-                              = nullif(regexp_replace(
-                                  sending.canonical_context->>'recipient_phone', '[^0-9]', '', 'g'
-                              ), '')
+            WITH RECURSIVE p AS (
+                SELECT
+                    {}::bigint AS wake,
+                    {}::uuid AS action_id,
+                    {}::text AS subject,
+                    {}::bigint AS channel_id,
+                    {}::timestamptz AS source_sent_at,
+                    {}::bigint AS source_message_id,
+                    {}::text AS family,
+                    {}::text AS target_id,
+                    {}::text AS provider_account,
+                    {}::text AS thread_identity,
+                    {}::text AS phone,
+                    {}::text AS operation,
+                    {}::bigint[] AS equivalent_ids,
+                    {}::bigint[] AS certified_older_ids,
+                    {}::text[] AS sent_sources,
+                    {}::text AS sent_match,
+                    {}::text AS sent_recipient,
+                    {}::boolean AS waive_shown,
+                    {}::timestamptz AS as_of
+            ), watermark AS (
+                SELECT coalesce(event.webui_accepted_at, event.created_at) AS at
+                FROM hermes_wakeup_events AS event, p
+                WHERE event.id = p.wake
+            ), shown AS (
+                SELECT DISTINCT shown.ref
+                FROM outbound_actions AS action
+                CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref), p
+                WHERE p.waive_shown
+                  AND action.wakeup_event_id = p.wake
+                  AND action.subject_key = p.subject
+                  AND action.state = 'stale'
+            ), own_send AS (
+                -- This wake's own sends are its agent's work, not news.
+                -- Providers spell the id differently in the ledger and in
+                -- messages ("tenantcloud-message:1" vs
+                -- "tenantcloud:thread-message:1", "a%20b" vs "a_b"): compare
+                -- the id after its last colon with punctuation removed.
+                SELECT
+                    own.action_id,
+                    nullif(regexp_replace(replace(regexp_replace(
+                        own.provider_message_id, '^.*:', ''), '%20', ''),
+                        '[^0-9A-Za-z]', '', 'g'), '') AS message_key
+                FROM outbound_actions AS own, p
+                WHERE own.wakeup_event_id = p.wake
+            ), candidate AS (
+                SELECT
+                    message.id,
+                    message.created_at,
+                    message.channel_id,
+                    message.sent_at,
+                    message.canonical_message_id,
+                    message.source,
+                    message.source_message_id,
+                    message.body,
+                    raw.payload,
+                    sender.participant_type,
+                    sender.participant_key,
+                    sender.display_name,
+                    CASE
+                        WHEN lower(coalesce(
+                            message.direction,
+                            raw.payload->>'direction',
+                            raw.payload#>>'{{data,object,direction}}',
+                            ''
+                        )) IN ('outbound', 'outgoing', 'sent') THEN 'outbound'
+                        ELSE coalesce(nullif(message.direction, ''), 'inbound')
+                    END AS direction
+                FROM messages AS message
+                CROSS JOIN p
+                CROSS JOIN watermark
+                LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
+                LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
+                WHERE (p.as_of IS NULL OR message.created_at <= p.as_of)
+                  AND (
+                      -- The wake's own channel is in the agent's context up
+                      -- to the watermark; anything that reached CDS after it
+                      -- is new.
+                      message.created_at > watermark.at
+                      -- Other channels are not in its context: anything sent
+                      -- after the message it is answering is new too.
+                      OR (
+                          message.channel_id IS DISTINCT FROM p.channel_id
+                          AND (message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)
                       )
                   )
-              )
-            ORDER BY message.created_at DESC
+                  AND NOT (coalesce(message.canonical_message_id, message.id) = ANY(p.equivalent_ids))
+                  AND NOT (lower(message.source) = 'zillow_rm_web_extract' AND message.id = ANY(p.certified_older_ids))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM own_send
+                      WHERE own_send.message_key = regexp_replace(replace(regexp_replace(
+                              message.source_message_id, '^.*:', ''), '%20', ''),
+                              '[^0-9A-Za-z]', '', 'g')
+                         OR raw.payload->>'outbound_action_id' = own_send.action_id::text
+                  )
+                  AND NOT (
+                      -- Automated operations alerts share Nigel's Cliq DM with
+                      -- Dan and answer nothing. Direction labels are unreliable
+                      -- for them (stored outbound and inbound alike); the
+                      -- sender is not: only Nigel's own Cliq user posts them.
+                      -- A human pasting an alert still counts. coalesce: an
+                      -- unknown sender must never make NOT(...) NULL.
+                      p.operation = 'cliq.chat.post'
+                      AND message.source = 'zoho_cliq'
+                      AND message.body LIKE '⚠️ Cron issue —%'
+                      AND coalesce(sender.participant_key, '') IN (
+                          SELECT agency.value
+                          FROM agency_identifiers AS agency
+                          WHERE agency.kind = 'cliq_user_id'
+                            AND agency.label = 'nigel-zoho'
+                      )
+                  )
+            ), received AS (
+                SELECT candidate.*
+                FROM candidate, p
+                WHERE candidate.direction <> 'outbound'
+                  AND (
+                      (
+                          candidate.channel_id = p.channel_id
+                          AND (
+                              -- A Quo channel is a shared business line, not a
+                              -- person: only this phone's messages count.
+                              -- Either endpoint (direction labels can be
+                              -- missing); never match empties.
+                              p.operation IS DISTINCT FROM 'quo.sms.send'
+                              OR (
+                                  lower(candidate.source) IN ('quo', 'openphone')
+                                  AND EXISTS (
+                                      SELECT 1
+                                      FROM (VALUES
+                                          (candidate.payload#>'{{data,object,from}}'),
+                                          (candidate.payload#>'{{data,object,to}}')
+                                      ) AS endpoint(value)
+                                      CROSS JOIN LATERAL jsonb_array_elements_text(
+                                          CASE WHEN jsonb_typeof(endpoint.value) = 'array'
+                                               THEN endpoint.value
+                                               ELSE jsonb_build_array(endpoint.value) END
+                                      ) AS endpoint_phone(value)
+                                      WHERE nullif(regexp_replace(endpoint_phone.value, '[^0-9]', '', 'g'), '')
+                                          = nullif(p.phone, '')
+                                  )
+                              )
+                          )
+                      ) OR (
+                          -- The same Zillow relay address on any channel.
+                          p.family = 'zillow'
+                          AND (
+                              lower(coalesce(
+                                  candidate.payload->>'proxy_email',
+                                  candidate.payload->>'zillow_proxy_email',
+                                  candidate.payload->>'relay_email',
+                                  CASE
+                                      WHEN lower(coalesce(candidate.participant_type, ''))
+                                               IN ('email', 'email_address')
+                                        AND split_part(lower(coalesce(candidate.participant_key, '')), '@', 2)
+                                            = 'convo.zillow.com'
+                                      THEN candidate.participant_key
+                                  END,
+                                  ''
+                              )) = lower(p.target_id)
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM jsonb_array_elements(
+                                      CASE
+                                          WHEN jsonb_typeof(candidate.payload->'participants') = 'array'
+                                          THEN candidate.payload->'participants'
+                                          ELSE '[]'::jsonb
+                                      END
+                                  ) AS recipient(value)
+                                  WHERE lower(coalesce(recipient.value->>'kind', '')) = 'to'
+                                    AND lower(coalesce(recipient.value->>'address', '')) = lower(p.target_id)
+                              )
+                          )
+                      ) OR (
+                          -- The same Quo line, conversation and phone on any channel.
+                          p.family = 'quo'
+                          AND lower(candidate.source) IN ('quo', 'openphone')
+                          AND lower(coalesce(
+                              candidate.payload#>>'{{data,object,phoneNumberId}}',
+                              candidate.payload#>>'{{data,object,phone_number_id}}',
+                              ''
+                          )) = lower(p.provider_account)
+                          AND (
+                              lower(coalesce(
+                                  candidate.payload#>>'{{data,object,conversationId}}',
+                                  candidate.payload#>>'{{data,object,conversation_id}}',
+                                  ''
+                              )) = lower(p.thread_identity)
+                              OR (
+                                  nullif(coalesce(
+                                      candidate.payload#>>'{{data,object,conversationId}}',
+                                      candidate.payload#>>'{{data,object,conversation_id}}',
+                                      ''
+                                  ), '') IS NULL
+                                  AND p.thread_identity LIKE 'line:%'
+                              )
+                          )
+                          AND regexp_replace(
+                              coalesce(candidate.payload#>>'{{data,object,from}}', ''), '[^0-9]', '', 'g'
+                          ) = p.phone
+                      )
+                  )
+            ), sent_message AS (
+                SELECT candidate.*
+                FROM candidate
+                CROSS JOIN p
+                JOIN channels AS candidate_channel ON candidate_channel.id = candidate.channel_id
+                WHERE candidate.direction = 'outbound'
+                  AND candidate.source = ANY(p.sent_sources)
+                  AND CASE p.sent_match
+                      WHEN 'email' THEN EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                              CASE
+                                  WHEN jsonb_typeof(candidate.payload->'participants') = 'array'
+                                  THEN candidate.payload->'participants'
+                                  ELSE '[]'::jsonb
+                              END
+                          ) AS recipient(value)
+                          WHERE lower(coalesce(recipient.value->>'kind', '')) IN ('to', 'cc', 'bcc')
+                            AND lower(btrim(coalesce(recipient.value->>'address', ''))) = p.sent_recipient
+                      )
+                      WHEN 'sms' THEN EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(
+                              CASE
+                                  WHEN jsonb_typeof(candidate.payload#>'{{data,object,to}}') = 'array'
+                                  THEN candidate.payload#>'{{data,object,to}}'
+                                  WHEN jsonb_typeof(candidate.payload#>'{{data,object,to}}') = 'string'
+                                  THEN jsonb_build_array(candidate.payload#>'{{data,object,to}}')
+                                  ELSE '[]'::jsonb
+                              END
+                          ) AS to_phone(value)
+                          WHERE nullif(regexp_replace(to_phone.value, '[^0-9]', '', 'g'), '') = p.sent_recipient
+                      )
+                      WHEN 'channel' THEN candidate_channel.source_channel_id = p.sent_recipient
+                      ELSE false
+                  END
+            ), retry_lineage AS (
+                SELECT action.action_id, action.retry_of_action_id
+                FROM outbound_actions AS action, p
+                WHERE action.action_id = p.action_id
+                UNION
+                SELECT ancestor.action_id, ancestor.retry_of_action_id
+                FROM outbound_actions AS ancestor
+                JOIN retry_lineage AS child ON ancestor.action_id = child.retry_of_action_id
+            ), sent_action AS (
+                -- Another wake's gateway send to this subject that started
+                -- dispatch (it may not be ingested back as a message yet).
+                SELECT
+                    ledger.action_id,
+                    ledger.operation,
+                    ledger.created_at,
+                    left(coalesce(ledger.arguments->>'text', ledger.arguments::text, ''), 300) AS preview
+                FROM outbound_actions AS ledger
+                CROSS JOIN p
+                CROSS JOIN watermark
+                WHERE ledger.subject_key = p.subject
+                  AND ledger.wakeup_event_id IS DISTINCT FROM p.wake
+                  AND ledger.created_at > watermark.at
+                  AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
+                  AND (ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed')
+                  AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
+            ), found AS (
+                SELECT 'message:' || id AS ref, id AS message_id, NULL::uuid AS action_id, created_at,
+                       direction, source, display_name AS sender, left(coalesce(body, ''), 300) AS preview
+                FROM received
+                UNION
+                SELECT 'message:' || id, id, NULL::uuid, created_at,
+                       direction, source, display_name, left(coalesce(body, ''), 300)
+                FROM sent_message
+                UNION
+                SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
+                       'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
+                FROM sent_action
+            )
+            SELECT found.*
+            FROM found
+            WHERE found.ref NOT IN (SELECT shown.ref FROM shown)
+            ORDER BY found.created_at DESC, found.ref
             LIMIT {}
             """,
-            [exclude_action_id, channel_id, watermark, excluded_messages, limit],
-        )
-        candidates: list[NewerActivity] = []
-        for row in ledger_rows or []:
-            cells = row.cells
-            candidates.append(
-                NewerActivity(
-                    direction="outbound",
-                    source="outbound_actions",
-                    occurred_at=cells["created_at"],
-                    preview=str(cells.get("preview") or ""),
-                    message_id=None,
-                    action_id=UUID(str(cells["action_id"])),
-                    sender=f"outbound gateway ({cells.get('operation')})" if cells.get("operation") else None,
-                )
-            )
-        for row in message_rows or []:
-            cells = row.cells
-            candidates.append(
-                NewerActivity(
-                    # NULL direction must not be silently reported as
-                    # "inbound" -- that would make the staleness detail text
-                    # claim inbound activity that was never actually
-                    # confirmed as such. "unknown" is the honest label.
-                    direction=str(cells.get("direction") or "unknown"),
-                    source=str(cells.get("source") or "messages"),
-                    occurred_at=cells["created_at"],
-                    preview=str(cells.get("preview") or ""),
-                    message_id=int(cells["message_id"]),
-                    action_id=None,
-                    sender=(str(cells["sender_name"]) if cells.get("sender_name") else None),
-                )
-            )
-        candidates.sort(key=lambda item: item.occurred_at, reverse=True)
-        return candidates[:limit]
-
-    async def acknowledged_refs(self, wakeup_event_id: int, recipient_key: str) -> frozenset[str]:
-        """Every item this wake's agent was shown for this recipient in a
-        stale_context question (Comm-Data-Store migration 192). Identity, not
-        time: an inbound stored with an earlier send time but ingested after
-        the question was asked was never shown and is never in this set."""
-        rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT DISTINCT shown.ref
-            FROM outbound_actions AS action
-            CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref)
-            WHERE action.wakeup_event_id = {}
-              AND action.subject_key = {}
-              AND action.state = 'stale'
-            """,
-            [wakeup_event_id, recipient_key],
-        )
-        return frozenset(str(row.cells["ref"]) for row in rows or [])
-
-    async def messages_by_id(self, message_ids: list[int]) -> list[NewerActivity]:
-        if not message_ids:
-            return []
-        rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT
-                message.id AS message_id,
-                message.created_at,
-                message.direction,
-                message.source,
-                sender.display_name AS sender_name,
-                left(coalesce(message.body,''), 300) AS preview
-            FROM messages AS message
-            LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
-            WHERE message.id = ANY({}::bigint[])
-            ORDER BY message.created_at DESC
-            """,
-            [sorted(message_ids)],
+            [
+                context.wakeup_event_id,
+                context.action_id,
+                context.prospect_id,
+                context.channel_id,
+                context.source_sent_at,
+                context.source_message_id,
+                "zillow" if context.source in _ZILLOW_FAMILY else context.source,
+                context.target.target_id,
+                context.provider_account,
+                context.thread_identity,
+                "".join(character for character in str(context.recipient_phone or "") if character.isdigit()),
+                context.operation.value,
+                sorted({context.source_message_id, *context.cross_channel_duplicate_message_ids}),
+                list(context.certified_older_message_ids),
+                list(target.sources),
+                target.match,
+                target.recipient,
+                waive_shown,
+                as_of,
+                max(1, int(limit)),
+            ],
         )
         return [
             NewerActivity(
-                direction=str(row.cells.get("direction") or "unknown"),
-                source=str(row.cells.get("source") or "messages"),
+                direction=str(row.cells["direction"]),
+                source=str(row.cells["source"]),
                 occurred_at=row.cells["created_at"],
                 preview=str(row.cells.get("preview") or ""),
-                message_id=int(row.cells["message_id"]),
-                action_id=None,
-                sender=(str(row.cells["sender_name"]) if row.cells.get("sender_name") else None),
+                message_id=int(row.cells["message_id"]) if row.cells.get("message_id") is not None else None,
+                action_id=UUID(str(row.cells["action_id"])) if row.cells.get("action_id") is not None else None,
+                sender=str(row.cells["sender"]) if row.cells.get("sender") else None,
             )
             for row in rows or []
         ]
 
-    async def context_watermark(self, wakeup_event_id: int) -> datetime | None:
-        rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT coalesce(webui_accepted_at, created_at) AS watermark
-            FROM hermes_wakeup_events
-            WHERE id = {}
-            """,
-            [wakeup_event_id],
-        )
-        if not rows:
-            return None
-        return rows[0].cells["watermark"]
+
+_ZILLOW_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
+
+
+@dataclass(frozen=True)
+class OutboundTarget:
+    """How to recognise a message we sent to the action's own target: which
+    message sources are the operation's channel family, how the recipient is
+    matched (`email`, `sms`, `channel`, or `none`), and the normalized
+    recipient key."""
+
+    sources: tuple[str, ...]
+    match: str
+    recipient: str
+
+
+_NO_OUTBOUND_TARGET = OutboundTarget(sources=(), match="none", recipient="")
+
+# Roles whose target is the counterpart of the conversation: a reply. An
+# internal notification's target is an operator's chat, where other wakes'
+# notifications about other subjects are not this action's context.
+_REPLY_ROLES = frozenset({ActionRole.PROSPECT_REPLY, ActionRole.INTERNAL_REPLY})
+
+
+def outbound_target(context: ActionContext) -> OutboundTarget:
+    """The target key a "sent by us" message is matched on (PR #48): keyed on
+    the recipient, never on the source conversation -- a Cliq post in the
+    wake's DM is not an email's activity (wake 27279), and a Quo channel is a
+    line, a mail channel a folder."""
+    from .context import normalize_phone
+
+    if context.action_role not in _REPLY_ROLES:
+        return _NO_OUTBOUND_TARGET
+    target = context.target.target_id.strip()
+    if not target:
+        return _NO_OUTBOUND_TARGET
+    if context.operation is Operation.EMAIL_SEND:
+        return OutboundTarget(sources=("zoho_mail", "nigel_mail"), match="email", recipient=target.casefold())
+    if context.operation is Operation.QUO_SMS_SEND:
+        digits = "".join(character for character in (normalize_phone(target) or target) if character.isdigit())
+        return OutboundTarget(sources=("quo", "openphone"), match="sms", recipient=digits) if digits else _NO_OUTBOUND_TARGET
+    if context.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
+        return OutboundTarget(sources=("zoho_cliq",), match="channel", recipient=target)
+    if context.operation is Operation.TENANTCLOUD_MESSAGE_SEND:
+        return OutboundTarget(sources=("tenantcloud_api",), match="channel", recipient=f"tenantcloud:thread:{target}")
+    return _NO_OUTBOUND_TARGET
