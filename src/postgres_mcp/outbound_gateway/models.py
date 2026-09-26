@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -226,6 +228,72 @@ def normalize_optional_title(value: Any, *, field: str) -> str | None:
     return normalize_public_text(value, field=field, minimum=1, maximum=255).strip() or None
 
 
+# Email attachments travel inside the request as base64: the agent shares no
+# filesystem with the gateway container. They are stored in the action's
+# saved arguments (the worker sends the saved record), so the cap keeps one
+# row small: 10 files, 10 MiB decoded in total (about 13.4 MiB of base64).
+MAX_EMAIL_ATTACHMENTS = 10
+MAX_EMAIL_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_MIME_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+
+
+class EmailAttachment(StrictModel):
+    filename: str
+    mime_type: str
+    content_base64: str
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def normalize_filename(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("filename must be a string, e.g. lease.pdf")
+        candidate = normalize("NFC", value).strip()
+        if not candidate:
+            raise ValueError("filename must not be empty; name the file as the recipient should see it, e.g. lease.pdf")
+        if len(candidate) > 255:
+            raise ValueError("filename must be at most 255 characters")
+        if "/" in candidate or "\\" in candidate or candidate in {".", ".."} or any(
+            category(character) == "Cc" for character in candidate
+        ):
+            raise ValueError("filename must be a bare file name like lease.pdf, without folders or control characters")
+        return candidate
+
+    @field_validator("mime_type", mode="before")
+    @classmethod
+    def normalize_mime_type(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("mime_type must be a string such as application/pdf or image/jpeg")
+        candidate = value.strip().casefold()
+        if len(candidate) > 255 or not _MIME_TYPE.fullmatch(candidate):
+            raise ValueError("mime_type must look like type/subtype, e.g. application/pdf or image/jpeg")
+        return candidate
+
+    @field_validator("content_base64", mode="before")
+    @classmethod
+    def normalize_content_base64(cls, value: Any) -> str:
+        """Stored in one canonical form: line breaks and spaces (as the
+        `base64` command wraps its output) are dropped, so the same bytes are
+        the same request however they were wrapped."""
+        if not isinstance(value, str):
+            raise ValueError("content_base64 must be a base64 string of the file's bytes")
+        compact = "".join(value.split())
+        if not compact:
+            raise ValueError("content_base64 must not be empty; attach a file with content")
+        try:
+            data = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                "content_base64 must be base64 of the file's bytes (standard alphabet, e.g. Python base64.b64encode)"
+            ) from exc
+        if not data:
+            raise ValueError("content_base64 must not be empty; attach a file with content")
+        return base64.b64encode(data).decode("ascii")
+
+    @property
+    def size(self) -> int:
+        return len(base64.b64decode(self.content_base64))
+
+
 class EmailArguments(StrictModel):
     to_address: str
     text: str
@@ -233,6 +301,33 @@ class EmailArguments(StrictModel):
     # added to the source's configured copy address (management@pfg.io).
     subject: str | None = None
     cc: tuple[str, ...] | None = None
+    attachments: tuple[EmailAttachment, ...] | None = None
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def normalize_attachments(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("attachments must be a list of {filename, mime_type, content_base64}")
+        if not value:
+            # No files is the same request as leaving attachments out.
+            return None
+        if len(value) > MAX_EMAIL_ATTACHMENTS:
+            raise ValueError(
+                f"attachments may list at most {MAX_EMAIL_ATTACHMENTS} files; send the rest in another email"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def limit_attachment_size(self) -> EmailArguments:
+        total = sum(attachment.size for attachment in self.attachments or ())
+        if total > MAX_EMAIL_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"attachments total {total} bytes, over the 10 MiB limit; send fewer or smaller files "
+                "(split them across emails)"
+            )
+        return self
 
     @field_validator("to_address", mode="before")
     @classmethod
@@ -555,7 +650,12 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
 # ARGUMENT_MODELS, so every profile sees the same exact request shapes and
 # they cannot drift from what the gateway accepts.
 OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
-    Operation.EMAIL_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "email anyone; sent from Nigel's mailbox"),
+    Operation.EMAIL_SEND: (
+        ActionRole.PROSPECT_REPLY,
+        IntentKind.INQUIRY_REPLY,
+        "email anyone; sent from Nigel's mailbox; attachments is a list of "
+        "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
+    ),
     Operation.QUO_SMS_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "text anyone (to_phone E.164)"),
     Operation.CLIQ_CHAT_POST: (ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),
     Operation.CLIQ_CHANNEL_POST: (
