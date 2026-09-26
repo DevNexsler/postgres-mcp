@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from typing import Protocol
@@ -11,6 +12,8 @@ from uuid import UUID
 from .models import ActionState
 from .service import OutboundActionService
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerStore(Protocol):
@@ -70,6 +73,7 @@ class OutboundWorker:
                     return
             await getattr(self._service, operation)(action_id)
         except Exception as exc:
+            logger.error("outbound worker %s failed for action %s", operation, action_id, exc_info=True)
             self._on_error(action_id, operation, exc)
 
     async def run_once(self) -> int:
