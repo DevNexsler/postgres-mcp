@@ -74,6 +74,28 @@ _ENQUEUE_TERMINAL_STATES = _EXECUTE_TERMINAL_STATES | {
 }
 
 
+# tenantcloud.message.send fails this same way whether thread_id was never a
+# thread (a lead id, most often) or is a thread that no longer exists: a bare
+# provider_rejected/target_unavailable detail_code gives the agent no way to
+# tell that apart from an outage, so it either gives up with nothing sent or
+# (target_unavailable_before_dispatch is retryable) burns the whole retry
+# budget re-asking a provider that will never say yes (wake 26156,
+# 2026-08-30: five identical rejections then retry_budget_exhausted, with no
+# indication anywhere in the result that the thread id was the problem).
+_TENANTCLOUD_NO_SUCH_THREAD_DETAILS = frozenset({"tenantcloud_target_unavailable_before_dispatch", "tenantcloud_provider_rejected_http_404"})
+
+
+def _tenantcloud_no_such_thread_detail(context: ActionContext, observation: ProviderObservation) -> str | None:
+    if context.operation is not Operation.TENANTCLOUD_MESSAGE_SEND:
+        return None
+    if observation.detail_code not in _TENANTCLOUD_NO_SUCH_THREAD_DETAILS:
+        return None
+    return (
+        f"TenantCloud has no messenger thread {context.target.target_id} (a lead id is not a "
+        "thread id). If this lead has no thread, reply with email.send to the lead's email instead."
+    )
+
+
 class PreflightEvidenceLoader(Protocol):
     async def load(self, context: ActionContext) -> PreflightEvidence: ...
 
@@ -561,6 +583,7 @@ class OutboundActionService:
         observation: ProviderObservation,
     ) -> PublicResult:
         expected_state = action.state
+        thread_detail = _tenantcloud_no_such_thread_detail(context, observation)
         if observation.disposition is ProviderDisposition.ACCEPTED:
             receipt = adapter.parse_receipt(context, observation)
             if receipt is None:
@@ -600,14 +623,14 @@ class OutboundActionService:
                     self._lease_owner,
                     observation,
                 )
-                return action_result(await self._schedule(retry, observation.detail_code))
+                return action_result(await self._schedule(retry, observation.detail_code), detail=thread_detail)
             failed = await self._store.definitive_fail(
                 action.action_id,
                 expected_state,
                 self._lease_owner,
                 observation,
             )
-            return action_result(failed)
+            return action_result(failed, detail=thread_detail)
         unknown = await self._store.transition(
             action.action_id,
             expected_state,
