@@ -1996,3 +1996,33 @@ async def test_a_qualification_send_cannot_add_recipients():
         await loader.load(
             request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "hi", "cc": ["someone@example.com"]})
         )
+
+
+def _quo_request(to_phone="+12015756789"):
+    return request(
+        operation="quo.sms.send", intent_kind="inquiry_reply", appointment_slot=None,
+        arguments={"to_phone": to_phone, "text": "Ticket #1569672 created."},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_text_from_a_wake_without_its_own_line_uses_the_default_line():
+    """Wake 27269: a TenantCloud notification email (source zoho_mail) asked
+    for a text. zoho_mail has no Quo line, so the action was recorded with an
+    empty line; Quo could never send it and it parked in manual_review."""
+    event = record(message_source="zoho_mail", channel_type="email_thread",
+                   participant_key="noreply@tenantcloud.com", raw_payload={},
+                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    defaulted = dataclasses.replace(policy(), quo_line_by_provider={"zillow": "PNlisting"}, quo_default_line="PN8ujudrpa")
+    context = await ActionContextLoader(FakeRepository(event), defaulted).load(_quo_request())
+    assert context.provider_account == "PN8ujudrpa"
+
+
+@pytest.mark.asyncio
+async def test_a_text_with_no_line_at_all_is_refused_when_asked_not_parked_later():
+    event = record(message_source="zoho_mail", channel_type="email_thread",
+                   participant_key="noreply@tenantcloud.com", raw_payload={},
+                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
+    no_line = dataclasses.replace(policy(), quo_line_by_provider={}, quo_default_line="")
+    with pytest.raises(ContextDerivationError, match="no Quo line is configured"):
+        await ActionContextLoader(FakeRepository(event), no_line).load(_quo_request())
