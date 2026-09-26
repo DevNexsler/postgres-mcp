@@ -65,7 +65,8 @@ async def traffic(traffic_database):
             CREATE TEMP TABLE messages (
                 id bigint PRIMARY KEY, channel_id bigint, created_at timestamptz,
                 direction text, body text, source text, raw_event_id bigint,
-                sender_participant_id bigint, recipient_participant_id bigint
+                sender_participant_id bigint, recipient_participant_id bigint,
+                source_message_id text
             );
             CREATE TEMP TABLE raw_events (id bigint PRIMARY KEY, payload jsonb);
             CREATE TEMP TABLE participants (id bigint PRIMARY KEY, participant_key text, participant_type text, display_name text);
@@ -73,8 +74,11 @@ async def traffic(traffic_database):
                 action_id uuid PRIMARY KEY, subject_key text, operation text, state text,
                 created_at timestamptz, arguments jsonb, canonical_context jsonb,
                 dispatch_started_at timestamptz, retry_of_action_id uuid,
-                wakeup_event_id bigint DEFAULT 26817,
-                stale_context_shown_refs text[]
+                -- Rows default to ANOTHER wake: since multi-action wakes (CDS
+                -- migration 204) the probe ignores the wake's own actions.
+                wakeup_event_id bigint DEFAULT 26800,
+                stale_context_shown_refs text[],
+                provider_message_id text
             );
             CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
             CREATE TEMP TABLE hermes_wakeup_events (
@@ -95,6 +99,7 @@ async def traffic(traffic_database):
             "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}',%s,NULL,NULL)",
             (ACTION, SUBJECT, WATERMARK, Jsonb({"recipient_phone": JESSICA})),
         )
+        await conn.execute("UPDATE outbound_actions SET wakeup_event_id = 26817 WHERE action_id = %s", (ACTION,))
         yield conn, OutboundGatewayRepository(SqlDriver(conn=conn))
 
 
