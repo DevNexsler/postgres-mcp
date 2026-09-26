@@ -145,8 +145,8 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
         "seen.received_at <= watermark.at",  # a re-ingest / re-scrape of what had reached CDS
         "(message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)",  # other channels
         "unnest(action.stale_context_shown_refs)",  # shown, by identity
-        "coalesce(message.canonical_message_id, message.id) = ANY(p.equivalent_ids)",
-        "message.id = ANY(p.certified_older_ids)",
+        "coalesce(related.canonical_message_id, related.id) = ANY(p.equivalent_ids)",
+        "related.id = ANY(p.certified_older_ids)",
         "message.body LIKE '⚠️ Cron issue —%'",
         "agency.label = 'nigel-zoho'",
         "candidate.source = ANY(p.sent_sources)",

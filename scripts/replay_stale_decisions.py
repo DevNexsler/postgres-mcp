@@ -9,6 +9,9 @@ would do now with what it did then:
 
   asked      -- unshown newer context: the agent gets needs_confirmation
   proceeds   -- nothing unshown: the send gate goes on (calendar, dispatch)
+  unasked    -- nothing at execute, but the worker dispatched it later (over
+                a minute on) with unshown newer context by then: now a
+                stale_context_unasked no-send
 
 Run inside the outbound worker container with the tree under test:
   docker exec -i -e PYTHONPATH=/tmp/newsrc comm-data-store-outbound-worker \\
@@ -20,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from collections import Counter
 
 from postgres_mcp.outbound_gateway.context import ActionContext
@@ -102,7 +106,7 @@ async def replay(days: int, role: str) -> None:
     repository = service._stale._probe
     rows = await SafeSqlDriver.execute_param_query(
         driver,
-        "SELECT action_id, wakeup_event_id, subject_key, state, detail_code, error_category, created_at "
+        "SELECT action_id, wakeup_event_id, subject_key, state, detail_code, error_category, created_at, dispatch_started_at "
         "FROM outbound_actions WHERE created_at > now() - make_interval(days => {}) AND action_role = {} "
         "ORDER BY created_at",
         [days, role],
@@ -116,6 +120,7 @@ async def replay(days: int, role: str) -> None:
     shown_by = [row.cells for row in shown_rows or []]
     tally: Counter = Counter()
     kinds: Counter = Counter()
+    timings: list[float] = []
     for row in rows or []:
         cells = row.cells
         before = old_outcome(cells)
@@ -128,7 +133,9 @@ async def replay(days: int, role: str) -> None:
             except Exception:  # noqa: BLE001 -- the request no longer validates: judge the record itself
                 context = await record_context(driver, action)
                 tally[("(context from record only)", before)] += 1
+            started = time.monotonic()
             found = await repository.newer_context(context, limit=50, waive_shown=False, as_of=cells["created_at"])
+            timings.append(time.monotonic() - started)
         except Exception as error:  # noqa: BLE001 -- counted, never fatal
             tally[(before, f"unavailable ({type(error).__name__})")] += 1
             continue
@@ -142,6 +149,11 @@ async def replay(days: int, role: str) -> None:
         }
         unshown = [item for item in found if item.ref not in shown]
         after = "asked" if unshown else "proceeds"
+        dispatched = cells.get("dispatch_started_at")
+        if not unshown and dispatched is not None and (dispatched - cells["created_at"]).total_seconds() > 60:
+            later = await repository.newer_context(context, limit=50, waive_shown=False, as_of=dispatched)
+            unshown = [item for item in later if item.ref not in shown]
+            after = "unasked (worker, no send)" if unshown else "proceeds"
         tally[(before, after)] += 1
         for item in unshown:
             kinds[(before, item.label, item.arm)] += 1
@@ -155,6 +167,11 @@ async def replay(days: int, role: str) -> None:
                     "items": [f"{item.label}:{item.ref}:{item.source}" for item in unshown][:5],
                 }
             )
+        )
+    timings.sort()
+    if timings:
+        print(
+            f"QUERY seconds: n={len(timings)} p50={timings[len(timings) // 2]:.3f} p95={timings[int(len(timings) * 0.95)]:.3f} max={timings[-1]:.3f}"
         )
     print("SUMMARY before -> after : count")
     for (before, after), count in sorted(tally.items()):

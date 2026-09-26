@@ -334,6 +334,7 @@ class OutboundGatewayRepository:
                     message.source,
                     message.source_message_id,
                     message.body,
+                    message.sender_participant_id,
                     raw.payload,
                     sender.participant_type,
                     sender.participant_key,
@@ -367,33 +368,6 @@ class OutboundGatewayRepository:
                           message.channel_id IS DISTINCT FROM p.channel_id
                           AND (message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)
                       )
-                  )
-                  -- The message being answered, its duplicates, and the
-                  -- scrapes certified older than it are the context itself.
-                  AND NOT (coalesce(message.canonical_message_id, message.id) = ANY(p.equivalent_ids))
-                  AND NOT (message.id = ANY(p.certified_older_ids))
-                  AND NOT (coalesce(message.canonical_message_id, message.id) = ANY(p.certified_older_ids))
-                  -- A re-ingest or re-scrape of a message that had reached
-                  -- CDS by the watermark is not new: the same canonical
-                  -- message, or -- a scrape carries no canonical id -- the
-                  -- same source, sender, text and send time (within a minute:
-                  -- scrapes round to it), on any channel.
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages AS seen
-                      WHERE message.canonical_message_id IS NOT NULL
-                        AND (seen.id = message.canonical_message_id OR seen.canonical_message_id = message.canonical_message_id)
-                        AND seen.id <> message.id
-                        AND seen.received_at <= watermark.at
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages AS seen
-                      WHERE seen.source = message.source
-                        AND seen.sent_at BETWEEN message.sent_at - interval '1 minute' AND message.sent_at + interval '1 minute'
-                        AND seen.id <> message.id
-                        AND seen.received_at <= watermark.at
-                        AND seen.sender_participant_id IS NOT DISTINCT FROM message.sender_participant_id
-                        AND nullif(regexp_replace(lower(coalesce(seen.body, '')), '[^a-z0-9]', '', 'g'), '')
-                            = regexp_replace(lower(coalesce(message.body, '')), '[^a-z0-9]', '', 'g')
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM own_send
@@ -553,6 +527,47 @@ class OutboundGatewayRepository:
                 SELECT ancestor.action_id, ancestor.retry_of_action_id
                 FROM outbound_actions AS ancestor
                 JOIN retry_lineage AS child ON ancestor.action_id = child.retry_of_action_id
+), fresh AS (
+                -- Checked after relevance: only this recipient's few messages.
+                SELECT related.*
+                FROM (
+                    SELECT * FROM received
+                    UNION ALL
+                    SELECT * FROM sent_message
+                ) AS related
+                CROSS JOIN p
+                CROSS JOIN watermark
+                -- The message being answered, its duplicates, and the
+                -- scrapes certified older than it are the context itself.
+                WHERE NOT (coalesce(related.canonical_message_id, related.id) = ANY(p.equivalent_ids))
+                AND NOT (related.id = ANY(p.certified_older_ids))
+                AND NOT (coalesce(related.canonical_message_id, related.id) = ANY(p.certified_older_ids))
+                -- A re-ingest or re-scrape of a message that had reached
+                -- CDS by the watermark is not new: the same canonical
+                -- message, or -- a scrape carries no canonical id -- the
+                -- same source, sender, text and send time (within a minute:
+                -- scrapes round to it), on any channel.
+                AND NOT EXISTS (
+                    SELECT 1 FROM messages AS seen
+                    WHERE related.canonical_message_id IS NOT NULL
+                      AND (seen.id = related.canonical_message_id OR seen.canonical_message_id = related.canonical_message_id)
+                      AND seen.id <> related.id
+                      AND seen.received_at <= watermark.at
+                )
+                -- A scalar subquery, not NOT EXISTS: an anti-join would hash
+                -- every message's normalized body (7 s on prod); this runs
+                -- per candidate on (source, sent_at).
+                AND NOT coalesce((
+                    SELECT true FROM messages AS seen
+                    WHERE seen.source = related.source
+                      AND seen.sent_at BETWEEN related.sent_at - interval '1 minute' AND related.sent_at + interval '1 minute'
+                      AND seen.id <> related.id
+                      AND seen.received_at <= watermark.at
+                      AND seen.sender_participant_id IS NOT DISTINCT FROM related.sender_participant_id
+                      AND nullif(regexp_replace(lower(coalesce(seen.body, '')), '[^a-z0-9]', '', 'g'), '')
+                          = regexp_replace(lower(coalesce(related.body, '')), '[^a-z0-9]', '', 'g')
+                    LIMIT 1
+                ), false)
             ), sent_action AS (
                 -- Another wake's gateway send to this subject that started
                 -- dispatch (it may not be ingested back as a message yet).
@@ -573,11 +588,7 @@ class OutboundGatewayRepository:
             ), found AS (
                 SELECT 'message:' || id AS ref, id AS message_id, NULL::uuid AS action_id, created_at,
                        direction, source, display_name AS sender, left(coalesce(body, ''), 300) AS preview
-                FROM received
-                UNION
-                SELECT 'message:' || id, id, NULL::uuid, created_at,
-                       direction, source, display_name, left(coalesce(body, ''), 300)
-                FROM sent_message
+                FROM fresh
                 UNION
                 SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
                        'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
