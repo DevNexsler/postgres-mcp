@@ -587,6 +587,7 @@ async def build_runtime() -> GatewayRuntime:
             {provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "") for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")},
         ),
         email_default_account=os.environ.get("OUTBOUND_EMAIL_DEFAULT_ACCOUNT", "nigel-zoho"),
+        quo_default_line=os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", ""),
         calendar_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_NAME", "nigel")},
         calendar_account_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_ACCOUNT", "nigel-zoho")},
         cliq_target_by_intent=_json_mapping(

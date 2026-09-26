@@ -96,6 +96,10 @@ class RoutingPolicy:
     # Sender for an email from a wake whose source has no mailbox of its own
     # (a Quo text, a Cliq message): Nigel's mailbox.
     email_default_account: str = ""
+    # Line for a text from a wake whose source has no Quo line of its own (a
+    # TenantCloud notification email, a Cliq message): PFG-General per Dan's
+    # 2026-09-11 directive (wake 27269 recorded an empty line instead).
+    quo_default_line: str = ""
 
 
 @dataclass(frozen=True)
@@ -814,7 +818,7 @@ class ActionContextLoader:
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
             assert isinstance(request.arguments, QuoSmsArguments)
-            configured_account = self._policy.quo_line_by_provider.get(provider, "")
+            configured_account = self._policy.quo_line_by_provider.get(provider, "") or self._policy.quo_default_line
             nested = _mapping(_mapping(raw.get("data")).get("object"))
             observed_account = _nonblank(nested.get("phoneNumberId") or nested.get("phone_number_id"))
             observed_direction = _nonblank(nested.get("direction"))
@@ -834,6 +838,12 @@ class ActionContextLoader:
                 if provider == "quo" and observed_account and observed_inbound
                 else configured_account
             )
+            if not account:
+                # Refuse now, where the agent sees why, instead of recording a
+                # send no worker can ever deliver (wake 27269).
+                raise ContextDerivationError(
+                    f"no Quo line is configured for provider {provider!r}"
+                )
             return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)
