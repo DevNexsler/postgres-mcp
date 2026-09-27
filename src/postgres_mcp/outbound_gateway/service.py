@@ -84,6 +84,11 @@ _ENQUEUE_TERMINAL_STATES = _EXECUTE_TERMINAL_STATES | {
 # indication anywhere in the result that the thread id was the problem).
 _TENANTCLOUD_NO_SUCH_THREAD_DETAILS = frozenset({"tenantcloud_target_unavailable_before_dispatch", "tenantcloud_provider_rejected_http_404"})
 
+# serialization_failure: what Comm-Data-Store's expected-state guards raise
+# when the row is no longer in the state the caller read (migration 067's
+# "outbound action state mismatch: expected %, found %").
+_SERIALIZATION_FAILURE_SQLSTATE = "40001"
+
 
 def _tenantcloud_no_such_thread_detail(context: ActionContext, observation: ProviderObservation) -> str | None:
     if context.operation is not Operation.TENANTCLOUD_MESSAGE_SEND:
@@ -332,10 +337,14 @@ class OutboundActionService:
         - Once adapter.invoke() has started (_ProviderCallAttemptedError) the
           provider may have the request: log at ERROR and return the row's
           durable state (dispatching -> lease expiry -> reconcile).
-        - Before it, nothing was sent: log at ERROR and tell the caller so.
-          The row stays where it was left; executing the same request again
-          re-runs the send from there. Nothing is retried on the agent's
-          behalf -- it decides.
+        - Before it, another caller may have moved the row first (the losing
+          racer of two identical executes): the database refuses with a
+          serialization failure and the row is no longer where this call
+          found it. That caller owns the send; return the row as it stands.
+        - Otherwise, before it, nothing was sent: log at ERROR and tell the
+          caller so. The row stays where it was left; executing the same
+          request again re-runs the send from there. Nothing is retried on
+          the agent's behalf -- it decides.
 
         Context load/validation (everything in execute() before this call)
         still raises.
@@ -356,6 +365,17 @@ class OutboundActionService:
             )
             return action_result(await self._require_action(action.action_id))
         except Exception as error:
+            if getattr(error, "sqlstate", None) == _SERIALIZATION_FAILURE_SQLSTATE:
+                current = await self._require_action(action.action_id)
+                if current.state is not action.state:
+                    logger.info(
+                        "wake %s action %s moved %s -> %s by another caller; returning its state",
+                        context.wakeup_event_id,
+                        action.action_id,
+                        action.state.value,
+                        current.state.value,
+                    )
+                    return action_result(current)
             logger.error(
                 "pre-send exception on wake %s action %s -- nothing was sent",
                 context.wakeup_event_id,
