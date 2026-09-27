@@ -20,6 +20,7 @@ from uuid import UUID
 from uuid import uuid4
 
 import pytest
+from psycopg.errors import SerializationFailure
 
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
@@ -2148,6 +2149,66 @@ async def test_an_error_after_the_provider_call_started_stays_uncertain_not_not_
     messages = [r.getMessage() for r in caplog.records]
     assert any("post-dispatch exception" in m for m in messages)
     assert not any("pre-send exception" in m for m in messages)
+
+
+def _prepare_after_another_caller_moved_it(store, moved):
+    """prepare_outbound_action_and_acquire_lock as the losing racer meets it:
+    both callers loaded the row as received, the other caller prepared it
+    first, and CDS migration 067's expected-state guard raises 40001."""
+
+    async def prepare(ctx, expected_state):
+        store.calls.append(("prepare", expected_state))
+        store.current = moved
+        raise SerializationFailure(f"outbound action state mismatch: expected {expected_state.value}, found prepared")
+
+    return prepare
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("moved", "status", "detail_code"),
+    [
+        (row(ActionState.PREPARED), PublicStatus.PENDING, "prepared"),
+        (
+            row(ActionState.UNKNOWN, provider_request_ref="req-1", detail_code="provider_queue_timeout"),
+            PublicStatus.UNKNOWN,
+            "provider_queue_timeout",
+        ),
+        (row(ActionState.COMPLETED, completion_kind=CompletionKind.SENT, detail_code="sent"), PublicStatus.SENT, "sent"),
+    ],
+)
+async def test_the_losing_racer_of_two_identical_executes_reports_the_row_the_winner_moved(caplog, moved, status, detail_code):
+    """#3515: two MCP clients executed the same request for one wake; the
+    loser came back `failed/gateway_internal_error` ("Execute the same request
+    again") while the winner's send was in flight. The other caller owns the
+    send, so the loser reports the row as it now stands and sends nothing."""
+    store = FakeStore()
+    adapter = FakeAdapter()
+    store.prepare = _prepare_after_another_caller_moved_it(store, moved)
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, adapter).execute(request())
+
+    assert result.status is status
+    assert result.detail_code == detail_code
+    assert result.action_id == ACTION_ID
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["create", "prepare"]
+    assert not any("pre-send exception" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_serialization_failure_on_a_row_nobody_moved_is_still_reported_not_sent(caplog):
+    """A received row is not listed by the worker: reporting it `pending`
+    would be a silent no-send. Only a row another caller moved is theirs."""
+    store = FakeStore()
+    adapter = FakeAdapter()
+    store.prepare = _prepare_after_another_caller_moved_it(store, row(ActionState.RECEIVED))
+
+    with caplog.at_level(logging.ERROR):
+        result = await service(store, adapter).execute(request())
+
+    _assert_not_sent(result, adapter, caplog, "SerializationFailure")
 
 
 @pytest.mark.asyncio
