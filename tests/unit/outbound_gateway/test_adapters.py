@@ -19,7 +19,9 @@ from postgres_mcp.outbound_gateway.adapters.quo import QuoSmsAdapter
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.identity import request_arguments
 from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.provider_client import McpCallResult
@@ -1649,6 +1651,75 @@ async def test_tenantcloud_reconciliation_auth_unavailable_on_a_create_is_retrya
     assert reconciled.retryable is True
     assert reconciled.category == "provider_authentication"
     assert reconciled.detail_code == "tenantcloud_auth_rejected_before_dispatch"
+
+
+class TruncatingTenantCloudThread:
+    """TenantCloud's observed message storage instead of a scripted result.
+
+    The POST is accepted, but the body is kept only up to the first character
+    outside the Basic Multilingual Plane (most emoji; live probe and wake
+    27226, 2026-09-25). Readback and reconcile then compare that stored copy
+    with the body the gateway sent, as the facade's reconcile_message does.
+    """
+
+    def __init__(self):
+        self.stored: list[str] = []
+
+    def send_message(self, thread_id, body):
+        cut = next((index for index, character in enumerate(body) if ord(character) > 0xFFFF), len(body))
+        self.stored.append(body[:cut].strip())
+        observation = self._readback(thread_id, body)
+        return FakeMutationExecution(FakeMutationResult(TC_ACCEPTED), observation, None if observation else "readback_mismatch")
+
+    def reconcile_message(self, thread_id, body, *, source_turn_at, allow_late=False):
+        observation = self._readback(thread_id, body)
+        if observation is None:
+            return FakeReconciliationResult(TC_UNKNOWN, None, "no_match")
+        return FakeReconciliationResult(TC_ACCEPTED, observation, None)
+
+    def _readback(self, thread_id, body):
+        if body not in self.stored:
+            return None
+        return FakeMutationObservation(
+            target_reference=f"thread:{thread_id}",
+            provider_object_id="11742638",
+            canonical_observed_state={"thread_id": str(thread_id), "body": body},
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_emoji_reply_arrives_whole_and_verifies_against_what_tenantcloud_stored():
+    """Wake 27226 sent "... the lazy dog. 🦊🐕 — received, Dan. ..." and
+    TenantCloud kept only "... the lazy dog.", so readback and every reconcile
+    found no match (tenantcloud_reconciliation_no_match) for a reply that had
+    reached the tenant cut short. A new request must reach the provider as text
+    TenantCloud stores whole, so the send verifies with no operator step."""
+    request = ExecuteRequest.model_validate(
+        {
+            "op": "execute",
+            "wakeup_event_id": 27226,
+            "action_role": "prospect_reply",
+            "operation": "tenantcloud.message.send",
+            "intent_kind": "inquiry_reply",
+            "arguments": {
+                "thread_id": 555,
+                "text": "The quick brown fox jumps over the lazy dog. \U0001f98a\U0001f415 — received, Dan. "
+                "Maintenance supervisor is live and responding on this thread.",
+            },
+        }
+    )
+    ctx = tenantcloud_context(Operation.TENANTCLOUD_MESSAGE_SEND, arguments=MappingProxyType(request_arguments(request.arguments)))
+    thread = TruncatingTenantCloudThread()
+    adapter = TenantCloudAdapter(mutations_factory=lambda: thread)
+
+    sent = await adapter.invoke(thread, adapter.build_request(ctx, ACTION_UID))
+    reconciled = await adapter.reconcile(thread, ctx, ACTION_UID, sent)
+
+    assert reconciled.detail_code == "tenantcloud_message_reconciled"
+    assert sent.disposition is ProviderDisposition.ACCEPTED
+    assert sent.detail_code == "tenantcloud_message_accepted"
+    assert thread.stored == [ctx.arguments["text"]]
+    assert thread.stored[0].endswith("responding on this thread.")
 
 
 @pytest.mark.asyncio
