@@ -63,6 +63,11 @@ class OutboundActionRecord:
     # revise), NULL while unanswered.
     stale_context_shown_refs: tuple[str, ...] = ()
     stale_context_decision: str | None = None
+    # outbound_actions.created_at already exists (not previously read by this
+    # dataclass): the anchor for the TenantCloud auth-outage wait's 2h
+    # ceiling (service.py's _tenantcloud_auth_wait_pending). None on a
+    # hand-built record (most test fixtures): treated as "just created".
+    created_at: datetime | None = None
 
     def execute_request(self) -> ExecuteRequest:
         # create_or_load() persists TenantCloud arguments enriched with

@@ -9,11 +9,23 @@ from unittest.mock import patch
 
 import pytest
 
+from postgres_mcp.outbound_gateway.metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from postgres_mcp.outbound_gateway.metrics import CircuitStatus
 from postgres_mcp.outbound_gateway.metrics import GatewayObservability
 from postgres_mcp.outbound_gateway.metrics import MetricSample
 from postgres_mcp.outbound_gateway.metrics import render_prometheus
+from postgres_mcp.outbound_gateway.metrics import tenantcloud_auth_wait_seconds
 from postgres_mcp.outbound_gateway.models import Operation
+
+
+def test_tenantcloud_auth_wait_seconds_grows_then_caps_at_five_minutes():
+    assert tenantcloud_auth_wait_seconds(0) == 60
+    assert tenantcloud_auth_wait_seconds(599) == 60
+    assert tenantcloud_auth_wait_seconds(600) == 120
+    assert tenantcloud_auth_wait_seconds(1_500) == 180
+    assert tenantcloud_auth_wait_seconds(3_600) == 300
+    assert tenantcloud_auth_wait_seconds(TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS) == 300
+    assert tenantcloud_auth_wait_seconds(100_000) == 300
 
 
 class Row:

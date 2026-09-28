@@ -23,8 +23,10 @@ from .context import ActionContextLoader
 from .context import ContextDerivationError
 from .context import DerivedTarget
 from .context import canonical_payload_hash
+from .metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
+from .metrics import tenantcloud_auth_wait_seconds
 from .models import ActionState
 from .models import CompletionKind
 from .models import ConfirmRequest
@@ -83,6 +85,40 @@ _ENQUEUE_TERMINAL_STATES = _EXECUTE_TERMINAL_STATES | {
 # 2026-08-30: five identical rejections then retry_budget_exhausted, with no
 # indication anywhere in the result that the thread id was the problem).
 _TENANTCLOUD_NO_SUCH_THREAD_DETAILS = frozenset({"tenantcloud_target_unavailable_before_dispatch", "tenantcloud_provider_rejected_http_404"})
+
+
+# A retryable TenantCloud rejection proven pre-dispatch (nothing was ever
+# written -- adapters/tenantcloud.py's _from_execution auth branch and
+# _from_reconciliation's authentication_unavailable branch, both provably
+# before any write is attempted): waited out instead of burning the ordinary
+# 5-attempt budget (8 of 9 retry_budget_exhausted TenantCloud sends in 60
+# days were 6x this rejection inside ~90-150s, well within a single auth
+# outage that can run up to ~45 minutes). error_category survives every
+# schedule_next_attempt() reschedule (that call never touches it); detail_code
+# does not (each reschedule overwrites it), so error_category is the durable
+# signal across repeated wait cycles.
+_TENANTCLOUD_AUTH_WAIT_DETAIL = "tenantcloud_auth_rejected_before_dispatch"
+_TENANTCLOUD_AUTH_WAIT_CATEGORY = "provider_authentication"
+
+
+def _tenantcloud_auth_wait_pending(action: OutboundActionRecord, now: datetime) -> bool:
+    """True only for a TenantCloud row parked retry_ready by a provably
+    pre-dispatch auth rejection, still inside the 2h ceiling. Any action that
+    actually dispatched lands in dispatching/provider_accepted/unknown/
+    reconciling instead of retry_ready, or (if retryable) carries a
+    different category -- so this can never fire for a send that reached the
+    provider."""
+    if action.operation not in TENANTCLOUD_OPERATIONS or action.state is not ActionState.RETRY_READY:
+        return False
+    if action.detail_code != _TENANTCLOUD_AUTH_WAIT_DETAIL and action.error_category != _TENANTCLOUD_AUTH_WAIT_CATEGORY:
+        return False
+    elapsed = (now - action.created_at).total_seconds() if action.created_at is not None else 0.0
+    return elapsed < TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
+
+
+def _tenantcloud_auth_wait_delay(action: OutboundActionRecord, now: datetime) -> int:
+    elapsed = (now - action.created_at).total_seconds() if action.created_at is not None else 0.0
+    return tenantcloud_auth_wait_seconds(elapsed)
 
 
 def _tenantcloud_no_such_thread_detail(context: ActionContext, observation: ProviderObservation) -> str | None:
@@ -513,6 +549,20 @@ class OutboundActionService:
                 action.state,
                 max(1, circuit.retry_after_seconds),
                 "provider_circuit_open",
+            )
+            return action_result(scheduled)
+        now = self._clock()
+        if _tenantcloud_auth_wait_pending(action, now):
+            # Same shape as the circuit-open branch above: reschedule without
+            # claim(), so this wait spends no attempt. Once the 2h ceiling
+            # passes, _tenantcloud_auth_wait_pending stops matching and this
+            # row falls straight through to the ordinary claim()/dispatch
+            # below -- today's behaviour.
+            scheduled = await self._store.schedule_next_attempt(
+                action.action_id,
+                action.state,
+                _tenantcloud_auth_wait_delay(action, now),
+                "tenantcloud_auth_wait",
             )
             return action_result(scheduled)
         claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)

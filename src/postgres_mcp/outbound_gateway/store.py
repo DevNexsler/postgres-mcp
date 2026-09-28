@@ -570,4 +570,5 @@ class PostgresActionStore:
             remediation_reason=cells.get("remediation_reason"),
             stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
+            created_at=cells.get("created_at"),
         )
