@@ -110,6 +110,7 @@ class GatewayRuntime:
     policy: FeaturePolicy
     observability: GatewayObservability
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None
+    restate_operations: frozenset[Operation] = frozenset()
 
 
 async def handle_outbound_action(
@@ -359,6 +360,26 @@ def _enabled_operations() -> frozenset[Operation]:
         raise ValueError("OUTBOUND_ENABLED_OPERATIONS_JSON contains an unsupported operation") from exc
 
 
+
+
+def _restate_operations() -> frozenset[Operation]:
+    """``OUTBOUND_RESTATE_OPERATIONS``: which non-TenantCloud operations route
+    through the generalized Restate delivery workflow instead of the legacy
+    worker.py polling loop. Default empty -- today's behavior for SMS/email/
+    Cliq/calendar is unchanged until an operation is named here. TenantCloud
+    is never read from this: it stays on Restate unconditionally, exactly as
+    before this flag existed (tenantcloud_delivery.py, worker.py's own
+    TENANTCLOUD_OPERATIONS union)."""
+    raw = os.environ.get("OUTBOUND_RESTATE_OPERATIONS")
+    if raw is None or not raw.strip():
+        return frozenset()
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError("OUTBOUND_RESTATE_OPERATIONS must be a JSON array")
+    try:
+        return frozenset(Operation(item) for item in value if isinstance(item, str))
+    except ValueError as exc:
+        raise ValueError("OUTBOUND_RESTATE_OPERATIONS contains an unsupported operation") from exc
 
 
 def _traffic_mode() -> str:
@@ -698,10 +719,14 @@ async def build_runtime() -> GatewayRuntime:
         policy=policy,
         observability=observability,
         tenantcloud_submitter=(
-            RestateWorkflowSubmitter(restate_ingress)
+            RestateWorkflowSubmitter(
+                restate_ingress,
+                workflow_name=os.environ.get("OUTBOUND_RESTATE_WORKFLOW_NAME", "TenantCloudDelivery"),
+            )
             if (restate_ingress := os.environ.get("OUTBOUND_TENANTCLOUD_RESTATE_INGRESS_URL", "").strip())
             else None
         ),
+        restate_operations=_restate_operations(),
     )
 
 
@@ -742,6 +767,7 @@ async def _work() -> None:
         max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
         observability=runtime.observability,
         tenantcloud_submitter=runtime.tenantcloud_submitter,
+        restate_operations=runtime.restate_operations,
     )
     interval = max(1.0, float(os.environ.get("OUTBOUND_WORKER_INTERVAL_SECONDS", "5")))
     try:
