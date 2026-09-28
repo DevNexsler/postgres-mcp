@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -283,8 +284,13 @@ async def test_restate_workflow_returns_serializable_terminal_outcome(monkeypatc
 async def test_an_ambiguous_action_that_never_verifies_is_parked_for_a_person() -> None:
     """Action c3df14e3 (2026-09-25): TenantCloud stored a truncated text, the
     readback could never match, and the send stayed `unknown` -- holding every
-    later send to that tenant. Past the ambiguous bound it goes to manual review."""
-    row = action(ActionState.UNKNOWN, attempts=12)
+    later send to that tenant. retry_policy.py's elapsed-time ceiling is the
+    one budget now (not attempt_count -- see tenantcloud_delivery.py's
+    advance()): past one hour from created_at it goes to manual review
+    regardless of how many reconcile attempts that took."""
+    created_at = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    row = action(ActionState.UNKNOWN, attempts=3)
+    row.created_at = created_at
     store = AsyncMock()
     store.get.return_value = row
     service = AsyncMock()
@@ -293,13 +299,106 @@ async def test_an_ambiguous_action_that_never_verifies_is_parked_for_a_person() 
     )
     auth = AsyncMock()
     auth.ensure_ready.return_value = AuthResult(AuthState.READY)
-    coordinator = TenantCloudDeliveryCoordinator(store=store, service=service, auth=auth, max_attempts=5)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        max_attempts=5,
+        clock=lambda: created_at + timedelta(seconds=3601),
+    )
 
     result = await coordinator.advance(ACTION_ID)
 
     assert result.phase is DeliveryPhase.TERMINAL
     service.exhaust.assert_awaited_once_with(ACTION_ID)
     service.reconcile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_action_with_many_attempts_but_inside_the_ceiling_keeps_reconciling() -> None:
+    """The old 12-attempt ambiguous cap does not apply on the Restate path:
+    an action that reconciles quickly and often must not get a smaller
+    effective budget than one that answers slowly -- only elapsed wall-clock
+    time against retry_policy.RETRY_CEILING_SECONDS decides this now."""
+    created_at = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    row = action(ActionState.UNKNOWN, attempts=50)
+    row.created_at = created_at
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.reconcile.return_value = SimpleNamespace(status=PublicStatus.UNKNOWN, detail_code="reconciliation_no_match")
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        max_ambiguous_attempts=12,
+        clock=lambda: created_at + timedelta(seconds=1800),
+    )
+
+    await coordinator.advance(ACTION_ID)
+
+    service.reconcile.assert_awaited_once_with(ACTION_ID)
+    service.exhaust.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_resumable_action_with_many_attempts_but_inside_the_ceiling_still_resumes() -> None:
+    """A flagged Restate operation follows retry_policy's 1h elapsed ceiling,
+    not the legacy worker's 5-attempt cap: attempt_count alone (here, 40 --
+    far past max_attempts=5) must never route to exhaust() while the action
+    is still inside its wall-clock budget."""
+    created_at = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    row = action(ActionState.RETRY_READY, attempts=40)
+    row.created_at = created_at
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(status=PublicStatus.UNKNOWN, detail_code="provider_pending")
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        max_attempts=5,
+        clock=lambda: created_at + timedelta(seconds=1800),
+    )
+
+    await coordinator.advance(ACTION_ID)
+
+    service.resume.assert_awaited_once_with(ACTION_ID)
+    service.exhaust.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_resumable_action_past_the_ceiling_is_exhausted_regardless_of_attempt_count() -> None:
+    """The mirror case: a single attempt (attempt_count=1, well under the old
+    5-attempt cap) still routes to exhaust() once 1h has elapsed -- proving
+    the ceiling, not the count, is what governs the Restate path."""
+    created_at = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    row = action(ActionState.RETRY_READY, attempts=1)
+    row.created_at = created_at
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.exhaust.return_value = SimpleNamespace(status=PublicStatus.MANUAL_REVIEW, detail_code="retry_budget_exhausted")
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        max_attempts=5,
+        clock=lambda: created_at + timedelta(seconds=3601),
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.TERMINAL
+    service.exhaust.assert_awaited_once_with(ACTION_ID)
+    service.resume.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -363,6 +462,7 @@ async def test_an_operations_set_generalizes_which_operations_the_coordinator_ad
         service=service,
         auth=auth,
         operations=frozenset({Operation.CALENDAR_UPDATE}),
+        clock=lambda: row.created_at + timedelta(seconds=5),
     )
 
     result = await coordinator.advance(ACTION_ID)
@@ -402,12 +502,16 @@ async def test_a_context_reload_manual_review_waits_instead_of_parking_inside_th
 
 @pytest.mark.asyncio
 async def test_a_context_reload_manual_review_past_the_ceiling_is_terminal() -> None:
+    """Past retry_policy's one-hour ceiling, advance() routes straight to
+    service.exhaust() instead of one more resume() -- the same
+    definitive_failed-with-warning outcome the ceiling exists for (see
+    retry_policy.py's decide()), not a further provider attempt."""
     now = datetime(2026, 9, 28, 19, 45, 0, tzinfo=timezone.utc)  # > 1h after created_at
     row = _generic_action(created_at=datetime(2026, 9, 28, 18, 41, 26, tzinfo=timezone.utc))
     store = AsyncMock()
     store.get.return_value = row
     service = AsyncMock()
-    service.resume.return_value = SimpleNamespace(
+    service.exhaust.return_value = SimpleNamespace(
         status=PublicStatus.MANUAL_REVIEW,
         detail_code="persisted_context_unavailable",
         detail="persisted_context_unavailable",
@@ -426,3 +530,5 @@ async def test_a_context_reload_manual_review_past_the_ceiling_is_terminal() -> 
 
     assert result.phase is DeliveryPhase.TERMINAL
     assert result.detail_code == "persisted_context_unavailable"
+    service.exhaust.assert_awaited_once_with(ACTION_ID)
+    service.resume.assert_not_called()

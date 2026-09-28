@@ -35,6 +35,7 @@ from .models import PublicStatus
 from .retry_policy import CONTEXT_RELOAD_WAIT_DETAILS
 from .retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
 from .retry_policy import RETRY_CEILING_SECONDS
+from .retry_policy import ceiling_exceeded
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
@@ -155,13 +156,16 @@ class TenantCloudDeliveryCoordinator:
         self._auth = auth
         self._operations = operations if operations is not None else TENANTCLOUD_OPERATIONS
         self._context_wait_ceiling_seconds = max(1, context_wait_ceiling_seconds)
+        # NOT read by advance() (see its body): retry_policy.py's elapsed-time
+        # ceiling (context_wait_ceiling_seconds, above) is the one budget for
+        # every operation this coordinator serves, including the ambiguous-
+        # reconcile-loop protection action c3df14e3 (2026-09-25, an unknown
+        # TenantCloud send whose in-flight state held every later send to the
+        # same recipient -- lease_held) needed a count cap for. Kept only as
+        # constructor parameters for source compatibility with existing
+        # callers (tenantcloud_delivery_server.py); passing a non-default
+        # value here no longer changes advance()'s behavior.
         self._max_attempts = max(1, max_attempts)
-        # An ambiguous write keeps reconciling past the send limit (the readback
-        # may still prove acceptance), but not forever: a TenantCloud send that
-        # can never verify -- its text arrived truncated, action c3df14e3 on
-        # 2026-09-25 -- stayed `unknown`, and its in-flight state held every
-        # later send to the same recipient (lease_held). Past this bound it is
-        # parked for a person (manual_review), which releases the recipient.
         self._max_ambiguous_attempts = max(self._max_attempts, max_ambiguous_attempts)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -219,15 +223,29 @@ class TenantCloudDeliveryCoordinator:
                     result.detail,
                     300,
                 )
-        elif action.state in _AMBIGUOUS_STATES:
-            if action.attempt_count >= self._max_ambiguous_attempts:
+        else:
+            # retry_policy.py owns every retry/backoff/ceiling decision for
+            # every action this coordinator advances (by construction, only
+            # operations in ``self._operations`` -- Restate-routed ones).
+            # attempt_count is never read here: the legacy worker's 5/12
+            # attempt caps (``self._max_attempts`` / ``self._max_ambiguous_attempts``,
+            # kept only for the non-Restate path in worker.py/service.py) do
+            # not apply once an operation is on Restate -- a send that answers
+            # slowly a handful of times must not get a smaller effective
+            # budget than one that answers instantly every time (see
+            # retry_policy.py's module docstring). The one ceiling is
+            # elapsed wall-clock time since the action's own created_at,
+            # bounded at ``self._context_wait_ceiling_seconds``
+            # (RETRY_CEILING_SECONDS, one hour, by default).
+            action_created_at = getattr(action, "created_at", None)
+            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
+            exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
+            if action.state in _AMBIGUOUS_STATES:
+                result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
+            elif exhausted:
                 result = await self._service.exhaust(action_id)
             else:
-                result = await self._service.reconcile(action_id)
-        elif action.attempt_count >= self._max_attempts:
-            result = await self._service.exhaust(action_id)
-        else:
-            result = await self._service.resume(action_id)
+                result = await self._service.resume(action_id)
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
         if result.status is PublicStatus.MANUAL_REVIEW:
