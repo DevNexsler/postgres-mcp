@@ -194,6 +194,55 @@ async def test_restate_outage_keeps_tenantcloud_action_pending_for_sweeper() -> 
 
 
 @pytest.mark.asyncio
+async def test_a_flagged_non_tenantcloud_operation_also_enqueues_and_submits_fast() -> None:
+    """OUTBOUND_RESTATE_OPERATIONS routes execute() through the same fast
+    enqueue+fire-and-forget path TenantCloud already uses, for whatever
+    operation is named -- here email.send, never itself a TenantCloud
+    operation."""
+    service = AsyncMock()
+    service.enqueue.return_value = public(PublicStatus.PENDING, "prepared")
+    submitter = AsyncMock()
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(
+        service,
+        policy,
+        execute_payload(),
+        tenantcloud_submitter=submitter,
+        restate_operations=frozenset({Operation.EMAIL_SEND}),
+    )
+
+    assert result["status"] == "pending"
+    service.enqueue.assert_awaited_once()
+    service.execute.assert_not_called()
+    submitter.submit.assert_awaited_once_with(ACTION_ID)
+
+
+@pytest.mark.asyncio
+async def test_an_unflagged_operation_keeps_the_legacy_synchronous_execute_path() -> None:
+    """Without the operation named in restate_operations, a submitter being
+    configured (e.g. because TenantCloud uses it) must not change behavior
+    for an operation still on the legacy worker."""
+    service = AsyncMock()
+    service.execute.return_value = public()
+    submitter = AsyncMock()
+    policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
+
+    result = await handle_outbound_action(
+        service,
+        policy,
+        execute_payload(),
+        tenantcloud_submitter=submitter,
+        restate_operations=frozenset(),
+    )
+
+    assert result["status"] == "sent"
+    service.execute.assert_awaited_once()
+    service.enqueue.assert_not_called()
+    submitter.submit.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_validation_error_names_field_and_values():
     service = AsyncMock()
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)

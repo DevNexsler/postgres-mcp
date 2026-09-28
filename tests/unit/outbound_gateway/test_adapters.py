@@ -207,6 +207,37 @@ def test_effect_call_tool_error_result_with_no_transport_kind_is_definitive_non_
     assert "CT_* chat id" in observation.evidence["provider_message"]
 
 
+def test_provider_permanent_upstream_error_is_definitive_non_acceptance():
+    """wake 27327 (2026-09-28 20:14:53Z): a cliq.chat.post to chat
+    1608777531604898891 whose Agent Email job finished status=failed,
+    category=provider_permanent_upstream_error -- the provider itself said
+    the rejection is permanent. CDS confirms it was never delivered (a
+    sibling DM sent at the same second WAS delivered), yet this classified
+    as AMBIGUOUS, reconciled 5 times, and parked in manual_review with no
+    reason surfaced -- the same failure mode provider_rejected_request was
+    fixed for above, just reached through the queue's terminal status
+    instead of a synchronous tool error."""
+    result = McpCallResult(
+        structured_content={
+            "status": "failed",
+            "category": "permanent_upstream_error",
+            "retryable": False,
+            "message": "Cliq rejected the message: chat is archived",
+            "request_id": "cliq-request-27327",
+        }
+    )
+
+    observation = initial_observation(result)
+
+    assert observation is not None
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.detail_code == "provider_permanent_upstream_error"
+    assert observation.category == "permanent_upstream_error"
+    assert observation.retryable is False
+    assert observation.evidence is not None
+    assert observation.evidence["provider_message"] == "Cliq rejected the message: chat is archived"
+
+
 def test_poll_call_tool_error_result_with_no_transport_kind_stays_ambiguous():
     """The same isError shape on a poll/reconcile call (e.g. request_status
     given a bad request_id) says nothing about whether the original send

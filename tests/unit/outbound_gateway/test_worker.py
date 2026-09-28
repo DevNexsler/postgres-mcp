@@ -112,6 +112,73 @@ async def test_worker_delegates_tenantcloud_work_to_restate() -> None:
     service.reconcile.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_worker_defaults_to_tenantcloud_only_restate_routing() -> None:
+    """Default (no restate_operations passed) preserves today's behavior:
+    only TenantCloud goes to Restate, a flagged-but-not-passed operation
+    still runs the legacy path."""
+    action_id = UUID(int=32)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(action_id, ActionState.RETRY_READY)]
+    store.get.return_value = type("Action", (), {"operation": Operation.CALENDAR_UPDATE})()
+    service = AsyncMock()
+    submitter = AsyncMock()
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        tenantcloud_submitter=submitter,
+    )
+
+    assert await worker.run_once() == 1
+    submitter.submit.assert_not_called()
+    service.resume.assert_awaited_once_with(action_id)
+
+
+@pytest.mark.asyncio
+async def test_worker_routes_a_flagged_non_tenantcloud_operation_to_restate() -> None:
+    """OUTBOUND_RESTATE_OPERATIONS (server.py) selects additional operations,
+    unioned with TenantCloud -- never subtracted from it."""
+    action_id = UUID(int=33)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(action_id, ActionState.RETRY_READY)]
+    store.get.return_value = type("Action", (), {"operation": Operation.CALENDAR_UPDATE})()
+    service = AsyncMock()
+    submitter = AsyncMock()
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        tenantcloud_submitter=submitter,
+        restate_operations=frozenset({Operation.CALENDAR_UPDATE}),
+    )
+
+    assert await worker.run_once() == 1
+    submitter.submit.assert_awaited_once_with(action_id)
+    service.resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_still_routes_tenantcloud_when_restate_operations_is_set() -> None:
+    """The flag only adds operations; TenantCloud is never opted out."""
+    action_id = UUID(int=34)
+    store = AsyncMock()
+    store.list_exhausted.return_value = []
+    store.list_work.return_value = [(action_id, ActionState.RETRY_READY)]
+    store.get.return_value = type("Action", (), {"operation": Operation.TENANTCLOUD_MESSAGE_SEND})()
+    service = AsyncMock()
+    submitter = AsyncMock()
+    worker = OutboundWorker(
+        store=store,
+        service=service,
+        tenantcloud_submitter=submitter,
+        restate_operations=frozenset({Operation.CALENDAR_UPDATE}),
+    )
+
+    assert await worker.run_once() == 1
+    submitter.submit.assert_awaited_once_with(action_id)
+
+
 def test_default_error_line_names_the_error(capsys):
     OutboundWorker._default_error(UUID(int=7), "reconcile", KeyError("nigel-zoho"))
     line = capsys.readouterr().out.strip()

@@ -35,6 +35,8 @@ from .adapters.tenantcloud import TenantCloudAdapter
 from .context import ACTION_NAMESPACE
 from .context import ActionContextLoader
 from .context import RoutingPolicy
+from .delivery_workflow import RestateWorkflowSubmitter
+from .delivery_workflow import SecretAuthGate
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
@@ -53,8 +55,6 @@ from .provider_client import McpServerConfig
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
-from .tenantcloud_delivery import RestateWorkflowSubmitter
-from .tenantcloud_delivery import TenantCloudAuthGate
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .worker import OutboundWorker
@@ -110,6 +110,7 @@ class GatewayRuntime:
     policy: FeaturePolicy
     observability: GatewayObservability
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None
+    restate_operations: frozenset[Operation] = frozenset()
 
 
 async def handle_outbound_action(
@@ -118,6 +119,7 @@ async def handle_outbound_action(
     request: dict[str, Any],
     *,
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> dict[str, Any]:
     try:
         parsed = parse_outbound_request(request)
@@ -141,7 +143,13 @@ async def handle_outbound_action(
     if isinstance(parsed, StatusRequest):
         result = await service.status(parsed.action_id)
     elif isinstance(parsed, ConfirmRequest):
-        result = await _confirm(service, policy, parsed, tenantcloud_submitter=tenantcloud_submitter)
+        result = await _confirm(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
     else:
         assert isinstance(parsed, ExecuteRequest)
         if not policy.writes_enabled or policy.kill_switch:
@@ -172,14 +180,20 @@ async def handle_outbound_action(
                 detail_code="operation_disabled",
             )
         else:
-            if parsed.operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None:
+            routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+            if parsed.operation in routed_operations and tenantcloud_submitter is not None:
+                # Stays fast: persist + preflight only (no provider I/O), then
+                # fire-and-forget the durable Restate submission. Execute
+                # returns "accepted, delivering" immediately either way -- the
+                # 1h retry ceiling runs entirely in the background workflow, a
+                # wake session never waits on it.
                 result = await service.enqueue(parsed)
                 if result.status is PublicStatus.PENDING:
                     try:
                         await tenantcloud_submitter.submit(result.action_id)
                     except Exception:
                         logger.exception(
-                            "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                            "Restate delivery submission failed for action %s; CDS sweeper will retry",
                             result.action_id,
                         )
             else:
@@ -202,6 +216,7 @@ async def _confirm(
     request: ConfirmRequest,
     *,
     tenantcloud_submitter: RestateWorkflowSubmitter | None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> PublicResult:
     """Route a stale_context answer. A decline is a ledger write only and is
     always accepted; a yes is a send and obeys the same write switches as
@@ -228,14 +243,15 @@ async def _confirm(
             retryable=False,
             detail_code="operation_disabled",
         )
-    tenantcloud = parent_operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None
-    result = await service.confirm(request, dispatch=not tenantcloud)
-    if tenantcloud and result.status is PublicStatus.PENDING and tenantcloud_submitter is not None:
+    routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+    routed = parent_operation in routed_operations and tenantcloud_submitter is not None
+    result = await service.confirm(request, dispatch=not routed)
+    if routed and result.status is PublicStatus.PENDING and tenantcloud_submitter is not None:
         try:
             await tenantcloud_submitter.submit(result.action_id)
         except Exception:
             logger.exception(
-                "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                "Restate delivery submission failed for action %s; CDS sweeper will retry",
                 result.action_id,
             )
     return result
@@ -247,6 +263,7 @@ def create_server(
     *,
     observability: GatewayObservability | None = None,
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> FastMCP:
     mcp = FastMCP(
         "comm-outbound-gateway",
@@ -288,6 +305,7 @@ def create_server(
             policy,
             request,
             tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
         )
 
     @mcp.resource("health://outbound-gateway", name="outbound-gateway-health")
@@ -359,6 +377,26 @@ def _enabled_operations() -> frozenset[Operation]:
         raise ValueError("OUTBOUND_ENABLED_OPERATIONS_JSON contains an unsupported operation") from exc
 
 
+
+
+def _restate_operations() -> frozenset[Operation]:
+    """``OUTBOUND_RESTATE_OPERATIONS``: which non-TenantCloud operations route
+    through the generalized Restate delivery workflow instead of the legacy
+    worker.py polling loop. Default empty -- today's behavior for SMS/email/
+    Cliq/calendar is unchanged until an operation is named here. TenantCloud
+    is never read from this: it stays on Restate unconditionally, exactly as
+    before this flag existed (tenantcloud_delivery.py, worker.py's own
+    TENANTCLOUD_OPERATIONS union)."""
+    raw = os.environ.get("OUTBOUND_RESTATE_OPERATIONS")
+    if raw is None or not raw.strip():
+        return frozenset()
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError("OUTBOUND_RESTATE_OPERATIONS must be a JSON array")
+    try:
+        return frozenset(Operation(item) for item in value if isinstance(item, str))
+    except ValueError as exc:
+        raise ValueError("OUTBOUND_RESTATE_OPERATIONS contains an unsupported operation") from exc
 
 
 def _traffic_mode() -> str:
@@ -469,7 +507,7 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
     return TenantCloudAdapter(mutations_factory=build_mutations)
 
 
-def build_tenantcloud_auth_gate() -> TenantCloudAuthGate:
+def build_tenantcloud_auth_gate() -> SecretAuthGate:
     """Build same scoped auth path used by TenantCloud provider writes."""
     _reject_tenantcloud_origin_overrides()
     control_url = os.environ.get("TENANTCLOUD_RUNNER_CONTROL_URL", "").strip()
@@ -488,7 +526,7 @@ def build_tenantcloud_auth_gate() -> TenantCloudAuthGate:
             profile_access=False,
         )
 
-    return TenantCloudAuthGate(
+    return SecretAuthGate(
         factory,
         login_required_errors=(auth_module.TenantCloudLoginRequiredError,),
         transport_errors=(auth_module.TenantCloudAuthTransportError,),
@@ -698,10 +736,14 @@ async def build_runtime() -> GatewayRuntime:
         policy=policy,
         observability=observability,
         tenantcloud_submitter=(
-            RestateWorkflowSubmitter(restate_ingress)
+            RestateWorkflowSubmitter(
+                restate_ingress,
+                workflow_name=os.environ.get("OUTBOUND_RESTATE_WORKFLOW_NAME", "TenantCloudDelivery"),
+            )
             if (restate_ingress := os.environ.get("OUTBOUND_TENANTCLOUD_RESTATE_INGRESS_URL", "").strip())
             else None
         ),
+        restate_operations=_restate_operations(),
     )
 
 
@@ -720,6 +762,7 @@ async def _serve() -> None:
         runtime.policy,
         observability=runtime.observability,
         tenantcloud_submitter=runtime.tenantcloud_submitter,
+        restate_operations=runtime.restate_operations,
     )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
@@ -742,6 +785,7 @@ async def _work() -> None:
         max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
         observability=runtime.observability,
         tenantcloud_submitter=runtime.tenantcloud_submitter,
+        restate_operations=runtime.restate_operations,
     )
     interval = max(1.0, float(os.environ.get("OUTBOUND_WORKER_INTERVAL_SECONDS", "5")))
     try:
