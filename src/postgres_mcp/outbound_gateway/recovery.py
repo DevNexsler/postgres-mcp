@@ -39,6 +39,8 @@ from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
+from .metrics import PROVIDER_PENDING_WAIT_CEILING_SECONDS
+from .metrics import provider_pending_wait_seconds
 from .models import ActionState
 from .models import CompletionKind
 from .models import Operation
@@ -111,11 +113,18 @@ Plan = tuple[Step, ...]
 # --------------------------------------------------------------------------
 
 
-def _ambiguous(detail_code: str, action: OutboundActionRecord) -> ProviderObservation:
+def _ambiguous(detail_code: str, action: OutboundActionRecord, *, reason: str | None = None) -> ProviderObservation:
     return ProviderObservation(
         ProviderDisposition.AMBIGUOUS,
         detail_code,
         provider_request_ref=action.provider_request_ref,
+        # `reason`: the real error a caller (e.g. a transient context reload
+        # failure -- ContextDerivationError's own message) carries into the
+        # attempt's persisted observation, bounded and sanitized by the
+        # caller. store.py's _observation() writes this into the attempt's
+        # provider_observation jsonb (an unconstrained column outside the
+        # provider_accepted acceptance-guard shape).
+        evidence={"reload_error": reason} if reason else None,
     )
 
 
@@ -197,9 +206,9 @@ def _dead_letter_for_review(
     )
 
 
-def plan_manual_review(action: OutboundActionRecord, detail_code: str) -> Plan:
+def plan_manual_review(action: OutboundActionRecord, detail_code: str, *, reason: str | None = None) -> Plan:
     """Park an action nobody can settle (its saved record cannot be executed)."""
-    observation = _ambiguous(detail_code, action)
+    observation = _ambiguous(detail_code, action, reason=reason)
     return _dead_letter_for_review(action.state, observation, observation, has_lease=False)
 
 
@@ -244,16 +253,19 @@ def plan_claim_for_final_check(action: OutboundActionRecord) -> Plan:
     return (*steps, Claim(state))  # already reconciling
 
 
-def plan_exhaust(action: OutboundActionRecord) -> Plan:
+def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None) -> Plan:
     """Close work whose retry budget is spent, without another provider
     invocation: a durable acceptance completes; anything that may already
     be with the provider is parked for a person; a send that never left
-    fails definitively; everything else is left as it is."""
+    fails definitively; everything else is left as it is. `reason`: the last
+    real cause of an ambiguous outcome (a context reload failure), carried
+    into the manual_review edge's observation so a person is never handed a
+    bare "retry_budget_exhausted" when a repeated, specific error caused it."""
     recovered = plan_recover_acceptance(action)
     if recovered is not None:
         return recovered
-    exhausted = _ambiguous("retry_budget_exhausted", action)
-    review = _ambiguous("retry_budget_exhausted_manual_review", action)
+    exhausted = _ambiguous("retry_budget_exhausted", action, reason=reason)
+    review = _ambiguous("retry_budget_exhausted_manual_review", action, reason=reason)
     state = action.state
     steps: Plan = ()
     if state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
@@ -326,7 +338,7 @@ async def apply_plan(
     return current
 
 
-VerifiedContext = Callable[[OutboundActionRecord], Awaitable[tuple[ActionContext | None, str]]]
+VerifiedContext = Callable[[OutboundActionRecord], Awaitable[tuple[ActionContext | None, str, str | None]]]
 FinishObservation = Callable[[OutboundActionRecord, ActionContext, ProviderAdapter, ProviderObservation], Awaitable[PublicResult]]
 Schedule = Callable[[OutboundActionRecord, str], Awaitable[OutboundActionRecord]]
 AdapterFor = Callable[[Operation], ProviderAdapter]
@@ -369,24 +381,34 @@ class ActionRecovery:
         exhaust() went straight to dead_letter/manual_review with no final
         check, even though CDS never saw the post either way)."""
         action = await require_action(self._store, action_id)
+        reload_reason: str | None = None
         if plan_recover_acceptance(action) is None and action.state in AMBIGUOUS_OUTCOME_STATES:
-            settled = await self._final_provider_check(action)
+            settled, reload_reason = await self._final_provider_check(action)
             if settled is not None:
                 return settled
             action = await require_action(self._store, action_id)
-        return action_result(await self._apply(action, plan_exhaust(action)))
+        return action_result(
+            await self._apply(action, plan_exhaust(action, reason=reload_reason)),
+            detail=reload_reason,
+        )
 
-    async def _final_provider_check(self, action: OutboundActionRecord) -> PublicResult | None:
+    async def _final_provider_check(self, action: OutboundActionRecord) -> tuple[PublicResult | None, str | None]:
         """One more adapter.reconcile() before exhaust() gives up. Proven
         delivered completes the action; proven not delivered fails it
         definitively -- regardless of what the observation itself marks
         retryable, since the retry budget is already spent and another
         RETRY_READY lap would just land back here next cycle. Still
-        ambiguous (or the context/action_uid is unavailable): None, so
-        exhaust() falls through to today's dead_letter/manual_review."""
-        context, _detail = await self._verified_context(action)
-        if context is None or action.action_uid is None:
-            return None
+        ambiguous: (None, None), so exhaust() falls through to today's
+        dead_letter/manual_review. The context/action_uid unavailable: (None,
+        reason) when it was a reload failure (action_uid missing carries no
+        reason -- that is a structural gap, not a transient one) so the
+        manual_review that follows carries the real cause instead of a bare
+        "retry_budget_exhausted"."""
+        context, _detail, reason = await self._verified_context(action)
+        if context is None:
+            return None, reason
+        if action.action_uid is None:
+            return None, None
         adapter = self._adapter_for(context.operation)
         claimed = await self._apply(action, plan_claim_for_final_check(action))
         observation = await adapter.reconcile(
@@ -400,7 +422,7 @@ class ActionRecovery:
             ),
         )
         if observation.disposition is ProviderDisposition.ACCEPTED:
-            return await self._finish_observation(claimed, context, adapter, observation)
+            return await self._finish_observation(claimed, context, adapter, observation), None
         if observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE:
             non_acceptance = ProviderObservation(
                 ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
@@ -418,11 +440,11 @@ class ActionRecovery:
                     claimed.action_id, ActionState.RECONCILING, ActionState.RETRY_READY, self._actor, non_acceptance
                 )
             failed = await self._store.definitive_fail(failable.action_id, failable.state, self._actor, non_acceptance)
-            return action_result(failed)
-        return None
+            return action_result(failed), None
+        return None, None
 
-    async def manual_review(self, action: OutboundActionRecord, detail_code: str) -> PublicResult:
-        return action_result(await self._apply(action, plan_manual_review(action, detail_code)))
+    async def manual_review(self, action: OutboundActionRecord, detail_code: str, *, reason: str | None = None) -> PublicResult:
+        return action_result(await self._apply(action, plan_manual_review(action, detail_code, reason=reason)), detail=reason)
 
     async def recover_persisted_acceptance(self, action: OutboundActionRecord) -> PublicResult | None:
         plan = plan_recover_acceptance(action)
@@ -444,9 +466,9 @@ class ActionRecovery:
         answered = await self._provider_outcome(action)
         if answered is not None:
             return answered
-        context, context_detail = await self._verified_context(action)
+        context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return await self.manual_review(action, context_detail)
+            return await self._reload_retry(action, context_detail, reason)
         adapter = self._adapter_for(context.operation)
         reconciling = await self._apply(action, plan_start_reconciliation(action))
         if reconciling.action_uid is None:
@@ -463,6 +485,24 @@ class ActionRecovery:
         )
         return await self._finish_observation(reconciling, context, adapter, observation)
 
+    async def _reload_retry(self, action: OutboundActionRecord, detail_code: str, reason: str | None) -> PublicResult:
+        """A context reload failure never parks an in-flight/unknown-outcome
+        action straight to manual_review (wake 27321: a provider_queue_timeout
+        action went to manual_review/persisted_context_unavailable on one
+        failed reload, then the exact same reload succeeded minutes later on
+        a manual re-run -- the failure was transient and the send's real
+        outcome was still unconfirmed). Spend one attempt on the SAME
+        retry/backoff machinery (schedule_next_attempt via _schedule) every
+        other ambiguous outcome already uses, and let this cycle's
+        _provider_outcome() poll run again first next time -- never
+        re-dispatch. Once the caller's own retry budget is spent, list_work
+        stops handing this action to reconcile() and the worker calls
+        exhaust() instead, whose own final provider check + plan_exhaust
+        parks it in manual_review carrying this same reason."""
+        claimed = await self._apply(action, (Claim(action.state),))
+        scheduled = await self._schedule(claimed, detail_code)
+        return action_result(scheduled, detail=reason)
+
     async def _provider_outcome(self, action: OutboundActionRecord) -> PublicResult | None:
         """Ask the provider about a send it already has before anything else.
         "Did job X finish?" needs only the job id; this send has already been
@@ -471,7 +511,7 @@ class ActionRecovery:
         record cannot be executed: the ordinary reconcile path decides."""
         if not asks_provider_first(action):
             return None
-        context, _detail = await self._verified_context(action)
+        context, _detail, _reason = await self._verified_context(action)
         if context is None:
             return None
         adapter = self._adapter_for(context.operation)
@@ -484,12 +524,30 @@ class ActionRecovery:
             ),
         )
         if observation.disposition is ProviderDisposition.PENDING:
-            # The job is still running: look again later, as the ordinary
-            # path does for a pending poll. Claiming spends one attempt, so a
-            # job that never finishes still reaches the retry budget.
-            claimed = await self._apply(action, (Claim(action.state),))
-            return action_result(await self._schedule(claimed, observation.detail_code))
+            return await self._pending_wait(action, observation)
         if observation.disposition not in {ProviderDisposition.ACCEPTED, ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE}:
             return None
         reconciling = await self._apply(action, plan_start_reconciliation(action))
         return await self._finish_observation(reconciling, context, adapter, observation)
+
+    async def _pending_wait(self, action: OutboundActionRecord, observation: ProviderObservation) -> PublicResult:
+        """The job is still running, not failed: look again later without
+        spending an attempt (no Claim), on the pending-wait ladder, up to its
+        several-hour ceiling -- PENDING must never burn toward the ordinary
+        5-attempt exhaustion budget the way a real ambiguous/failed outcome
+        does (wake 27321: the provider's own write landed well inside a
+        second of dispatch; a slow-but-alive job is not the same failure
+        class a stuck one is). Past the ceiling this rejoins the ordinary
+        claim()-then-schedule path, so a job that truly never finishes still
+        reaches a person eventually."""
+        elapsed = (self._clock() - action.created_at).total_seconds() if action.created_at is not None else 0.0
+        if elapsed < PROVIDER_PENDING_WAIT_CEILING_SECONDS:
+            scheduled = await self._store.schedule_next_attempt(
+                action.action_id,
+                action.state,
+                provider_pending_wait_seconds(elapsed),
+                observation.detail_code,
+            )
+            return action_result(scheduled)
+        claimed = await self._apply(action, (Claim(action.state),))
+        return action_result(await self._schedule(claimed, observation.detail_code))

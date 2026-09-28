@@ -55,6 +55,19 @@ from .traffic_control import check_traffic
 
 logger = logging.getLogger("postgres_mcp.outbound_gateway.service")
 
+_RELOAD_REASON_MAX_CHARS = 300
+
+
+def _bounded_reload_reason(error: Exception) -> str:
+    """Mirrors service.py's own helper -- see its docstring. Kept local
+    (not imported from ..service) so this frozen module stays self-contained;
+    the VerifiedContext interface ActionRecovery (../recovery.py) calls
+    through requires both sides to return the same 3-tuple shape, so this
+    much of _verified_context is an interface requirement, not a judgment
+    change."""
+    text = " ".join(str(error).split())
+    return text[:_RELOAD_REASON_MAX_CHARS] if text else type(error).__name__
+
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
     {
@@ -292,9 +305,9 @@ class OutboundActionService:
             return action_result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
             return action_result(successor)
-        context, context_detail = await self._verified_context(successor)
+        context, context_detail, reason = await self._verified_context(successor)
         if context is None:
-            return action_result(successor, detail=context_detail)
+            return action_result(successor, detail=reason or context_detail)
         return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
 
     async def prepare(self, action_id: UUID) -> PublicResult:
@@ -302,9 +315,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if action.state is not ActionState.RECEIVED or not self._is_due(action):
             return action_result(action)
-        context, context_detail = await self._verified_context(action)
+        context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return action_result(action, detail=context_detail)
+            return action_result(action, detail=reason or context_detail)
         return await self._drive(action, context, dispatch=False)
 
     async def _preflight_without_dispatch(
@@ -581,9 +594,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return action_result(action)
-        context, context_detail = await self._verified_context(action)
+        context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return await self._recovery.manual_review(action, context_detail)
+            return await self._recovery.manual_review(action, context_detail, reason=reason)
         # Worker-driven resume (worker.py's list_work -> resume for
         # dependency_wait/prepared/retry_ready) has no ExecuteRequest and
         # therefore no caller-supplied override -- a long-waited action
@@ -851,7 +864,7 @@ class OutboundActionService:
     async def _verified_context(
         self,
         action: OutboundActionRecord,
-    ) -> tuple[ActionContext | None, str]:
+    ) -> tuple[ActionContext | None, str, str | None]:
         """The context the worker executes an existing action with: the saved
         record of what was asked and derived at execute time (Comm-Data-Store
         migration 206 makes it immutable), never a fresh derivation compared
@@ -859,15 +872,26 @@ class OutboundActionService:
         re-threaded -- and comparing against it parked real sends (wake
         27244). The wake is re-read only for facts the record does not carry
         (the message's source and send time, the property label, aliases),
-        none of which decides who receives what."""
+        none of which decides who receives what.
+
+        A failed reload never discards its own reason (wake 27321): the
+        third element is that reload's own bounded message, logged here and
+        handed back to the caller. None on any success."""
         try:
             live = await self._context_loader.load(action.execute_request())
-        except ContextDerivationError:
-            return None, "persisted_context_unavailable"
+        except ContextDerivationError as error:
+            reason = _bounded_reload_reason(error)
+            logger.warning(
+                "context reload failed for action %s (wake %s): %s",
+                action.action_id,
+                action.wakeup_event_id,
+                reason,
+            )
+            return None, "persisted_context_unavailable", reason
         live = self._context_for(action, live)
         if not action.payload_hash:
-            return live, "context_verified"
-        return _recorded_context(action, live), "context_recorded"
+            return live, "context_verified", None
+        return _recorded_context(action, live), "context_recorded", None
 
     @staticmethod
     def _matches_durable_subject_alias_promotion(
