@@ -76,6 +76,34 @@ def backoff_seconds(attempt_count: int) -> int:
     return min(RETRY_STEP_CAP_SECONDS, RETRY_BASE_SECONDS * int(math.pow(2, exponent)))
 
 
+def elapsed_step_backoff_seconds(elapsed_seconds: float) -> int:
+    """The same 5s-doubling-to-300s-cap shape as ``backoff_seconds()``, but
+    derived purely from wall-clock time elapsed since the action's own
+    ``created_at`` instead of a persisted ``attempt_count`` column.
+
+    ``attempt_count`` is bumped by the SQL ``claim_outbound_action`` function
+    (Comm-Data-Store, out of this repo) when a dispatch attempt takes the
+    lease -- but a Restate-routed reschedule to RETRY_READY on a retryable
+    DEFINITIVE_NON_ACCEPTANCE (adapters/tenantcloud.py's "not yet applied"
+    outcome, SAFE_TO_REINVOKE) or an ordinary AMBIGUOUS reschedule to UNKNOWN
+    does not itself take a fresh claim between schedule() calls the way the
+    legacy worker's loop does, so keying backoff on attempt_count here risks
+    a flat, never-growing wait (2026-09-28: an all-day live test surfaced
+    360 TenantCloud status-update reinvokes in one hour -- one roughly every
+    10s, the un-doubled base -- instead of the ~15-20 a real 5s-to-300s
+    doubling schedule reaches by the one-hour ceiling). This function never
+    depends on that counter at all, so it cannot go flat regardless of what
+    attempt_count does elsewhere: it is a pure function of time already
+    spent waiting.
+    """
+    remaining = max(0.0, elapsed_seconds)
+    step = RETRY_BASE_SECONDS
+    while remaining >= step:
+        remaining -= step
+        step = min(RETRY_STEP_CAP_SECONDS, step * 2)
+    return step
+
+
 def ceiling_exceeded(elapsed_seconds: float, *, ceiling_seconds: int = RETRY_CEILING_SECONDS) -> bool:
     return elapsed_seconds >= ceiling_seconds
 

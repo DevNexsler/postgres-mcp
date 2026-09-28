@@ -1244,8 +1244,14 @@ async def test_tenantcloud_lead_status_ambiguous_forever_reinvokes_safely_then_r
     assert (clock.now - CREATED_AT).total_seconds() >= RETRY_CEILING_SECONDS
     assert len(staff_warning.calls) == 1
     # SAFE_TO_REINVOKE really did reinvoke -- every one preceded by the
-    # facade's own precheck, never a blind resend.
-    assert [call[0] for call in facade.calls].count("mark_lead_working") > 1
+    # facade's own precheck, never a blind resend -- but bounded to what
+    # retry_policy's 5s-to-300s-capped backoff reaches in one hour (~15-20
+    # reschedules total, so well under half that many real writes), never
+    # the un-doubled ~360 a flat attempt_count-keyed backoff produced before
+    # service.py's _schedule() was fixed to use elapsed_step_backoff_seconds
+    # for a Restate-flagged operation.
+    reinvokes = [call[0] for call in facade.calls].count("mark_lead_working")
+    assert 1 < reinvokes < 30, reinvokes
 
 
 @pytest.mark.asyncio
@@ -1373,4 +1379,8 @@ async def test_tenantcloud_maintenance_status_ambiguous_forever_reinvokes_safely
     assert store.current.state is ActionState.DEFINITIVE_FAILED
     assert (clock.now - CREATED_AT).total_seconds() >= RETRY_CEILING_SECONDS
     assert len(staff_warning.calls) == 1
-    assert [call[0] for call in facade.calls].count("update_maintenance_status") > 1
+    # Same bound as lead.status.update's sibling assertion: real backoff
+    # growth, not the flat ~360-reinvoke cadence a counter-keyed schedule
+    # produced before the fix.
+    reinvokes = [call[0] for call in facade.calls].count("update_maintenance_status")
+    assert 1 < reinvokes < 30, reinvokes

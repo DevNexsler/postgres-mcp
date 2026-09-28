@@ -45,6 +45,7 @@ from .record import action_result
 from .record import is_due
 from .record import require_action
 from .recovery import ActionRecovery
+from .retry_policy import elapsed_step_backoff_seconds
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
 from .stale_context import execute_answer
@@ -231,6 +232,12 @@ class OutboundActionService:
         self._circuit_guard = circuit_guard or ClosedCircuitGuard()
         self._retry_base_seconds = max(1, retry_base_seconds)
         self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
+        # Every operation OutboundDeliveryCoordinator advances -- see
+        # ActionRecovery's own restate_operations docstring below. _schedule()
+        # reads this too: a Restate-routed reschedule must never key its
+        # backoff on attempt_count (retry_policy.elapsed_step_backoff_seconds'
+        # docstring).
+        self._restate_operations = restate_operations
         self._traffic_mode = traffic_mode
         # One probe: the in-flight lease (traffic_control.InFlightProbe) and
         # the newer-context query (stale_context.NewerContextProbe).
@@ -764,14 +771,28 @@ class OutboundActionService:
         action: OutboundActionRecord,
         detail_code: str,
     ) -> OutboundActionRecord:
-        return await self._store.schedule_next_attempt(
-            action.action_id,
-            action.state,
-            bounded_backoff_seconds(
+        if action.operation in self._restate_operations:
+            # attempt_count is the legacy worker's own counter (bumped by
+            # claim_outbound_action, Comm-Data-Store) -- a Restate-routed
+            # reschedule does not reliably take a fresh claim between every
+            # schedule() call, so keying backoff on it here risks a flat,
+            # never-growing wait. See elapsed_step_backoff_seconds' docstring
+            # for the live symptom this fixed: 360 TenantCloud status-update
+            # reinvokes in one hour (one every ~10s, never doubling) instead
+            # of the ~15-20 a real 5s-to-300s-capped schedule reaches by the
+            # one-hour retry ceiling.
+            elapsed = max(0.0, (self._clock() - action.created_at).total_seconds()) if action.created_at is not None else 0.0
+            wait_seconds = elapsed_step_backoff_seconds(elapsed)
+        else:
+            wait_seconds = bounded_backoff_seconds(
                 action.attempt_count,
                 base_seconds=self._retry_base_seconds,
                 max_seconds=self._retry_max_seconds,
-            ),
+            )
+        return await self._store.schedule_next_attempt(
+            action.action_id,
+            action.state,
+            wait_seconds,
             detail_code,
         )
 
