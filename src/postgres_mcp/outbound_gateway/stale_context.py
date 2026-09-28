@@ -51,6 +51,7 @@ from .identity import same_request
 from .models import REVISABLE_ARGUMENT_KEYS
 from .models import STALE_CONTEXT_DETAIL
 from .models import STALE_CONTEXT_DETAILS
+from .models import ActionRole
 from .models import ActionState
 from .models import ConfirmRequest
 from .models import ContextItem
@@ -358,6 +359,19 @@ class StaleContextQuestions:
         (or, where nobody can be asked, the `stale_context_unasked` no-send),
         or None: send. confirm=True (override=true) records the question and
         answers yes at once."""
+        if action.action_role is ActionRole.INTERNAL_NOTIFICATION:
+            # The question is "since your context was built, a new message
+            # was sent to or received from this recipient -- still send?" An
+            # internal_notification has no such recipient: it posts to a
+            # staff review channel about something that happened, not a
+            # reply in a conversation that can go stale. newer_context's
+            # "received" match is channel-scoped, not role-scoped, so a busy
+            # wake's own channel (e.g. a Quo line still getting texts) used
+            # to trip this for a manual_review_alert with nothing to do with
+            # its content (wakes 27313/27314, 2026-09-28: the bug report
+            # itself was blocked as stale_context, delaying it behind a
+            # confirm round trip it never needed). Always send.
+            return None
         if self._mode == "off" or self._probe is None:
             return None
         askable = agent_facing and self.enabled and action.state in STALE_BLOCKABLE_STATES

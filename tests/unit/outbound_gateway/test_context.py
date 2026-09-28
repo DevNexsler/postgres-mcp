@@ -1096,14 +1096,17 @@ async def test_maintenance_line_reply_uses_receiving_quo_account():
 
 
 @pytest.mark.asyncio
-async def test_quo_route_allows_inquiry_reply_but_not_propertyless_showing_offer():
+async def test_quo_route_allows_inquiry_reply_and_a_propertyless_showing_offer():
     """This used to be
     test_quo_phase_route_allows_inquiry_reply_but_not_propertyless_showing_offer,
     which relied on RoutingPolicy.enabled_intents_by_provider to reject a
-    showing_offer on the quo provider. That gate is removed by this task;
-    a propertyless showing_offer still fails closed, but now for the
-    real reason -- no property could be derived from this wake at all --
-    not because of a per-provider intent allowlist."""
+    showing_offer on the quo provider. That gate is removed by this task.
+    A propertyless showing_offer used to fail closed next, for a different
+    reason -- no property could be derived from this wake at all -- but that
+    refusal pointed the agent at inquiry_reply, which forbids
+    appointment_slot: a dead end for exactly the kind of wake (Quo, plain
+    SMS) that never carries a property (wakes 27313/27314, 2026-09-28). It
+    now falls back to a deterministic, target-derived property_id instead."""
     event = record(
         event_source="quo",
         message_source="quo",
@@ -1133,10 +1136,13 @@ async def test_quo_route_allows_inquiry_reply_but_not_propertyless_showing_offer
         )
     )
     assert inquiry.intent_kind == "inquiry_reply"
-    with pytest.raises(ContextDerivationError, match="verified property could not be derived"):
-        await ActionContextLoader(FakeRepository(event), policy()).load(
-            request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})
-        )
+
+    showing_offer = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})
+    )
+    assert showing_offer.intent_kind == "showing_offer"
+    assert showing_offer.property_id == "target:quo_conversation:+19085550199"
+    assert showing_offer.canonical_context["property_source"] == "unresolved"
 
 
 @pytest.mark.asyncio
@@ -1923,6 +1929,149 @@ async def test_calendar_update_and_delete_still_fail_closed_when_neither_agent_n
                 arguments={"calendar_id": "nigel"},
             )
         )
+
+
+# --- a propertyless calendar mutation falls back instead of refusing -------
+
+
+def _propertyless_quo_wake(**overrides):
+    """A tenant maintenance wake on the Quo general line, exactly like
+    wakes 27313/27314 (2026-09-28): no property anywhere -- no message
+    property, no proxy_email, no subject to mine one from."""
+    values = dict(
+        event_source="quo",
+        message_source="quo",
+        channel_type="phone_number",
+        participant_type="phone_number",
+        participant_key="+19085550199",
+        subject=None,
+        raw_payload={
+            "data": {
+                "object": {
+                    "conversationId": "quo-conversation-live",
+                    "phoneNumberId": "leasing-main",
+                    "direction": "incoming",
+                    "from": "+19085550199",
+                }
+            }
+        },
+        envelope={"identity": {}, "message": {}},
+    )
+    values.update(overrides)
+    return record(**values)
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_on_a_propertyless_quo_wake_falls_back_instead_of_refusing():
+    """Wakes 27313/27314, 2026-09-28: a tenant maintenance wake from the Quo
+    general line needed calendar.update and the gateway refused -- "verified
+    property could not be derived" -- and its own refusal text pointed the
+    agent at intent_kind inquiry_reply, which forbids appointment_slot: a
+    dead end. ExecuteRequest has no field for the agent to name a property at
+    all, so a Quo (or plain-SMS) wake could never create/update/delete a
+    calendar event. It now falls back to a deterministic key instead of
+    refusing, and the fallback is recorded (property_source)."""
+    event = _propertyless_quo_wake()
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation="calendar.create",
+            intent_kind="showing_create",
+            appointment_slot="2026-09-29T14:00:00-04:00",
+            arguments={"calendar_id": "nigel"},
+        )
+    )
+    assert context.property_id == "calendar:nigel:wake:12345"
+    assert context.canonical_context["property_source"] == "unresolved"
+    assert context.canonical_scope["property_id"] == context.property_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "intent", "slot"),
+    [
+        ("calendar.update", "showing_update", "2026-09-29T14:00:00-04:00"),
+        ("calendar.delete", "showing_delete", None),
+    ],
+)
+async def test_calendar_update_and_delete_on_a_propertyless_quo_wake_fall_back_instead_of_refusing(operation, intent, slot):
+    event = _propertyless_quo_wake()
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation=operation,
+            intent_kind=intent,
+            appointment_slot=slot,
+            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+        )
+    )
+    assert context.property_id == f"calendar:nigel:event:{_EXAMPLE_EVENT_UID}"
+    assert context.canonical_context["property_source"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_propertyless_calendar_mutation_fallback_is_idempotent_across_a_retry():
+    """The same request loaded twice (a retry) must derive the identical
+    property_id/canonical_context, or create_or_load_outbound_action's
+    immutable-context guard (Comm-Data-Store migration 206) would treat the
+    retry as a conflicting action rather than the same one."""
+    event = _propertyless_quo_wake()
+    loader = ActionContextLoader(FakeRepository(event), policy())
+    req = request(
+        action_role="calendar_mutation",
+        operation="calendar.update",
+        intent_kind="showing_update",
+        appointment_slot="2026-09-29T14:00:00-04:00",
+        arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+    )
+    first = await loader.load(req)
+    second = await loader.load(req)
+    assert first.action_id == second.action_id
+    assert first.property_id == second.property_id
+    assert dict(first.canonical_context) == dict(second.canonical_context)
+    assert first.payload_hash == second.payload_hash
+
+
+@pytest.mark.asyncio
+async def test_propertyless_calendar_fallback_never_collides_across_different_wakes():
+    """The fallback is wake/target-scoped, not a shared literal -- two
+    different propertyless wakes mutating the same calendar must not
+    collapse onto the same property_id."""
+    first_wake = _propertyless_quo_wake(wakeup_event_id=12345)
+    second_wake = _propertyless_quo_wake(wakeup_event_id=67890)
+
+    def create_request(wakeup_event_id):
+        return request(
+            wakeup_event_id=wakeup_event_id,
+            action_role="calendar_mutation",
+            operation="calendar.create",
+            intent_kind="showing_create",
+            appointment_slot="2026-09-29T14:00:00-04:00",
+            arguments={"calendar_id": "nigel"},
+        )
+
+    first = await ActionContextLoader(FakeRepository(first_wake), policy()).load(create_request(12345))
+    second = await ActionContextLoader(FakeRepository(second_wake), policy()).load(create_request(67890))
+    assert first.property_id != second.property_id
+
+
+@pytest.mark.asyncio
+async def test_calendar_mutation_with_a_known_property_keeps_the_prior_canonical_context_shape():
+    """Parity: a wake WITH a resolvable property must not gain the new
+    property_source key -- canonical_context (and so payload_hash) for a
+    wake that already worked is byte-identical to before this fallback."""
+    event = record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"})
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(
+        request(
+            action_role="calendar_mutation",
+            operation="calendar.update",
+            intent_kind="showing_update",
+            appointment_slot="2026-07-17T14:30:00Z",
+            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+        )
+    )
+    assert context.property_id == "building:bullman-st"
+    assert "property_source" not in context.canonical_context
 
 
 @pytest.mark.asyncio

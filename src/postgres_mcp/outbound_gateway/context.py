@@ -313,22 +313,6 @@ class ActionContextLoader:
             # exactly what a customer send is keyed on anyway.
             prospect_id = f"prospect:{target.target_id}"
 
-        requires_property = request.intent_kind not in {
-            IntentKind.INQUIRY_REPLY,
-            IntentKind.INTERNAL_REPLY,
-            IntentKind.LEAD_ALERT,
-            IntentKind.MANUAL_REVIEW_ALERT,
-            IntentKind.TENANTCLOUD_LEAD_STATUS,
-            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
-            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
-        }
-        if requires_property and property_id is None:
-            raise ContextDerivationError(
-                f"verified property could not be derived. Nothing was sent: intent_kind {request.intent_kind} "
-                "needs a property this wake does not name. A plain reply can use intent_kind inquiry_reply; "
-                "otherwise record needs_human."
-            )
-
         if record.provenance == "internal_test":
             # A qualification send reaches only its dedicated test target;
             # extra recipients would slip past that check.
@@ -383,6 +367,38 @@ class ActionContextLoader:
                     "canonical calendar event revision is required. Nothing was sent: pass the event's "
                     "event_url and etag in arguments, from calendar_events_get."
                 )
+
+        requires_property = request.intent_kind not in {
+            IntentKind.INQUIRY_REPLY,
+            IntentKind.INTERNAL_REPLY,
+            IntentKind.LEAD_ALERT,
+            IntentKind.MANUAL_REVIEW_ALERT,
+            IntentKind.TENANTCLOUD_LEAD_STATUS,
+            IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
+            IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
+        }
+        property_source: str | None = None
+        if requires_property and property_id is None:
+            # No stable property anywhere on the wake, and no routing-policy
+            # alias covers it either. This used to hard-fail every
+            # propertyless showing action -- a Quo or plain-SMS wake could
+            # never do a calendar create/update/delete, and the refusal
+            # pointed the agent at intent_kind inquiry_reply, which forbids
+            # appointment_slot: a dead end (wakes 27313/27314, 2026-09-28).
+            # Fall back to a deterministic key built from the agent's own
+            # verified target -- the same idea as the prospect_id fallback
+            # above. It is wake/target-scoped so it never collides across
+            # unrelated wakes, and it is stable across a retry of the same
+            # request, so idempotency (create_or_load_outbound_action) still
+            # holds. The provenance is recorded (property_source) so an
+            # unresolved property stays visible in the ledger.
+            if request.operation is Operation.CALENDAR_CREATE:
+                property_id = f"calendar:{target.target_id}:wake:{request.wakeup_event_id}"
+            elif request.operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE}:
+                property_id = f"calendar:{target.target_id}:event:{calendar_event_uid}"
+            else:
+                property_id = f"target:{target.kind}:{target.target_id}"
+            property_source = "unresolved"
 
         source_subject = _nonblank(record.subject)
         prospect_name = _nonblank(message.get("prospect_name")) or _nonblank(record.display_name)
@@ -455,6 +471,11 @@ class ActionContextLoader:
             "cross_channel_duplicate_message_ids": list(cross_channel_duplicate_message_ids),
             "certified_older_message_ids": list(certified_older_message_ids),
         }
+        if property_source is not None:
+            # Only present when property_id is a fallback, not a verified
+            # label/alias -- so a wake WITH a resolvable property keeps
+            # exactly the canonical_context this loader produced before.
+            canonical_context_data["property_source"] = property_source
         if request.operation in _TENANTCLOUD_OPERATIONS:
             canonical_context_data.update(
                 tenantcloud_claim_id=record.tenantcloud_claim_id or "",
