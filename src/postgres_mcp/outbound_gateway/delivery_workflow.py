@@ -40,6 +40,7 @@ from uuid import UUID
 from .models import ActionState
 from .models import Operation
 from .models import PublicStatus
+from .idempotency_policy import reinvoke_safety
 from .retry_policy import CONTEXT_RELOAD_WAIT_DETAILS
 from .retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
 from .retry_policy import RETRY_CEILING_SECONDS
@@ -181,6 +182,14 @@ class OutboundDeliveryCoordinator:
         self._service = service
         self._auth = auth
         self._operations = operations if operations is not None else TENANTCLOUD_OPERATIONS
+        # Fail at construction, not at the first ambiguous outcome: every
+        # operation this coordinator will ever advance must already have a
+        # reinvoke-safety classification (idempotency_policy.py). A new
+        # operation added to OUTBOUND_RESTATE_OPERATIONS without one is
+        # exactly the silent "assume it's safe" mistake that module exists
+        # to prevent.
+        for operation in self._operations:
+            reinvoke_safety(operation)
         self._context_wait_ceiling_seconds = max(1, context_wait_ceiling_seconds)
         # Default is inert (NoopStaffWarningPort just logs): a caller that
         # wants the real Cliq notification passes
