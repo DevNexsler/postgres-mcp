@@ -40,7 +40,6 @@ from .models import ExecuteRequest
 from .models import IntentKind
 from .models import Operation
 from .models import parse_outbound_request
-from .retry_policy import StaffWarningPort
 
 logger = logging.getLogger(__name__)
 

@@ -37,10 +37,10 @@ from urllib.request import Request
 from urllib.request import build_opener
 from uuid import UUID
 
+from .idempotency_policy import reinvoke_safety
 from .models import ActionState
 from .models import Operation
 from .models import PublicStatus
-from .idempotency_policy import reinvoke_safety
 from .retry_policy import CONTEXT_RELOAD_WAIT_DETAILS
 from .retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
 from .retry_policy import RETRY_CEILING_SECONDS
