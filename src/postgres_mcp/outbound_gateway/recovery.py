@@ -57,6 +57,13 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # A send that may already be with the provider: reconcile, never re-dispatch.
 IN_FLIGHT_STATES = frozenset({ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED, ActionState.RECONCILING})
 
+# exhaust() states whose outcome nobody has confirmed: a provider call may
+# have happened (or, for UNKNOWN, definitely did) and nothing since has
+# proven accepted or not-accepted. dependency_wait/prepared/retry_ready were
+# never dispatched -- plan_exhaust already closes those without asking
+# anyone anything.
+AMBIGUOUS_OUTCOME_STATES = IN_FLIGHT_STATES | {ActionState.UNKNOWN}
+
 
 # --------------------------------------------------------------------------
 # Plan vocabulary
@@ -211,6 +218,32 @@ def plan_start_reconciliation(action: OutboundActionRecord) -> Plan:
     )
 
 
+def plan_claim_for_final_check(action: OutboundActionRecord) -> Plan:
+    """Take the lease so exhaust()'s last look at the provider can transition
+    the row afterward. Every AMBIGUOUS_OUTCOME_STATES member lands in
+    RECONCILING -- the one expected_state _finish_observation already knows
+    how to take an accepted or non-accepted answer from for every operation
+    (it is exactly where the ordinary reconcile() flow calls
+    adapter.reconcile() from). dispatching/provider_accepted cannot jump
+    straight to reconciling (ALLOWED_TRANSITIONS only lets unknown do that),
+    so this takes the same two-claim ladder plan_exhaust itself takes."""
+    state = action.state
+    steps: Plan = ()
+    if state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
+        steps = (
+            Claim(state),
+            Transition(state, ActionState.UNKNOWN, _ambiguous("retry_budget_exhausted_final_check", action)),
+        )
+        state = ActionState.UNKNOWN
+    if state is ActionState.UNKNOWN:
+        return (
+            *steps,
+            Claim(ActionState.UNKNOWN),
+            Transition(ActionState.UNKNOWN, ActionState.RECONCILING, _ambiguous("retry_budget_exhausted_final_check", action)),
+        )
+    return (*steps, Claim(state))  # already reconciling
+
+
 def plan_exhaust(action: OutboundActionRecord) -> Plan:
     """Close work whose retry budget is spent, without another provider
     invocation: a durable acceptance completes; anything that may already
@@ -329,9 +362,64 @@ class ActionRecovery:
         return await apply_plan(self._store, action, plan, actor=self._actor, lease_seconds=self._lease_seconds)
 
     async def exhaust(self, action_id: UUID) -> PublicResult:
-        """Close exhausted work without another provider invocation."""
+        """Close exhausted work -- but not blindly: an action whose outcome
+        is still unknown or ambiguous (a send may already be with the
+        provider) gets one last provider look first (wakes 27296/27297/27314
+        -- Cliq's poll() came back inconclusive four times running and
+        exhaust() went straight to dead_letter/manual_review with no final
+        check, even though CDS never saw the post either way)."""
         action = await require_action(self._store, action_id)
+        if plan_recover_acceptance(action) is None and action.state in AMBIGUOUS_OUTCOME_STATES:
+            settled = await self._final_provider_check(action)
+            if settled is not None:
+                return settled
+            action = await require_action(self._store, action_id)
         return action_result(await self._apply(action, plan_exhaust(action)))
+
+    async def _final_provider_check(self, action: OutboundActionRecord) -> PublicResult | None:
+        """One more adapter.reconcile() before exhaust() gives up. Proven
+        delivered completes the action; proven not delivered fails it
+        definitively -- regardless of what the observation itself marks
+        retryable, since the retry budget is already spent and another
+        RETRY_READY lap would just land back here next cycle. Still
+        ambiguous (or the context/action_uid is unavailable): None, so
+        exhaust() falls through to today's dead_letter/manual_review."""
+        context, _detail = await self._verified_context(action)
+        if context is None or action.action_uid is None:
+            return None
+        adapter = self._adapter_for(context.operation)
+        claimed = await self._apply(action, plan_claim_for_final_check(action))
+        observation = await adapter.reconcile(
+            self._provider_client,
+            context,
+            claimed.action_uid,
+            ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                "retry_budget_exhausted_final_check",
+                provider_request_ref=claimed.provider_request_ref,
+            ),
+        )
+        if observation.disposition is ProviderDisposition.ACCEPTED:
+            return await self._finish_observation(claimed, context, adapter, observation)
+        if observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE:
+            non_acceptance = ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                observation.detail_code,
+                category=observation.category or "retry_budget_exhausted",
+                evidence=observation.evidence,
+            )
+            # reconciling has no direct edge to definitive_failed
+            # (outbound_action_transition_allowed) -- retry_ready does, the
+            # same edge plan_exhaust's own PREPARED/RETRY_READY branch fails
+            # from, and it costs no extra attempt (only Claim does).
+            failable = claimed
+            if claimed.state is ActionState.RECONCILING:
+                failable = await self._store.transition(
+                    claimed.action_id, ActionState.RECONCILING, ActionState.RETRY_READY, self._actor, non_acceptance
+                )
+            failed = await self._store.definitive_fail(failable.action_id, failable.state, self._actor, non_acceptance)
+            return action_result(failed)
+        return None
 
     async def manual_review(self, action: OutboundActionRecord, detail_code: str) -> PublicResult:
         return action_result(await self._apply(action, plan_manual_review(action, detail_code)))

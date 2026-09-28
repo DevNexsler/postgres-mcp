@@ -1110,6 +1110,119 @@ async def test_open_provider_circuit_defers_without_provider_call():
 
 
 @pytest.mark.asyncio
+async def test_tenantcloud_auth_wait_reschedules_without_spending_the_retry_budget():
+    """FIX 3: a retryable TenantCloud rejection proven pre-dispatch
+    (tenantcloud_auth_rejected_before_dispatch / category=provider_authentication)
+    waits out the outage instead of burning the ordinary 5-attempt budget --
+    8 of 9 retry_budget_exhausted TenantCloud sends in 60 days were 6x this
+    exact rejection inside ~90-150s. Same shape as
+    test_open_provider_circuit_defers_without_provider_call: reschedule with
+    no claim() and no provider call."""
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.RETRY_READY,
+            detail_code="tenantcloud_auth_rejected_before_dispatch",
+            error_category="provider_authentication",
+            attempt_count=1,
+            next_attempt_at=NOW,
+            created_at=NOW,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await tenantcloud_service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.RETRY_READY
+    assert not any(call[0] == "claim" for call in store.calls)
+    assert adapter.calls == []
+    assert ("schedule", ActionState.RETRY_READY, 60, "tenantcloud_auth_wait") in store.calls
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_auth_wait_grows_then_falls_through_to_the_ordinary_path_at_the_ceiling():
+    """The backoff grows from 60s towards 5 minutes as the outage persists,
+    and once the 2h ceiling passes the row rejoins the ordinary
+    claim()/dispatch path -- today's ordinary ladder to exhaustion."""
+    waited = tenantcloud_row(
+        ActionState.RETRY_READY,
+        detail_code="tenantcloud_auth_rejected_before_dispatch",
+        error_category="provider_authentication",
+        attempt_count=1,
+        next_attempt_at=NOW,
+        created_at=NOW - timedelta(minutes=25),
+    )
+    store = FakeStore(waited)
+    result = await tenantcloud_service(store, FakeAdapter()).resume(ACTION_ID)
+    assert result.status is PublicStatus.PENDING
+    assert not any(call[0] == "claim" for call in store.calls)
+    assert ("schedule", ActionState.RETRY_READY, 180, "tenantcloud_auth_wait") in store.calls
+
+    past_ceiling = tenantcloud_row(
+        ActionState.RETRY_READY,
+        detail_code="tenantcloud_auth_rejected_before_dispatch",
+        error_category="provider_authentication",
+        attempt_count=1,
+        next_attempt_at=NOW,
+        created_at=NOW - timedelta(hours=2, seconds=1),
+    )
+    store = FakeStore(past_ceiling)
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "tenantcloud_auth_rejected_before_dispatch",
+            category="provider_authentication",
+            retryable=True,
+        )
+    )
+
+    result = await tenantcloud_service(store, adapter).resume(ACTION_ID)
+
+    assert result.status is PublicStatus.PENDING
+    assert store.current.state is ActionState.RETRY_READY
+    assert any(call[0] == "claim" for call in store.calls)
+    assert ("invoke",) in adapter.calls
+    assert store.current.detail_code == "tenantcloud_auth_rejected_before_dispatch"
+    assert not any(call[0] == "schedule" and call[3] == "tenantcloud_auth_wait" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_auth_wait_never_applies_to_a_row_about_to_dispatch_for_real():
+    """The wait only ever looks at a row already parked retry_ready by a
+    prior pre-dispatch rejection: a PREPARED row -- about to dispatch for the
+    first time -- always goes through the ordinary claim()/invoke(), even
+    carrying the same detail_code/error_category (a retried remediation
+    successor's stale fields, say). An action that already dispatched -- or
+    is about to -- never gets this treatment."""
+    store = FakeStore(
+        tenantcloud_row(
+            ActionState.PREPARED,
+            detail_code="tenantcloud_auth_rejected_before_dispatch",
+            error_category="provider_authentication",
+            attempt_count=0,
+            next_attempt_at=NOW,
+            created_at=NOW,
+        )
+    )
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "tenantcloud_lead_status_accepted",
+            provider_request_ref="tenantcloud-lead:6001:working",
+            message_id="tenantcloud-lead:6001:working",
+            accepted_at=NOW,
+            evidence={"kind": "provider_message_id"},
+        )
+    )
+
+    result = await tenantcloud_service(store, adapter).resume(ACTION_ID)
+
+    assert any(call[0] == "claim" for call in store.calls)
+    assert ("invoke",) in adapter.calls
+    assert result.status is PublicStatus.SENT
+
+
+@pytest.mark.asyncio
 async def test_repeated_execute_cannot_bypass_scheduled_retry_due_time():
     store = FakeStore(
         row(
@@ -1386,6 +1499,9 @@ async def test_an_unrelated_tenantcloud_rejection_keeps_the_ordinary_detail():
 
 @pytest.mark.asyncio
 async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch():
+    """exhaust()'s final look (test_exhaust_final_check_* below) still comes
+    back inconclusive here, so today's dead_letter/manual_review ladder is
+    unchanged -- just reached one adapter.reconcile() call later."""
     store = FakeStore(
         row(
             ActionState.UNKNOWN,
@@ -1394,15 +1510,107 @@ async def test_retry_budget_exhaustion_dead_letters_unknown_without_redispatch()
             attempt_count=5,
         )
     )
-    adapter = FakeAdapter()
+    adapter = FakeAdapter(
+        ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_timeout", provider_request_ref="req-1")
+    )
 
     result = await service(store, adapter).exhaust(ACTION_ID)
 
     assert result.status is PublicStatus.MANUAL_REVIEW
     assert store.current.state is ActionState.MANUAL_REVIEW
-    assert adapter.calls == []
+    assert adapter.calls == [("reconcile",)]
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
-    assert any(call[0] == "transition" and call[1] is ActionState.DEAD_LETTER and call[2] is ActionState.MANUAL_REVIEW for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_exhaust_final_check_completes_a_send_the_provider_actually_made():
+    """FIX 2: exhaust() used to go straight to dead_letter/manual_review for
+    an unknown-outcome action with no final provider look (wakes
+    27296/27297/27314 -- Cliq's poll() came back inconclusive four times
+    running while the post had, or had not, actually gone out)."""
+    store = FakeStore(
+        row(
+            ActionState.UNKNOWN,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-1",
+            attempt_count=5,
+        )
+    )
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "provider_accepted",
+            provider_request_ref="req-1",
+            message_id="mail-1",
+            accepted_at=NOW,
+            evidence={"kind": "provider_message_id"},
+        )
+    )
+
+    result = await service(store, adapter).exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert store.current.state is ActionState.COMPLETED
+    assert adapter.calls == [("reconcile",)]
+    assert not any(call[0] == "definitive_fail" for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_exhaust_final_check_fails_definitively_even_if_the_observation_says_retryable():
+    """The retry budget is already spent: a proven non-acceptance here is
+    final regardless of the adapter's own retryable flag -- looping back to
+    retry_ready would just land the row in list_exhausted again next
+    worker cycle."""
+    store = FakeStore(
+        row(
+            ActionState.UNKNOWN,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-1",
+            attempt_count=5,
+        )
+    )
+    adapter = FakeAdapter(
+        ProviderObservation(
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "provider_busy",
+            provider_request_ref="req-1",
+            category="transient_upstream_error",
+            retryable=True,
+        )
+    )
+
+    result = await service(store, adapter).exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.FAILED
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert store.current.detail_code == "provider_busy"
+    assert adapter.calls == [("reconcile",)]
+    assert not any(call[0] == "transition" and call[2] is ActionState.MANUAL_REVIEW for call in store.calls)
+
+
+@pytest.mark.asyncio
+async def test_exhaust_final_check_skipped_when_a_durable_acceptance_already_recovers():
+    """plan_recover_acceptance still takes priority: a row with a trusted
+    persisted receipt completes from the ledger alone, no provider call --
+    exactly test_provider_accepted_exhaustion_recovers_persisted_receipt's
+    shape, now proven to bypass the new final-check call too."""
+    store = FakeStore(
+        row(
+            ActionState.PROVIDER_ACCEPTED,
+            action_uid=ACTION_UID,
+            provider_request_ref="req-accepted",
+            provider_message_id="mail-accepted",
+            provider_accepted_at=NOW,
+            attempt_count=5,
+        )
+    )
+    adapter = FakeAdapter()
+
+    result = await service(store, adapter).exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.calls == []
+    assert [call[0] for call in store.calls] == ["claim", "complete"]
 
 
 @pytest.mark.asyncio

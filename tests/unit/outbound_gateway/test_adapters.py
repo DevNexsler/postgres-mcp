@@ -617,6 +617,77 @@ async def test_cliq_chat_timeout_without_request_id_does_not_send_again():
 
 
 @pytest.mark.asyncio
+async def test_cliq_reconcile_keeps_polls_own_detail_instead_of_a_generic_one():
+    """FIX 1: wakes 27296/27297/27314 -- reconcile() used to discard poll()'s
+    own detail_code (e.g. malformed_provider_success) and substitute the
+    generic cliq_reconciliation_inconclusive, so the ledger and logs never
+    showed what request_status actually said."""
+    adapter = CliqAdapter(Operation.CLIQ_CHAT_POST)
+    ctx = context(Operation.CLIQ_CHAT_POST, action_role=ActionRole.INTERNAL_REPLY, intent_kind=IntentKind.INTERNAL_REPLY)
+    client = FakeClient(
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "result": {
+                    "tool_name": "cliq_chat_post",
+                    "structured_content": {"status": "unexpected_shape"},
+                },
+            }
+        )
+    )
+    seed = ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_queue_timeout", provider_request_ref="cliq-request-1")
+
+    reconciled = await adapter.reconcile(client, ctx, ACTION_UID, seed)
+
+    assert reconciled.disposition is ProviderDisposition.AMBIGUOUS
+    assert reconciled.detail_code == "malformed_provider_success"
+    assert reconciled.provider_request_ref == "cliq-request-1"
+    assert reconciled.detail_code != "cliq_reconciliation_inconclusive"
+    assert [call[1] for call in client.calls] == ["request_status"]
+
+
+@pytest.mark.asyncio
+async def test_cliq_reconcile_keeps_polls_category_too():
+    adapter = CliqAdapter(Operation.CLIQ_CHANNEL_POST)
+    ctx = context(Operation.CLIQ_CHANNEL_POST)
+    client = FakeClient(McpCallResult(structured_content={"status": "lost", "request_id": "cliq-request-9"}))
+    seed = ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_queue_timeout", provider_request_ref="cliq-request-9")
+
+    reconciled = await adapter.reconcile(client, ctx, ACTION_UID, seed)
+
+    assert reconciled.disposition is ProviderDisposition.AMBIGUOUS
+    assert reconciled.detail_code == "provider_request_lost"
+    assert reconciled.category == "request_lost"
+    assert reconciled.provider_request_ref == "cliq-request-9"
+
+
+@pytest.mark.asyncio
+async def test_cliq_reconcile_still_passes_through_a_resolved_poll():
+    """A poll that actually resolves (accepted / definitive) is unaffected:
+    only the ambiguous fallback changed."""
+    adapter = CliqAdapter(Operation.CLIQ_CHAT_POST)
+    ctx = context(Operation.CLIQ_CHAT_POST, action_role=ActionRole.INTERNAL_REPLY, intent_kind=IntentKind.INTERNAL_REPLY)
+    client = FakeClient(
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "request_id": "cliq-request-1",
+                "result": {
+                    "tool_name": "cliq_chat_post",
+                    "structured_content": {"status": "sent", "provider_message_id": "provider-cliq-message-1"},
+                },
+            }
+        )
+    )
+    seed = ProviderObservation(ProviderDisposition.AMBIGUOUS, "provider_queue_timeout", provider_request_ref="cliq-request-1")
+
+    reconciled = await adapter.reconcile(client, ctx, ACTION_UID, seed)
+
+    assert reconciled.disposition is ProviderDisposition.ACCEPTED
+    assert reconciled.message_id == "provider-cliq-message-1"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("operation", "tool"),
     [

@@ -71,6 +71,17 @@ class CliqAdapter:
             polled = await self.poll(client, observation)
             if polled.disposition is not ProviderDisposition.AMBIGUOUS:
                 return polled
+            # Keep poll()'s own detail (e.g. malformed_provider_success,
+            # provider_request_lost) instead of the generic
+            # cliq_reconciliation_inconclusive: wakes 27296/27297/27314 hit
+            # exhaust() with the ledger and logs showing only the generic
+            # string, never what request_status actually said.
+            return ProviderObservation(
+                ProviderDisposition.AMBIGUOUS,
+                polled.detail_code,
+                provider_request_ref=polled.provider_request_ref or observation.provider_request_ref,
+                category=polled.category,
+            )
         return ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
             "cliq_reconciliation_inconclusive",
