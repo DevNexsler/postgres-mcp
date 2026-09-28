@@ -1,4 +1,10 @@
-"""TenantCloud-only durable delivery coordinator and Restate ingress adapter."""
+"""Generalized durable delivery coordinator and Restate ingress adapter.
+
+Originally TenantCloud-only; ``TenantCloudDeliveryCoordinator`` (aliased as
+``OutboundDeliveryCoordinator``) now takes an ``operations`` set, so the same
+class, same retry policy (``retry_policy.py``), and same Restate workflow
+shape serve TenantCloud (unconditional) and any operation named in
+``OUTBOUND_RESTATE_OPERATIONS`` (server.py). See the class docstring."""
 
 from __future__ import annotations
 
@@ -24,7 +30,12 @@ from urllib.request import build_opener
 from uuid import UUID
 
 from .models import ActionState
+from .models import Operation
 from .models import PublicStatus
+from .retry_policy import CONTEXT_RELOAD_WAIT_DETAILS
+from .retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
+from .retry_policy import RETRY_CEILING_SECONDS
+from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 
@@ -100,14 +111,32 @@ _TERMINAL_STATES = {
     ActionState.DEAD_LETTER,
     ActionState.MANUAL_REVIEW,
 }
-_CONTEXT_WAIT_DETAILS = {
-    "persisted_context_unavailable",
-    "persisted_context_mismatch",
-}
+# Kept as an alias of retry_policy's shared constant: several call sites and
+# tests in this module predate the generalized policy module and refer to
+# the old local name.
+_CONTEXT_WAIT_DETAILS = CONTEXT_RELOAD_WAIT_DETAILS
 
 
 class TenantCloudDeliveryCoordinator:
-    """One idempotent advance over CDS state. No workflow/runtime details."""
+    """Generalized one-idempotent-advance-over-CDS-state coordinator behind
+    the ``OutboundDelivery`` Restate workflow (``build_restate_app`` below).
+    No workflow/runtime details leak in here -- ``advance()`` is a pure async
+    function of durable state plus its ``store``/``service``/``auth``
+    collaborators, which is what makes it safe for ``ctx.run_typed`` to
+    replay.
+
+    Despite the name (kept for source/test compatibility -- this class is
+    constructed for TenantCloud unconditionally, by ``tenantcloud_delivery_server.py``,
+    exactly as before), this is now the ONE coordinator for every operation
+    routed through Restate: ``operations`` selects which ones a given
+    instance will advance. TenantCloud's own instance always passes
+    ``TENANTCLOUD_OPERATIONS`` (unconditional, ignoring
+    ``OUTBOUND_RESTATE_OPERATIONS`` -- see server.py); a generic instance for
+    the flagged non-TenantCloud operations passes
+    ``TENANTCLOUD_OPERATIONS | <flagged operations>`` so the same class,
+    same Restate app, and same retry policy serve both. See also the
+    ``OutboundDeliveryCoordinator`` alias below.
+    """
 
     def __init__(
         self,
@@ -118,10 +147,14 @@ class TenantCloudDeliveryCoordinator:
         max_attempts: int = 5,
         max_ambiguous_attempts: int = 12,
         clock: Callable[[], datetime] | None = None,
+        operations: frozenset[Operation] | None = None,
+        context_wait_ceiling_seconds: int = RETRY_CEILING_SECONDS,
     ) -> None:
         self._store = store
         self._service = service
         self._auth = auth
+        self._operations = operations if operations is not None else TENANTCLOUD_OPERATIONS
+        self._context_wait_ceiling_seconds = max(1, context_wait_ceiling_seconds)
         self._max_attempts = max(1, max_attempts)
         # An ambiguous write keeps reconciling past the send limit (the readback
         # may still prove acceptance), but not forever: a TenantCloud send that
@@ -136,7 +169,7 @@ class TenantCloudDeliveryCoordinator:
         action = await self._store.get(action_id)
         if action is None:
             return DeliveryResult(DeliveryPhase.TERMINAL, "action_not_found")
-        if action.operation not in TENANTCLOUD_OPERATIONS:
+        if action.operation not in self._operations:
             return DeliveryResult(DeliveryPhase.TERMINAL, "operation_not_tenantcloud")
         if action.state is ActionState.COMPLETED:
             return DeliveryResult(DeliveryPhase.COMPLETE, "completed")
@@ -152,7 +185,7 @@ class TenantCloudDeliveryCoordinator:
         action = await self._store.get(action_id)
         if action is None:
             return DeliveryResult(DeliveryPhase.TERMINAL, "action_not_found")
-        if action.operation not in TENANTCLOUD_OPERATIONS:
+        if action.operation not in self._operations:
             return DeliveryResult(DeliveryPhase.TERMINAL, "operation_not_tenantcloud")
         if action.state is ActionState.COMPLETED:
             return DeliveryResult(DeliveryPhase.COMPLETE, "completed")
@@ -197,6 +230,26 @@ class TenantCloudDeliveryCoordinator:
             result = await self._service.resume(action_id)
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
+        if result.status is PublicStatus.MANUAL_REVIEW:
+            # None (a hand-built record, or a store that predates
+            # created_at) is treated as "just created" -- same convention
+            # as service.py's TenantCloud auth-wait ceiling anchor.
+            action_created_at = getattr(action, "created_at", None)
+            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
+            wait_detail = result.detail_code if result.detail_code in _CONTEXT_WAIT_DETAILS else getattr(result, "detail", None)
+            if wait_detail in _CONTEXT_WAIT_DETAILS and should_wait_for_context_reload(
+                wait_detail,
+                elapsed,
+                ceiling_seconds=self._context_wait_ceiling_seconds,
+            ):
+                # Generalizes the RECEIVED-only wait above to every state:
+                # real prod data (action 497fcaf8, calendar.update,
+                # 2026-09-28) shows this same detail code reaching
+                # manual_review from other branches too, well inside the
+                # retry ceiling, on an action that had not actually failed
+                # -- only its context reload had. Wait and let the next
+                # advance() try the reload again instead of parking it.
+                return DeliveryResult(DeliveryPhase.WAIT, wait_detail, CONTEXT_RELOAD_WAIT_SECONDS)
         if result.status in {
             PublicStatus.FAILED,
             PublicStatus.REJECTED,
@@ -260,9 +313,24 @@ async def _post(url: str, body: bytes, headers: dict[str, str], timeout: float) 
 
 
 class RestateWorkflowSubmitter:
-    """Submit exactly one Workflow invocation keyed by CDS action UUID."""
+    """Submit exactly one Workflow invocation keyed by CDS action UUID.
 
-    def __init__(self, ingress_url: str, *, request: RequestFn = _post) -> None:
+    ``workflow_name`` defaults to ``"TenantCloudDelivery"``, the name
+    already registered with the live Restate server -- changing it requires
+    a coordinated re-registration (see the deploy notes in this change's
+    report), so it is NOT renamed automatically just because the coordinator
+    behind it is now generic. A second submitter instance constructed with
+    ``workflow_name="OutboundDelivery"`` (or any other name you register)
+    points the same client at a different deployed workflow -- still one
+    coordinator class and one retry policy, just a second named deployment,
+    which is the safest way to roll out the generalized worker without
+    touching TenantCloud's already-live one.
+    """
+
+    def __init__(self, ingress_url: str, *, request: RequestFn = _post, workflow_name: str = "TenantCloudDelivery") -> None:
+        if not workflow_name or "/" in workflow_name:
+            raise ValueError("workflow_name must be a non-empty path segment")
+        self._workflow_name = workflow_name
         parsed = urlsplit(ingress_url)
         if (
             parsed.scheme != "http"
@@ -280,7 +348,7 @@ class RestateWorkflowSubmitter:
 
     async def submit(self, action_id: UUID) -> None:
         encoded_id = quote(str(action_id), safe="")
-        url = f"{self._ingress_url}/TenantCloudDelivery/{encoded_id}/deliver/send"
+        url = f"{self._ingress_url}/{self._workflow_name}/{encoded_id}/deliver/send"
         body = json.dumps({"action_id": str(action_id)}, separators=(",", ":")).encode("utf-8")
         status, _body = await self._request(
             url,
@@ -294,12 +362,16 @@ class RestateWorkflowSubmitter:
             raise RuntimeError(f"Restate ingress returned HTTP {status}")
 
 
-def build_restate_app(coordinator: TenantCloudDeliveryCoordinator):
-    """Build lazily so normal gateway processes do not require Restate imports."""
+def build_restate_app(coordinator: TenantCloudDeliveryCoordinator, *, workflow_name: str = "TenantCloudDelivery"):
+    """Build lazily so normal gateway processes do not require Restate imports.
+
+    ``workflow_name`` must match what ``RestateWorkflowSubmitter`` was given
+    and what is registered with the Restate admin server -- see that
+    class's docstring for why this is not renamed by default."""
     import restate
 
     workflow = restate.Workflow(
-        "TenantCloudDelivery",
+        workflow_name,
         inactivity_timeout=timedelta(minutes=10),
         abort_timeout=timedelta(minutes=15),
         ingress_private=False,
@@ -342,3 +414,11 @@ def build_restate_app(coordinator: TenantCloudDeliveryCoordinator):
             step += 1
 
     return restate.app([workflow])
+
+
+# The generic entry point: same class, same retry policy, same Restate
+# workflow shape as TenantCloud's -- construct it with
+# ``operations=TENANTCLOUD_OPERATIONS | <flagged operations>`` for a
+# generalized deployment. See the class docstring for why the class itself
+# keeps its original name.
+OutboundDeliveryCoordinator = TenantCloudDeliveryCoordinator

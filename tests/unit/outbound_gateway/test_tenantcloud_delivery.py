@@ -318,3 +318,111 @@ async def test_an_ambiguous_action_below_the_bound_still_reconciles(attempts) ->
 
     service.reconcile.assert_awaited_once_with(ACTION_ID)
     service.exhaust.assert_not_called()
+
+
+# -- Generalized (non-TenantCloud) coordinator behavior --------------------
+#
+# The same class, now parameterized on `operations`, is the generic Restate
+# delivery coordinator (OutboundDeliveryCoordinator alias). These tests use
+# calendar.update, which is never a TenantCloud operation, to prove the
+# generalization and the context-reload-wait fix grounded in real prod data
+# (action 497fcaf8, 2026-09-28: a calendar.update reached manual_review with
+# detail_code persisted_context_unavailable only 6 seconds after being
+# created, at attempt_count 2).
+
+
+def _generic_action(*, attempts: int = 2, created_at=None):
+    return SimpleNamespace(
+        action_id=ACTION_ID,
+        operation=Operation.CALENDAR_UPDATE,
+        state=ActionState.RETRY_READY,
+        attempt_count=attempts,
+        next_attempt_at=datetime(2026, 9, 28, 18, 41, tzinfo=timezone.utc),
+        created_at=created_at if created_at is not None else datetime(2026, 9, 28, 18, 41, 26, tzinfo=timezone.utc),
+    )
+
+
+def test_a_non_tenantcloud_operation_is_rejected_by_the_tenantcloud_only_instance() -> None:
+    coordinator = TenantCloudDeliveryCoordinator(store=AsyncMock(), service=AsyncMock(), auth=AsyncMock())
+    assert Operation.CALENDAR_UPDATE not in coordinator._operations  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_an_operations_set_generalizes_which_operations_the_coordinator_advances() -> None:
+    row = _generic_action()
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(
+        status=PublicStatus.SENT, detail_code="sent", detail=None
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({Operation.CALENDAR_UPDATE}),
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.COMPLETE
+    service.resume.assert_awaited_once_with(ACTION_ID)
+
+
+@pytest.mark.asyncio
+async def test_a_context_reload_manual_review_waits_instead_of_parking_inside_the_ceiling() -> None:
+    now = datetime(2026, 9, 28, 18, 41, 32, tzinfo=timezone.utc)
+    row = _generic_action(created_at=datetime(2026, 9, 28, 18, 41, 26, tzinfo=timezone.utc))
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(
+        status=PublicStatus.MANUAL_REVIEW,
+        detail_code="persisted_context_unavailable",
+        detail="persisted_context_unavailable",
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({Operation.CALENDAR_UPDATE}),
+        clock=lambda: now,
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.WAIT
+    assert result.detail_code == "persisted_context_unavailable"
+    assert result.retry_after_seconds == 300
+
+
+@pytest.mark.asyncio
+async def test_a_context_reload_manual_review_past_the_ceiling_is_terminal() -> None:
+    now = datetime(2026, 9, 28, 19, 45, 0, tzinfo=timezone.utc)  # > 1h after created_at
+    row = _generic_action(created_at=datetime(2026, 9, 28, 18, 41, 26, tzinfo=timezone.utc))
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(
+        status=PublicStatus.MANUAL_REVIEW,
+        detail_code="persisted_context_unavailable",
+        detail="persisted_context_unavailable",
+    )
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    coordinator = TenantCloudDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({Operation.CALENDAR_UPDATE}),
+        clock=lambda: now,
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.TERMINAL
+    assert result.detail_code == "persisted_context_unavailable"
