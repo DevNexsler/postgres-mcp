@@ -11,6 +11,7 @@ import pytest
 
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
+from postgres_mcp.outbound_gateway.adapters.base import initial_observation
 from postgres_mcp.outbound_gateway.adapters.base import transport_observation
 from postgres_mcp.outbound_gateway.adapters.calendar import CalendarAdapter
 from postgres_mcp.outbound_gateway.adapters.cliq import CliqAdapter
@@ -177,6 +178,47 @@ def test_auth_rejection_is_retryable_definitive_non_acceptance():
     assert observation.detail_code == "provider_auth_rejected"
     assert observation.category == "provider_authentication"
     assert observation.retryable is True
+
+
+def test_effect_call_tool_error_result_with_no_transport_kind_is_definitive_non_acceptance():
+    """2026-09-28: Agent Email's synchronous argument validation (e.g.
+    parseCliqBotToolCall rejecting a CT_* channel_unique_name) returns an
+    MCP CallToolResult with isError=true and no structuredContent -- the
+    session round-tripped fine, so there is no TransportErrorKind, and
+    nothing was ever enqueued, so there is no queue status either. That is
+    a definitive provider rejection of this exact request, not a transport
+    hiccup: treating it as AMBIGUOUS meant the gateway reconciled a request
+    that could never succeed 5 times and parked it in manual_review with no
+    reason surfaced."""
+    result = McpCallResult(
+        is_error=True,
+        text="Error executing cliq_channel_bot_post: cliq_channel_bot_post requires channel_unique_name, "
+        "not a CT_* chat id",
+    )
+
+    observation = initial_observation(result, effect_call=True)
+
+    assert observation is not None
+    assert observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observation.detail_code == "provider_rejected_request"
+    assert observation.category == "provider_validation"
+    assert observation.retryable is False
+    assert observation.evidence is not None
+    assert "CT_* chat id" in observation.evidence["provider_message"]
+
+
+def test_poll_call_tool_error_result_with_no_transport_kind_stays_ambiguous():
+    """The same isError shape on a poll/reconcile call (e.g. request_status
+    given a bad request_id) says nothing about whether the original send
+    happened, so it must not become definitive non-acceptance -- only the
+    effect call itself proves the send never went out."""
+    result = McpCallResult(is_error=True, text="Error executing request_status: Request not found")
+
+    observation = initial_observation(result, effect_call=False)
+
+    assert observation is not None
+    assert observation.disposition is ProviderDisposition.AMBIGUOUS
+    assert observation.detail_code == "provider_mcp_error"
 
 
 def session_timeout_before_tool_request():

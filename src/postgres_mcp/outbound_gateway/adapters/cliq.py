@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from ..cliq_target import CliqTargetKind
+from ..cliq_target import cliq_tool_for_kind
 from ..context import ActionContext
 from ..models import Operation
 from ..provider_client import McpCallResult
@@ -32,12 +34,20 @@ class CliqAdapter:
 
     def build_request(self, context: ActionContext, action_uid: UUID) -> ProviderRequest:
         self.validate(context)
-        channel = self._operation is Operation.CLIQ_CHANNEL_POST
+        # The AES tool is chosen by what context derivation resolved the
+        # target to (context.target.kind), not by which operation the agent
+        # named: cliq.channel.post with a chat-shaped id (a CT_* conversation
+        # id, or a numeric chat id) is resolved to a CHAT target there --
+        # AES's cliq_channel_bot_post rejects that shape outright
+        # (2026-09-28 manual_review pileup) -- and must still go to
+        # cliq_chat_post here. See cliq_target.py for the single shared
+        # classification this and context derivation both use.
+        tool, target_field = cliq_tool_for_kind(CliqTargetKind(context.target.kind))
         return ProviderRequest(
             server_name="agent-email",
-            tool="cliq_channel_bot_post" if channel else "cliq_chat_post",
+            tool=tool,
             arguments={
-                "channel_unique_name" if channel else "chat_id": context.target.target_id,
+                target_field: context.target.target_id,
                 "text": str(context.arguments["text"]),
                 "sync_message": True,
                 "idempotency_key": (

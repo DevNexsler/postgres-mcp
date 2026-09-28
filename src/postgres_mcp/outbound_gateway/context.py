@@ -17,6 +17,9 @@ from unicodedata import normalize
 from uuid import UUID
 from uuid import uuid5
 
+from .cliq_target import CliqChannelIdUnresolvedError
+from .cliq_target import CliqTargetKind
+from .cliq_target import resolve_cliq_target
 from .identity import request_arguments
 from .models import ActionRole
 from .models import CalendarCreateArguments
@@ -93,6 +96,11 @@ class RoutingPolicy:
     property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
     calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
+    # Numeric Cliq channel id -> AES channel_unique_name. Only consulted for
+    # a channel_or_chat_id that is neither chat-shaped (see cliq_target.py)
+    # nor already a unique_name; an id missing here refuses at execute time
+    # rather than guessing.
+    cliq_channel_unique_names_by_id: Mapping[str, str] = dataclass_field(default_factory=dict)
     # Sender for an email from a wake whose source has no mailbox of its own
     # (a Quo text, a Cliq message): Nigel's mailbox.
     email_default_account: str = ""
@@ -907,8 +915,18 @@ class ActionContextLoader:
                         "channel_or_chat_id. To post anywhere else use cliq.channel.post "
                         "(action_role internal_notification, intent_kind manual_review_alert)."
                     )
-            kind = "cliq_channel" if request.operation is Operation.CLIQ_CHANNEL_POST else "cliq_chat"
-            return DerivedTarget(kind, request.arguments.channel_or_chat_id, True), request.arguments.channel_or_chat_id
+            requested_kind = (
+                CliqTargetKind.CHANNEL if request.operation is Operation.CLIQ_CHANNEL_POST else CliqTargetKind.CHAT
+            )
+            try:
+                kind, target_value = resolve_cliq_target(
+                    request.arguments.channel_or_chat_id,
+                    requested_kind,
+                    self._policy.cliq_channel_unique_names_by_id,
+                )
+            except CliqChannelIdUnresolvedError as exc:
+                raise ContextDerivationError(str(exc)) from exc
+            return DerivedTarget(kind.value, target_value, True), target_value
         assert isinstance(request.arguments, (CalendarCreateArguments, CalendarUpdateArguments, CalendarDeleteArguments))
         profile = "appointment-setter"
         configured_calendar = self._policy.calendar_by_profile.get(profile, "")

@@ -1,0 +1,428 @@
+{
+  "_provenance": {
+    "source_repo": "Agent-Email-Server",
+    "generated_by": "scripts/refresh_agent_email_tool_schemas.py",
+    "note": "Vendored MCP inputSchema for every AES tool the gateway calls. Extracted directly from AES's own tool-definition source via tsx, not hand-copied. Refresh after any AES schema change and re-run tests/unit/outbound_gateway/test_cliq_contract.py."
+  },
+  "_runtime_rules": {
+    "note": "Rules AES enforces in code or by documented design, not in inputSchema. Source: Agent-Email-Server/src/tools/cliq-bot-tools.ts (parseCliqChannelBotPost/parseCliqChatPost) and cliq-chat-id.ts (CLIQ_CHAT_ID_PATTERN + its 2026-09-03 incident comment).",
+    "cliq_channel_bot_post.channel_unique_name": {
+      "must_not_match_pattern": "cliq_chat_post.chat_id.pattern",
+      "reason": "Explicit for a CT_* value (cliq-bot-tools.ts parseCliqChannelBotPost: channelUniqueName.startsWith('CT_') throws). A >=15-digit numeric value has no matching local throw, but cliq-chat-id.ts's own rationale for MIN_CLIQ_NUMERIC_CHAT_ID_DIGITS establishes that space as chat ids, not channel unique names, and its 2026-09-03 incident shows Zoho rejects it with an opaque operation_failed 400 rather than a clear channel-not-found error -- exactly the kind of failure this contract test exists to catch before it reaches Zoho."
+    }
+  },
+  "cliq_channel_bot_post": {
+    "type": "object",
+    "properties": {
+      "channel_unique_name": {
+        "type": "string",
+        "description": "Zoho Cliq channel unique name, for example 'acquisition'. Do not pass '#Acquisition' or a CT_* chat id."
+      },
+      "text": {
+        "type": "string",
+        "maxLength": 5000,
+        "description": "Plain text message to post as the bot. Maximum 5000 characters."
+      },
+      "bot_unique_name": {
+        "type": "string",
+        "default": "nigelgeneral",
+        "description": "Zoho Cliq bot unique name. Defaults to 'nigelgeneral' for @Nigel-General."
+      },
+      "idempotency_key": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Stable outbound intent key. Identical destination/content reuses original result for 24 hours."
+      },
+      "allow_repeat": {
+        "type": "boolean",
+        "default": false,
+        "description": "Explicit intentional repeat: bypass the 2-minute content guard. A repeated idempotency_key still suppresses."
+      },
+      "sync_message": {
+        "type": "boolean",
+        "default": true,
+        "description": "Request a synchronous Zoho response containing message_id when supported. Defaults to true."
+      },
+      "reply_to": {
+        "type": "string",
+        "description": "Optional Zoho message ID to reply to in the channel."
+      }
+    },
+    "required": [
+      "channel_unique_name",
+      "text"
+    ],
+    "additionalProperties": false
+  },
+  "cliq_chat_post": {
+    "type": "object",
+    "properties": {
+      "chat_id": {
+        "type": "string",
+        "maxLength": 256,
+        "pattern": "^(?:[0-9]{15,}|CT_[A-Za-z0-9_/%-]*[0-9][A-Za-z0-9_/%-]*)$",
+        "description": "Zoho existing DM/group chat ID. Do not pass a channel unique name or a user id (ZUID). Expected a numeric Cliq chat id of at least 15 digits (e.g. 1424728044450751028) or a CT_<chat>_<user> conversation id (e.g. CT_2198174035284346737_721156495)."
+      },
+      "text": {
+        "type": "string",
+        "maxLength": 5000,
+        "description": "Private chat message text. Maximum 5000 characters."
+      },
+      "idempotency_key": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Stable outbound intent key. Identical destination/content reuses original result for 24 hours."
+      },
+      "allow_repeat": {
+        "type": "boolean",
+        "default": false,
+        "description": "Explicit intentional repeat: bypass the 2-minute content guard. A repeated idempotency_key still suppresses."
+      },
+      "sync_message": {
+        "type": "boolean",
+        "default": true,
+        "description": "Request a synchronous Zoho response containing message evidence. Defaults to true."
+      },
+      "reply_to": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Optional Zoho message ID to reply to."
+      }
+    },
+    "required": [
+      "chat_id",
+      "text"
+    ],
+    "additionalProperties": false
+  },
+  "email_send": {
+    "type": "object",
+    "properties": {
+      "account_id": {
+        "type": "string",
+        "description": "The account ID to execute this operation against"
+      },
+      "outbound_action_uid": {
+        "type": "string",
+        "format": "uuid",
+        "description": "Gateway-issued outbound action correlation UUID"
+      },
+      "to": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "address": {
+              "type": "string",
+              "format": "email"
+            }
+          },
+          "required": [
+            "address"
+          ]
+        },
+        "description": "Recipients of the email"
+      },
+      "cc": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "address": {
+              "type": "string",
+              "format": "email"
+            }
+          },
+          "required": [
+            "address"
+          ]
+        },
+        "description": "CC recipients (optional)"
+      },
+      "bcc": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "address": {
+              "type": "string",
+              "format": "email"
+            }
+          },
+          "required": [
+            "address"
+          ]
+        },
+        "description": "BCC recipients (optional)"
+      },
+      "subject": {
+        "type": "string",
+        "description": "Subject line of the email"
+      },
+      "text": {
+        "type": "string",
+        "description": "Plain text content of the email"
+      },
+      "html": {
+        "type": "string",
+        "description": "HTML content of the email (optional)"
+      },
+      "attachments": {
+        "type": "array",
+        "maxItems": 20,
+        "description": "Inline attachments. Supply bytes as canonical base64; provider credentials remain inside this service.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "Attachment filename shown to recipients"
+            },
+            "content_base64": {
+              "type": "string",
+              "contentEncoding": "base64",
+              "maxLength": 34952536,
+              "description": "Attachment bytes encoded as canonical base64"
+            },
+            "content_type": {
+              "type": "string",
+              "maxLength": 255,
+              "description": "Optional MIME type such as image/jpeg"
+            }
+          },
+          "required": [
+            "filename",
+            "content_base64"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "account_id",
+      "to",
+      "subject"
+    ],
+    "additionalProperties": false
+  },
+  "calendar_create_event": {
+    "type": "object",
+    "properties": {
+      "account_id": {
+        "type": "string",
+        "description": "The account ID to execute this operation against"
+      },
+      "uid": {
+        "type": "string",
+        "format": "uuid",
+        "description": "Gateway-issued outbound action correlation UUID"
+      },
+      "summary": {
+        "type": "string",
+        "description": "Event title/summary"
+      },
+      "description": {
+        "type": "string",
+        "description": "Event description (optional)"
+      },
+      "location": {
+        "type": "string",
+        "description": "Event location (optional)"
+      },
+      "start": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Event start time. Timed event start/end MUST include an explicit timezone offset or Z. Do not send timezone-less date-times like 2026-04-20T10:00:00. This server runs in UTC; timezone-less 11:00 is treated as 11:00 UTC, not 11:00 ET. For America/New_York, use -04:00 during EDT, -05:00 during EST, or equivalent UTC Z. Example 10 AM ET during EDT: 2026-04-20T10:00:00-04:00 or 2026-04-20T14:00:00Z."
+      },
+      "end": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Event end time. Timed event start/end MUST include an explicit timezone offset or Z. Do not send timezone-less date-times like 2026-04-20T10:00:00. This server runs in UTC; timezone-less 11:00 is treated as 11:00 UTC, not 11:00 ET. For America/New_York, use -04:00 during EDT, -05:00 during EST, or equivalent UTC Z. Example 10 AM ET during EDT: 2026-04-20T10:00:00-04:00 or 2026-04-20T14:00:00Z."
+      },
+      "all_day": {
+        "type": "boolean",
+        "description": "Whether this is an all-day event (default: false)"
+      },
+      "calendar": {
+        "type": "string",
+        "description": "Calendar name (e.g., 'dan.park' or 'nigel')"
+      },
+      "organizer": {
+        "type": "object",
+        "description": "Event organizer",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ]
+      },
+      "attendees": {
+        "type": "array",
+        "description": "Event attendees",
+        "items": {
+          "type": "object",
+          "properties": {
+            "email": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "email"
+          ]
+        }
+      }
+    },
+    "required": [
+      "account_id",
+      "summary",
+      "start",
+      "end"
+    ],
+    "additionalProperties": false
+  },
+  "calendar_update_event": {
+    "type": "object",
+    "properties": {
+      "account_id": {
+        "type": "string",
+        "description": "The account ID to execute this operation against"
+      },
+      "event_url": {
+        "type": "string",
+        "description": "URL of the event to update (from calendar_events_get response)"
+      },
+      "etag": {
+        "type": "string",
+        "description": "Current etag of the event (for optimistic concurrency)"
+      },
+      "summary": {
+        "type": "string",
+        "description": "Updated event title"
+      },
+      "description": {
+        "type": "string",
+        "description": "Updated event description"
+      },
+      "location": {
+        "type": "string",
+        "description": "Updated event location"
+      },
+      "start": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Updated start time. Timed event start/end MUST include an explicit timezone offset or Z. Do not send timezone-less date-times like 2026-04-20T10:00:00. This server runs in UTC; timezone-less 11:00 is treated as 11:00 UTC, not 11:00 ET. For America/New_York, use -04:00 during EDT, -05:00 during EST, or equivalent UTC Z. Example 10 AM ET during EDT: 2026-04-20T10:00:00-04:00 or 2026-04-20T14:00:00Z."
+      },
+      "end": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Updated end time. Timed event start/end MUST include an explicit timezone offset or Z. Do not send timezone-less date-times like 2026-04-20T10:00:00. This server runs in UTC; timezone-less 11:00 is treated as 11:00 UTC, not 11:00 ET. For America/New_York, use -04:00 during EDT, -05:00 during EST, or equivalent UTC Z. Example 10 AM ET during EDT: 2026-04-20T10:00:00-04:00 or 2026-04-20T14:00:00Z."
+      },
+      "all_day": {
+        "type": "boolean",
+        "description": "Whether this is an all-day event"
+      },
+      "calendar": {
+        "type": "string",
+        "description": "Calendar name"
+      },
+      "organizer": {
+        "type": "object",
+        "description": "Updated organizer",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ]
+      },
+      "attendees": {
+        "type": "array",
+        "description": "Updated attendees list",
+        "items": {
+          "type": "object",
+          "properties": {
+            "email": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "email"
+          ]
+        }
+      }
+    },
+    "required": [
+      "account_id",
+      "event_url",
+      "etag"
+    ],
+    "additionalProperties": false
+  },
+  "calendar_delete_event": {
+    "type": "object",
+    "properties": {
+      "account_id": {
+        "type": "string",
+        "description": "The account ID to execute this operation against"
+      },
+      "event_url": {
+        "type": "string",
+        "description": "URL of the event to delete (from calendar_events_get response)"
+      },
+      "etag": {
+        "type": "string",
+        "description": "Current etag of the event (for optimistic concurrency)"
+      },
+      "calendar": {
+        "type": "string",
+        "description": "Calendar name"
+      }
+    },
+    "required": [
+      "account_id",
+      "event_url",
+      "etag"
+    ],
+    "additionalProperties": false
+  },
+  "request_status": {
+    "type": "object",
+    "properties": {
+      "request_id": {
+        "type": "string",
+        "description": "The request ID returned when the tool was invoked"
+      }
+    },
+    "required": [
+      "request_id"
+    ],
+    "additionalProperties": false
+  }
+}

@@ -1693,6 +1693,109 @@ async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contamina
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_target_id",
+    ["1424728044450751028", "CT_2243214485353125021_721156495"],
+    ids=["prod_numeric_chat_id", "prod_ct_star_chat_id"],
+)
+async def test_cliq_channel_post_with_a_chat_shaped_id_is_routed_as_a_chat_target(raw_target_id):
+    """2026-09-28: every cliq.channel.post that failed named a target shaped
+    like AES's chat_id (a >=15-digit numeric id, or a CT_* conversation id),
+    which AES's cliq_channel_bot_post always rejects for channel_unique_name.
+    Context derivation must resolve that target to a CHAT kind regardless of
+    which operation the agent named, so the adapter sends it to
+    cliq_chat_post instead."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": raw_target_id, "text": "New lead"},
+        )
+    )
+
+    assert context.target.kind == "cliq_chat"
+    assert context.target.target_id == raw_target_id
+
+
+@pytest.mark.asyncio
+async def test_cliq_channel_post_with_an_unmapped_numeric_channel_id_refuses_at_execute_time():
+    """A short numeric Cliq channel id (not chat-shaped) has no reliable
+    static source of its channel_unique_name -- guessing risks posting to
+    the wrong channel, which is worse than refusing. Refuse with an
+    instructive message instead of silently misrouting or guessing."""
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    loader = ActionContextLoader(FakeRepository(event), policy())
+
+    with pytest.raises(ContextDerivationError) as excinfo:
+        await loader.load(
+            request(
+                action_role="internal_notification",
+                operation="cliq.channel.post",
+                intent_kind="lead_alert",
+                appointment_slot=None,
+                arguments={"channel_or_chat_id": "42", "text": "New lead"},
+            )
+        )
+    message = str(excinfo.value)
+    assert "Nothing was sent" in message
+    assert "cliq_channels_list" in message
+    assert "channel_unique_name" in message
+    assert "cliq.chat.post" in message
+
+
+@pytest.mark.asyncio
+async def test_cliq_channel_post_with_a_mapped_numeric_channel_id_resolves_to_its_unique_name():
+    event = record(
+        event_source="zoho_cliq",
+        message_source="zoho_cliq",
+        source_channel_id="tenant-leads",
+        channel_type="channel",
+        participant_type="user",
+        participant_key="internal-user",
+        raw_payload={"provider": "cliq", "channel_id": "tenant-leads"},
+        envelope={"identity": {}, "message": {}},
+    )
+    configured_policy = dataclasses.replace(policy(), cliq_channel_unique_names_by_id={"42": "maintenance"})
+    loader = ActionContextLoader(FakeRepository(event), configured_policy)
+
+    context = await loader.load(
+        request(
+            action_role="internal_notification",
+            operation="cliq.channel.post",
+            intent_kind="lead_alert",
+            appointment_slot=None,
+            arguments={"channel_or_chat_id": "42", "text": "New lead"},
+        )
+    )
+
+    assert context.target.kind == "cliq_channel"
+    assert context.target.target_id == "maintenance"
+
+
+@pytest.mark.asyncio
 async def test_cliq_wake_reply_targets_its_inbound_chat_without_property():
     inbound = record(
         event_source="zoho_cliq",
