@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionRole
+from postgres_mcp.outbound_gateway.models import CliqArguments
 from postgres_mcp.outbound_gateway.models import ExecuteRequest
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
@@ -36,6 +37,7 @@ async def test_warn_once_posts_a_cliq_channel_internal_notification() -> None:
     assert request.action_role is ActionRole.INTERNAL_NOTIFICATION
     assert request.operation is Operation.CLIQ_CHANNEL_POST
     assert request.intent_kind == IntentKind.MANUAL_REVIEW_ALERT.value
+    assert isinstance(request.arguments, CliqArguments)
     assert request.arguments.channel_or_chat_id == DEFAULT_STAFF_WARNING_CHANNEL
     text = request.arguments.text
     assert "quo.sms.send" in text
@@ -48,10 +50,9 @@ async def test_warn_once_posts_a_cliq_channel_internal_notification() -> None:
 async def test_warn_once_is_idempotent_on_action_id() -> None:
     service = AsyncMock()
     port = CliqStaffWarningPort(service)
-    kwargs = dict(wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
 
-    await port.warn_once(ACTION_ID, None, "reason", **kwargs)
-    await port.warn_once(ACTION_ID, None, "reason", **kwargs)
+    await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
+    await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
 
     service.execute.assert_awaited_once()
 
@@ -64,6 +65,7 @@ async def test_warn_once_uses_the_configured_target_channel() -> None:
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
 
     (request,) = service.execute.await_args.args
+    assert isinstance(request.arguments, CliqArguments)
     assert request.arguments.channel_or_chat_id == "ops-alerts"
 
 

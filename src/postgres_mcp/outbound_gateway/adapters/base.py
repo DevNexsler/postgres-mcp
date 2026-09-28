@@ -191,6 +191,29 @@ def initial_observation(result: McpCallResult, *, effect_call: bool = False) -> 
     if status in {"failed", "lost"}:
         category = payload.get("category") if payload else None
         category = category if isinstance(category, str) else "request_lost" if status == "lost" else "provider_failure"
+        message = payload.get("message") if payload else None
+        message = message if isinstance(message, str) and message.strip() else None
+        if status == "failed" and category == "permanent_upstream_error":
+            # The one exception to "queue failure does not prove
+            # non-acceptance" below: Agent Email's own job classification
+            # (category, its raw value -- this gateway's own detail_code
+            # below adds the "provider_" prefix) already says the upstream
+            # provider's rejection is permanent -- this is authoritative
+            # evidence, not a transport hiccup. Without this, a
+            # permanently-refused send (wake 27327, a cliq.chat.post to chat
+            # 1608777531604898891, 2026-09-28 20:14:53Z -- CDS confirms
+            # non-delivery, a sibling DM at the same second delivered fine)
+            # reconciled 5 times and parked in manual_review with no reason
+            # surfaced, exactly like provider_rejected_request above did
+            # before it was fixed.
+            return ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                "provider_permanent_upstream_error",
+                provider_request_ref=ref,
+                category=category,
+                retryable=False,
+                evidence={"status": status, "category": category, "provider_message": message},
+            )
         # Queue failure proves only that the provider call did not produce a
         # usable receipt. It does not prove non-acceptance: SMTP, calendar, or
         # messaging providers can accept an effect before the queue reports a

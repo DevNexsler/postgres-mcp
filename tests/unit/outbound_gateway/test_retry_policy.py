@@ -166,9 +166,22 @@ def test_decide_for_observation_retries_an_ambiguous_observation() -> None:
 async def test_noop_staff_warning_port_warns_at_most_once_per_action(caplog: pytest.LogCaptureFixture) -> None:
     port = retry_policy.NoopStaffWarningPort()
     action_id = UUID("11111111-1111-1111-1111-111111111111")
-    kwargs = dict(wakeup_event_id=27000, operation=Operation.QUO_SMS_SEND, recipient="+15555550100")
     with caplog.at_level("WARNING"):
-        await port.warn_once(action_id, None, "retry_budget_exhausted", **kwargs)
-        await port.warn_once(action_id, None, "retry_budget_exhausted", **kwargs)
+        await port.warn_once(
+            action_id,
+            None,
+            "retry_budget_exhausted",
+            wakeup_event_id=27000,
+            operation=Operation.QUO_SMS_SEND,
+            recipient="+15555550100",
+        )
+        await port.warn_once(
+            action_id,
+            None,
+            "retry_budget_exhausted",
+            wakeup_event_id=27000,
+            operation=Operation.QUO_SMS_SEND,
+            recipient="+15555550100",
+        )
     warnings = [record for record in caplog.records if "no Cliq warning was sent" in record.getMessage()]
     assert len(warnings) == 1
