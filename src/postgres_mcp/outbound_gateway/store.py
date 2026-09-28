@@ -19,6 +19,7 @@ from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
 from .models import Operation
+from .models import RequestRefusedError
 from .service import OutboundActionRecord
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
@@ -99,7 +100,7 @@ def _explain_database_refusal(error: Exception) -> Exception:
     for pattern, next_step in _DATABASE_REFUSAL_NEXT_STEPS:
         match = pattern.search(message)
         if match:
-            return ValueError(f"{match.group(0).rstrip('.')}. {next_step}")
+            return RequestRefusedError(f"{match.group(0).rstrip('.')}. {next_step}")
     return error
 
 

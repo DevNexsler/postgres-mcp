@@ -13,13 +13,16 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from postgres_mcp.outbound_gateway.context import ActionContextLoader
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.record import require_action
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
+from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
+from postgres_mcp.outbound_gateway.stale_context import refusal
 from postgres_mcp.outbound_gateway.state_machine import InvalidTransitionError
 from postgres_mcp.outbound_gateway.state_machine import validate_transition
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
@@ -174,6 +177,81 @@ async def test_an_invalid_request_says_nothing_was_sent_and_where_the_shapes_are
     text = str(raised.value)
     assert text.startswith("invalid outbound action request: ")
     assert "Nothing was sent" in text and "tool description" in text
+
+
+async def _cliq_reply_target_refusal() -> Exception:
+    inbound = record(
+        event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_1",
+        channel_type="dm", subject=None, envelope={"identity": {}, "message": {}}, raw_payload={},
+    )
+    outbound = request(
+        action_role="internal_reply", operation="cliq.chat.post", intent_kind="internal_reply",
+        appointment_slot=None, arguments={"channel_or_chat_id": "CT_2", "text": "pong"},
+    )
+    with pytest.raises(Exception) as raised:
+        await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
+    return raised.value
+
+
+async def _unknown_action_refusal() -> Exception:
+    store = AsyncMock()
+    store.get.return_value = None
+    with pytest.raises(Exception) as raised:
+        await require_action(store, ACTION_ID)
+    return raised.value
+
+
+EXECUTE = {
+    "op": "execute", "wakeup_event_id": 27250, "action_role": "prospect_reply", "operation": "email.send",
+    "intent_kind": "inquiry_reply", "arguments": {"to_address": "dan@pfg.io", "text": "hi"},
+}
+CONFIRM = {"op": "confirm", "wakeup_event_id": 27250, "action_id": str(ACTION_ID), "decision": "yes"}
+STATUS = {"op": "status", "action_id": str(ACTION_ID)}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_request_is_a_rejected_result_not_an_mcp_tool_error():
+    """hermes-agent counts every MCP tool error toward a 3-strike breaker
+    that parks outbound-gateway for every caller (#3463). A request the
+    gateway refuses as asked -- a closed wake, an action already recorded
+    with other content, a target the wake does not allow, a stale_context
+    answer that changes the recipient, an unknown action_id -- is the
+    caller's to correct, not a gateway fault: the tool answers it as an
+    ordinary rejected result carrying the refusal's own words."""
+    refused = [
+        ("execute", EXECUTE, await _create_raising("ordinary outbound action cannot attach to terminal wake 27250")),
+        ("execute", EXECUTE, await _create_raising(f"outbound action immutable context mismatch for {ACTION_ID}")),
+        ("execute", EXECUTE, await _cliq_reply_target_refusal()),
+        ("confirm", CONFIRM, refusal("revise refused: only the message content (text) may change; "
+                                     "channel_or_chat_id must stay exactly as refused (same operation, recipient and target).")),
+        ("confirm", CONFIRM, await _confirm_raising("stale context already answered no")),
+        ("status", STATUS, await _unknown_action_refusal()),
+    ]
+    results = []
+    for method, payload, error in refused:
+        service = AsyncMock()
+        service.action_operation.return_value = None
+        getattr(service, method).side_effect = error
+        mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+        async with create_connected_server_and_client_session(mcp) as client:
+            results.append((error, await client.call_tool("outbound_action", {"request": payload})))
+
+    assert [result.isError for _error, result in results] == [False] * len(refused)
+    for error, result in results:
+        body = result.structuredContent or {}
+        assert (body["status"], body["detail_code"], body["retryable"]) == ("rejected", "request_refused", False)
+        assert body["detail"] == str(error)
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_fault_is_still_an_mcp_tool_error():
+    service = AsyncMock()
+    service.execute.side_effect = await _create_raising("connection reset by peer")
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+    async with create_connected_server_and_client_session(mcp) as client:
+        result = await client.call_tool("outbound_action", {"request": EXECUTE})
+    assert result.isError
+    assert "connection reset by peer" in str(result.content)
 
 
 def test_an_invalid_transition_says_to_check_status_first():

@@ -59,6 +59,7 @@ from .models import ExecuteRequest
 from .models import NewerActivity
 from .models import PublicResult
 from .models import PublicStatus
+from .models import RequestRefusedError
 from .models import StaleContextDecision
 from .record import ActionStore
 from .record import OutboundActionRecord
@@ -159,13 +160,13 @@ def stale_context_question(*, wakeup_event_id: int, action_id: UUID) -> str:
 # --------------------------------------------------------------------------
 
 
-def refusal(message: str) -> ValueError:
+def refusal(message: str) -> RequestRefusedError:
     """Every refused stale_context answer names itself as a decision, not an
     outage, so no agent reads it as leave to use a direct provider route."""
-    return ValueError(f"{message} {CONFIRM_REFUSAL_NOTICE}")
+    return RequestRefusedError(f"{message} {CONFIRM_REFUSAL_NOTICE}")
 
 
-def confirmation_disabled() -> ValueError:
+def confirmation_disabled() -> RequestRefusedError:
     return refusal(
         "confirm refused: stale_context confirmation is not enabled on this gateway; "
         "there is no question to answer."
