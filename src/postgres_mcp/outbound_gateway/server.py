@@ -119,6 +119,7 @@ async def handle_outbound_action(
     request: dict[str, Any],
     *,
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> dict[str, Any]:
     try:
         parsed = parse_outbound_request(request)
@@ -142,7 +143,13 @@ async def handle_outbound_action(
     if isinstance(parsed, StatusRequest):
         result = await service.status(parsed.action_id)
     elif isinstance(parsed, ConfirmRequest):
-        result = await _confirm(service, policy, parsed, tenantcloud_submitter=tenantcloud_submitter)
+        result = await _confirm(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
     else:
         assert isinstance(parsed, ExecuteRequest)
         if not policy.writes_enabled or policy.kill_switch:
@@ -173,14 +180,20 @@ async def handle_outbound_action(
                 detail_code="operation_disabled",
             )
         else:
-            if parsed.operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None:
+            routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+            if parsed.operation in routed_operations and tenantcloud_submitter is not None:
+                # Stays fast: persist + preflight only (no provider I/O), then
+                # fire-and-forget the durable Restate submission. Execute
+                # returns "accepted, delivering" immediately either way -- the
+                # 1h retry ceiling runs entirely in the background workflow, a
+                # wake session never waits on it.
                 result = await service.enqueue(parsed)
                 if result.status is PublicStatus.PENDING:
                     try:
                         await tenantcloud_submitter.submit(result.action_id)
                     except Exception:
                         logger.exception(
-                            "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                            "Restate delivery submission failed for action %s; CDS sweeper will retry",
                             result.action_id,
                         )
             else:
@@ -203,6 +216,7 @@ async def _confirm(
     request: ConfirmRequest,
     *,
     tenantcloud_submitter: RestateWorkflowSubmitter | None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> PublicResult:
     """Route a stale_context answer. A decline is a ledger write only and is
     always accepted; a yes is a send and obeys the same write switches as
@@ -229,14 +243,15 @@ async def _confirm(
             retryable=False,
             detail_code="operation_disabled",
         )
-    tenantcloud = parent_operation in TENANTCLOUD_OPERATIONS and tenantcloud_submitter is not None
-    result = await service.confirm(request, dispatch=not tenantcloud)
-    if tenantcloud and result.status is PublicStatus.PENDING and tenantcloud_submitter is not None:
+    routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+    routed = parent_operation in routed_operations and tenantcloud_submitter is not None
+    result = await service.confirm(request, dispatch=not routed)
+    if routed and result.status is PublicStatus.PENDING and tenantcloud_submitter is not None:
         try:
             await tenantcloud_submitter.submit(result.action_id)
         except Exception:
             logger.exception(
-                "TenantCloud Restate submission failed for action %s; CDS sweeper will retry",
+                "Restate delivery submission failed for action %s; CDS sweeper will retry",
                 result.action_id,
             )
     return result
@@ -248,6 +263,7 @@ def create_server(
     *,
     observability: GatewayObservability | None = None,
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None,
+    restate_operations: frozenset[Operation] | None = None,
 ) -> FastMCP:
     mcp = FastMCP(
         "comm-outbound-gateway",
@@ -289,6 +305,7 @@ def create_server(
             policy,
             request,
             tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
         )
 
     @mcp.resource("health://outbound-gateway", name="outbound-gateway-health")
@@ -745,6 +762,7 @@ async def _serve() -> None:
         runtime.policy,
         observability=runtime.observability,
         tenantcloud_submitter=runtime.tenantcloud_submitter,
+        restate_operations=runtime.restate_operations,
     )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
