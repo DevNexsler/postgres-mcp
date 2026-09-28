@@ -123,6 +123,33 @@ def test_loopback_http_health_and_metrics_routes_are_sanitized():
     assert "recipient" not in metrics.text
 
 
+def test_request_on_a_session_the_gateway_does_not_know_is_answered_404():
+    # A gateway restart forgets every MCP session. A client still holding the old
+    # session id must get 404, which the MCP client turns into a "Session
+    # terminated" error for that request so it reconnects and retries. A 400
+    # instead crashes the client's transport and orphans the request: it waits
+    # out the whole tool timeout and never reaches the ledger (#3394).
+    mcp = create_server(AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    with TestClient(mcp.streamable_http_app()) as client:
+        response = client.post(
+            "/mcp",
+            headers={
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+                "mcp-session-id": "0" * 32,
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "outbound_action", "arguments": {"request": {"op": "status"}}},
+            },
+        )
+
+    assert response.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_execute_and_status_delegate_only_after_strict_json_validation():
     service = AsyncMock()
