@@ -77,11 +77,36 @@ class OutboundWorker:
 
     async def _run_isolated(self, action_id: UUID, operation: str) -> None:
         try:
-            if self._tenantcloud_submitter is not None:
-                action = await self._store.get(action_id)
-                if action is not None and action.operation in self._restate_operations:
-                    await self._tenantcloud_submitter.submit(action_id)
+            action = await self._store.get(action_id)
+            if action is not None and action.operation in self._restate_operations:
+                # Restate (delivery_workflow.py's OutboundDeliveryCoordinator)
+                # owns every retry/backoff/ceiling decision for this
+                # operation -- retry_policy.py's one-hour elapsed ceiling,
+                # not this worker's count-based 5/12-attempt cap
+                # (list_work/list_exhausted). Falling through to
+                # self._service.reconcile()/.exhaust() here would drive the
+                # SAME row through the legacy count-based path concurrently
+                # with (and much faster than) the workflow's own ceiling,
+                # landing an unresolved ambiguity in dead_letter/manual_review
+                # in minutes instead of the intended hour -- exactly the
+                # 2026-09-28 cliq.channel.post incident this guard exists
+                # for. A misconfigured submitter (unset
+                # OUTBOUND_TENANTCLOUD_RESTATE_INGRESS_URL on this process
+                # while the flag names the operation) is a deploy error to
+                # surface loudly, never a silent fallback to the old path.
+                if self._tenantcloud_submitter is None:
+                    self._on_error(
+                        action_id,
+                        operation,
+                        RuntimeError(
+                            f"action {action_id} (operation {action.operation.value}) is Restate-flagged "
+                            "but this worker has no tenantcloud_submitter configured; refusing to drive "
+                            "it with the legacy count-based worker"
+                        ),
+                    )
                     return
+                await self._tenantcloud_submitter.submit(action_id)
+                return
             await getattr(self._service, operation)(action_id)
         except Exception as exc:
             logger.error("outbound worker %s failed for action %s", operation, action_id, exc_info=True)

@@ -728,6 +728,13 @@ async def build_runtime() -> GatewayRuntime:
         # (default): never ask, and never send stale -- an action with unshown
         # newer context ends as a `stale_context_unasked` no-send.
         stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
+        # Same union worker.py and tenantcloud_delivery_server.py's
+        # coordinator already use (TENANTCLOUD_OPERATIONS unconditionally,
+        # plus OUTBOUND_RESTATE_OPERATIONS): ActionRecovery.exhaust() needs
+        # this to know which operations the Restate workflow, not a human,
+        # settles at the retry ceiling (recovery.py's plan_exhaust
+        # `restate_flagged`).
+        restate_operations=TENANTCLOUD_OPERATIONS | _restate_operations(),
     )
     return GatewayRuntime(
         pool=pool,
