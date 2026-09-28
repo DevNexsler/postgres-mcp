@@ -206,6 +206,29 @@ def initial_observation(result: McpCallResult, *, effect_call: bool = False) -> 
             evidence={"status": status, "category": category},
         )
     if result.is_error:
+        # `is_error` with no transport error_kind and no queue status means
+        # the MCP session round-tripped fine and the tool itself returned an
+        # error CallToolResult -- e.g. Agent Email's synchronous argument/
+        # schema validation (parseCliqBotToolCall rejecting a CT_* id for
+        # channel_unique_name) rejects before anything is enqueued, so there
+        # is never a "failed"/"lost" status to match above. That is
+        # definitive: the provider looked at this exact request and refused
+        # it, it did not merely fail to answer. On the effect call this
+        # means the send never happened at all. Treating it as merely
+        # AMBIGUOUS (as a transport hiccup would be) meant the gateway
+        # reconciled a request that could never succeed 5 times and parked
+        # it in manual_review with no reason surfaced (2026-09-28). A poll/
+        # reconcile-time tool error (e.g. a bad request_status id) says
+        # nothing about the original send and stays ambiguous.
+        if effect_call and result.error_kind is None:
+            return ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                "provider_rejected_request",
+                provider_request_ref=ref,
+                category="provider_validation",
+                retryable=False,
+                evidence={"kind": "tool_error_result", "provider_message": mcp_text(result) or None},
+            )
         return ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
             "provider_mcp_error",

@@ -596,6 +596,10 @@ async def build_runtime() -> GatewayRuntime:
             "OUTBOUND_CLIQ_TARGETS_JSON",
             {"lead_alert": "tenant-leads", "manual_review_alert": "tenant-leads"},
         ),
+        cliq_channel_unique_names_by_id=_json_mapping(
+            "OUTBOUND_CLIQ_CHANNEL_UNIQUE_NAMES_JSON",
+            {},
+        ),
         property_aliases=_json_mapping(
             "OUTBOUND_PROPERTY_ALIASES_JSON",
             DEFAULT_PROPERTY_ALIASES,
