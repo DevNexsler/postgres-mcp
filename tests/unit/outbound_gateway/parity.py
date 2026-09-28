@@ -468,6 +468,17 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # waiting) row went to dispatch without any preflight look.
     if asked and "store.block_stale_context" not in old:
         return "asked_where_legacy_never_looked"
+    # An internal_notification has no recipient conversation to go stale
+    # against -- it posts to a staff review channel about something that
+    # happened, not a reply to whoever is still texting the wake's own
+    # channel. It now always sends, where the legacy's channel-scoped
+    # newer_context check raised the same question it raises for a
+    # prospect/internal reply (wakes 27313/27314, 2026-09-28: a
+    # manual_review_alert reporting a gateway bug was itself blocked
+    # stale_context, then its confirmed successor exhausted a retry budget
+    # without ever landing).
+    if _call(legacy, "store.block_stale_context") and not asked and "('action_role', 'internal_notification')" in new:
+        return "internal_notification_never_asks_stale_context"
     return None
 
 

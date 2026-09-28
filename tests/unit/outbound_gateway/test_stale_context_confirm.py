@@ -507,6 +507,37 @@ async def test_wake_27164_refusal_is_a_question_with_the_cron_alert_as_new_conte
 
 
 @pytest.mark.asyncio
+async def test_internal_notification_never_asks_the_stale_context_question():
+    """Wakes 27313/27314, 2026-09-28: a manual_review_alert reporting a gateway
+    bug went stale_context, then its confirmed successor exhausted a retry
+    budget without landing -- because it was asked the same "since your
+    context was built, a new message was sent or received; still send?"
+    question the CRON_ALERT/pong scenario above legitimately asks a Cliq DM
+    reply. An internal_notification has no conversation to go stale against:
+    it posts to a staff review channel about something that happened, not a
+    reply to whoever is still texting the wake's own line. It must always
+    send, even with the exact same unshown newer activity that blocks an
+    internal_reply."""
+    service, _store, _probe, adapter = harness(CRON_ALERT)
+    alert = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": WAKE,
+            "action_role": "internal_notification",
+            "operation": "cliq.chat.post",
+            "intent_kind": "manual_review_alert",
+            "arguments": {"text": "calendar.update needs a property this wake does not name", "channel_or_chat_id": CHAT},
+        }
+    )
+    assert isinstance(alert, ExecuteRequest)
+
+    result = await service.execute(alert)
+
+    assert result.status is PublicStatus.SENT
+    assert adapter.sent == ["calendar.update needs a property this wake does not name"]
+
+
+@pytest.mark.asyncio
 async def test_yes_sends_pong_once_through_a_successor_with_staleness_rechecked_at_the_acknowledged_point():
     service, store, probe, adapter = harness(CRON_ALERT)
     await service.execute(execute_request())
@@ -988,6 +1019,12 @@ async def test_implicit_revise_with_a_new_slot_is_refused_not_sent_with_the_old_
 
 @pytest.mark.asyncio
 async def test_implicit_revise_with_another_operation_is_refused():
+    """action_role is prospect_reply, not internal_notification: an
+    internal_notification never blocks on stale_context at all now (an
+    internal alert has no recipient conversation to go stale against --
+    wakes 27313/27314, 2026-09-28), so it can no longer reach this refusal.
+    The mismatch under test (a differing operation is not a legal answer to
+    an open question) is otherwise unrelated to action_role."""
     service, store, _probe, adapter = harness(CRON_ALERT)
 
     def alert(operation):
@@ -995,7 +1032,7 @@ async def test_implicit_revise_with_another_operation_is_refused():
             {
                 "op": "execute",
                 "wakeup_event_id": WAKE,
-                "action_role": "internal_notification",
+                "action_role": "prospect_reply",
                 "operation": operation,
                 "intent_kind": "manual_review_alert",
                 "arguments": {"text": "review this lead", "channel_or_chat_id": CHAT},
