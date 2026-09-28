@@ -22,6 +22,7 @@ from .models import CompletionKind
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
+from .models import RequestRefusedError
 from .state_machine import public_result
 from .tenantcloud_shared import strip_tenantcloud_persisted_argument_keys
 
@@ -182,10 +183,14 @@ class ActionStore(Protocol):
     ) -> OutboundActionRecord: ...
 
 
+class UnknownActionError(RequestRefusedError, LookupError):
+    """The caller named an action_id the gateway has no record of."""
+
+
 async def require_action(store: ActionStore, action_id: UUID) -> OutboundActionRecord:
     action = await store.get(action_id)
     if action is None:
-        raise LookupError(
+        raise UnknownActionError(
             f"outbound action does not exist (action_id {action_id}). Check the action_id: copy it from "
             "the execute result it came from."
         )

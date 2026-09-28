@@ -34,6 +34,7 @@ from .models import MaintenanceCreateArguments
 from .models import MaintenanceStatusArguments
 from .models import Operation
 from .models import QuoSmsArguments
+from .models import RequestRefusedError
 from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
 from .repository import WakeEventRecord
@@ -75,7 +76,7 @@ _ADDRESS_WORDS = {
 }
 
 
-class ContextDerivationError(ValueError):
+class ContextDerivationError(RequestRefusedError):
     pass
 
 
