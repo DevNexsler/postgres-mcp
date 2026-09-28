@@ -253,19 +253,50 @@ def plan_claim_for_final_check(action: OutboundActionRecord) -> Plan:
     return (*steps, Claim(state))  # already reconciling
 
 
-def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None) -> Plan:
+def _ceiling_fail(action: OutboundActionRecord, *, reason: str | None = None) -> ProviderObservation:
+    """The definitive_failed observation a Restate-flagged operation's spent
+    retry budget lands on -- never manual_review (see plan_exhaust's
+    ``restate_flagged`` branch): the workflow already owns this decision
+    (retry_policy.RETRY_CEILING_SECONDS/decide()), so a person is never
+    handed a stray dead_letter row for an operation the workflow itself
+    settles."""
+    evidence: dict[str, Any] = {"kind": "retry_ceiling"}
+    if reason:
+        evidence["reload_error"] = reason
+    return ProviderObservation(
+        ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+        "retry_budget_exhausted",
+        provider_request_ref=action.provider_request_ref,
+        category="retry_budget_exhausted",
+        retryable=False,
+        evidence=evidence,
+    )
+
+
+def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, restate_flagged: bool = False) -> Plan:
     """Close work whose retry budget is spent, without another provider
     invocation: a durable acceptance completes; anything that may already
     be with the provider is parked for a person; a send that never left
     fails definitively; everything else is left as it is. `reason`: the last
     real cause of an ambiguous outcome (a context reload failure), carried
     into the manual_review edge's observation so a person is never handed a
-    bare "retry_budget_exhausted" when a repeated, specific error caused it."""
+    bare "retry_budget_exhausted" when a repeated, specific error caused it.
+
+    `restate_flagged`: True for any operation OutboundDeliveryCoordinator
+    advances (TenantCloud, unconditionally, plus whatever
+    OUTBOUND_RESTATE_OPERATIONS names -- see ActionRecovery's own
+    `restate_operations`). For those operations the Restate workflow +
+    retry_policy.py own every retry/give-up decision, so an outcome nobody
+    could settle -- even after `_final_provider_check`'s one last look --
+    becomes `definitive_failed` (with exactly one staff warning) instead of
+    the legacy worker's dead_letter -> manual_review parking. The legacy
+    (non-flagged) path is unchanged: a human still reviews it."""
     recovered = plan_recover_acceptance(action)
     if recovered is not None:
         return recovered
     exhausted = _ambiguous("retry_budget_exhausted", action, reason=reason)
     review = _ambiguous("retry_budget_exhausted_manual_review", action, reason=reason)
+    ceiling_fail = _ceiling_fail(action, reason=reason)
     state = action.state
     steps: Plan = ()
     if state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
@@ -277,8 +308,26 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None) -> 
             Claim(ActionState.UNKNOWN),
             Transition(ActionState.UNKNOWN, ActionState.RECONCILING, _ambiguous("retry_budget_exhausted_reconciliation", action)),
         )
+        if restate_flagged:
+            return (
+                *steps,
+                Transition(ActionState.RECONCILING, ActionState.RETRY_READY, exhausted),
+                DefinitiveFail(ActionState.RETRY_READY, ceiling_fail),
+            )
         return (*steps, *_dead_letter_for_review(ActionState.RECONCILING, exhausted, review, has_lease=True))
     if state in {ActionState.RECONCILING, ActionState.DEPENDENCY_WAIT}:
+        if restate_flagged and state is ActionState.RECONCILING:
+            # The row is already leased (plan_claim_for_final_check's own
+            # Claim ran before exhaust() got here) -- outbound_action_transition_
+            # allowed has no reconciling -> definitive_failed edge, only
+            # retry_ready -> definitive_failed (the same edge
+            # _final_provider_check's own DEFINITIVE_NON_ACCEPTANCE branch
+            # uses), so take it the same way: one extra leased transition,
+            # no extra Claim (it costs no attempt).
+            return (
+                Transition(state, ActionState.RETRY_READY, exhausted),
+                DefinitiveFail(ActionState.RETRY_READY, ceiling_fail),
+            )
         return _dead_letter_for_review(state, exhausted, review, has_lease=False)
     if state in {ActionState.PREPARED, ActionState.RETRY_READY}:
         return (
@@ -359,6 +408,7 @@ class ActionRecovery:
         clock: Callable[[], datetime],
         actor: str,
         lease_seconds: int,
+        restate_operations: frozenset[Operation] = frozenset(),
     ):
         self._store = store
         self._provider_client = provider_client
@@ -369,6 +419,13 @@ class ActionRecovery:
         self._clock = clock
         self._actor = actor
         self._lease_seconds = lease_seconds
+        # Every operation OutboundDeliveryCoordinator advances (TenantCloud,
+        # unconditionally, plus OUTBOUND_RESTATE_OPERATIONS) -- see
+        # plan_exhaust's `restate_flagged` docstring for why exhaust() needs
+        # this. Empty by default so a caller that never passes it (most
+        # existing tests, and any legacy-only wiring) keeps today's
+        # dead_letter -> manual_review behavior exactly.
+        self._restate_operations = restate_operations
 
     async def _apply(self, action: OutboundActionRecord, plan: Plan) -> OutboundActionRecord:
         return await apply_plan(self._store, action, plan, actor=self._actor, lease_seconds=self._lease_seconds)
@@ -388,7 +445,10 @@ class ActionRecovery:
                 return settled
             action = await require_action(self._store, action_id)
         return action_result(
-            await self._apply(action, plan_exhaust(action, reason=reload_reason)),
+            await self._apply(
+                action,
+                plan_exhaust(action, reason=reload_reason, restate_flagged=action.operation in self._restate_operations),
+            ),
             detail=reload_reason,
         )
 

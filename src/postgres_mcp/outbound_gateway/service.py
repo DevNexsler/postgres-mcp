@@ -150,6 +150,20 @@ def _tenantcloud_no_such_thread_detail(context: ActionContext, observation: Prov
     )
 
 
+def _provider_message_detail(observation: ProviderObservation) -> str | None:
+    """The provider's own rejection text (initial_observation's
+    evidence["provider_message"], e.g. AES's "channel not found or ... not a
+    member" for a permanent_upstream_error job), surfaced as the agent-facing
+    `detail` on a definitive outcome. Without this the agent -- and a
+    Restate-flagged operation's one staff warning -- saw only a bare detail
+    code (`provider_permanent_upstream_error`) and had to go dig up why."""
+    evidence = observation.evidence
+    if not isinstance(evidence, Mapping):
+        return None
+    message = evidence.get("provider_message")
+    return message.strip() if isinstance(message, str) and message.strip() else None
+
+
 class PreflightEvidenceLoader(Protocol):
     async def load(self, context: ActionContext) -> PreflightEvidence: ...
 
@@ -190,6 +204,7 @@ class OutboundActionService:
         traffic_mode: str = "shadow",
         traffic_probe: Any | None = None,
         stale_confirm_enabled: bool = False,
+        restate_operations: frozenset[Operation] = frozenset(),
     ):
         if traffic_mode not in VALID_TRAFFIC_MODES:
             raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
@@ -240,6 +255,7 @@ class OutboundActionService:
             clock=clock,
             actor=lease_owner,
             lease_seconds=lease_seconds,
+            restate_operations=restate_operations,
         )
 
     @property
@@ -686,7 +702,7 @@ class OutboundActionService:
         observation: ProviderObservation,
     ) -> PublicResult:
         expected_state = action.state
-        thread_detail = _tenantcloud_no_such_thread_detail(context, observation)
+        thread_detail = _tenantcloud_no_such_thread_detail(context, observation) or _provider_message_detail(observation)
         if observation.disposition is ProviderDisposition.ACCEPTED:
             receipt = adapter.parse_receipt(context, observation)
             if receipt is None:
