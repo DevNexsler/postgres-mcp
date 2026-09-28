@@ -253,24 +253,45 @@ class OutboundGatewayRepository:
     ) -> list[NewerActivity]:
         """The stale-context question's one query: every message received
         from, or sent by us to, this action's recipient that is not in the
-        agent's context, newest first, at most `limit`. Not in its context: on
-        the wake's own channel, reached CDS (received_at) after the wake's
-        context watermark (hermes_wakeup_events accepted/created time); on
-        any other channel, sent after the message being answered. Never a
-        re-ingest or re-scrape of a message that had reached CDS by the
-        watermark. waive_shown leaves out what this wake's agent was already
-        shown for this recipient (migration 192), by identity.
+        agent's context, newest first, at most `limit`.
 
-        Received: a message in the recipient's conversation that is not ours
-        -- the wake's own channel (a Quo reply only from/to that phone, since a
-        Quo channel is a line), the Zillow relay address across channels, or
-        the same Quo line, conversation and phone across channels.
-        Sent by us: a message to this action's own target on the operation's
-        channel family (an email to the address, a text to the phone, a post
-        in that Cliq chat, a message in that TenantCloud thread), and another
-        wake's gateway send to the same subject that started dispatch.
-        Never this wake's own sends, the source message or its duplicates,
-        certified-older Zillow scrapes, or Nigel's automated cron alerts.
+        Identity-first, channel fallback, in this one place: when CDS has
+        already resolved this wake's own identity (envelope
+        `identity.factbook_entity_uuid`), "newer" is decided per PERSON --
+        any inbound message or outbound gateway send belonging to another
+        wake CDS resolved to the *same* person, whatever its channel,
+        recipient address or source, recorded after this wake's context
+        watermark. A gateway send counts whether or not it has been ingested
+        back as a message yet, and only in a state that means sent or may
+        have been sent (never a definitive failure). Wakes 27331/27332
+        (2026-09-28): one prospect, one Zillow relay email, reached by two
+        sources -- a TenantCloud lead wake whose identity did not resolve
+        (the gap is being closed on the CDS side) and a Zillow wake that did
+        -- so the old per-channel/per-subject match missed the TenantCloud
+        send. When this wake's own identity did not resolve, today's
+        channel-scoped matching is unchanged:
+
+        - on the wake's own channel, reached CDS (received_at) after the
+          wake's context watermark (hermes_wakeup_events accepted/created
+          time); on any other channel, sent after the message being
+          answered. Never a re-ingest or re-scrape of a message that had
+          reached CDS by the watermark.
+        - Received: a message in the recipient's conversation that is not
+          ours -- the wake's own channel (a Quo reply only from/to that
+          phone, since a Quo channel is a line), the Zillow relay address
+          across channels, or the same Quo line, conversation and phone
+          across channels.
+        - Sent by us: a message to this action's own target on the
+          operation's channel family (an email to the address, a text to the
+          phone, a post in that Cliq chat, a message in that TenantCloud
+          thread), and another wake's gateway send to the same subject that
+          started dispatch.
+        - Never this wake's own sends, the source message or its duplicates,
+          certified-older Zillow scrapes, or Nigel's automated cron alerts.
+
+        waive_shown leaves out what this wake's agent was already shown for
+        this recipient (migration 192), by identity (the shown-refs ledger,
+        unrelated to CDS person identity above).
 
         as_of: replay only -- the world as it stood at that time."""
         target = outbound_target(context)
@@ -302,6 +323,27 @@ class OutboundGatewayRepository:
                 SELECT coalesce(event.webui_accepted_at, event.created_at) AS at
                 FROM hermes_wakeup_events AS event, p
                 WHERE event.id = p.wake
+            ), identity AS (
+                -- CDS's own identity resolution for this wake (the same
+                -- envelope the agent reads). When resolved, "newer" is
+                -- decided per PERSON, not per channel or recipient address
+                -- (wakes 27331/27332, 2026-09-28: one prospect, one Zillow
+                -- relay email, two sources -- a TenantCloud lead wake whose
+                -- identity did not resolve, and a Zillow wake that did --
+                -- reached the same recipient by two unrelated paths).
+                SELECT nullif(event.envelope #>> '{{identity,factbook_entity_uuid}}', '') AS entity_uuid
+                FROM hermes_wakeup_events AS event, p
+                WHERE event.id = p.wake
+            ), identity_wakes AS (
+                -- Every OTHER wake CDS resolved to the same person. Unset
+                -- when this wake's own identity did not resolve: today's
+                -- channel/recipient matching is the only fallback then (CDS
+                -- is fixing the TenantCloud-lead identity gap separately).
+                SELECT event.id AS wakeup_event_id, event.message_id
+                FROM hermes_wakeup_events AS event, identity, p
+                WHERE identity.entity_uuid IS NOT NULL
+                  AND event.envelope #>> '{{identity,factbook_entity_uuid}}' = identity.entity_uuid
+                  AND event.id <> p.wake
             ), shown AS (
                 SELECT DISTINCT shown.ref
                 FROM outbound_actions AS action
@@ -351,6 +393,7 @@ class OutboundGatewayRepository:
                 FROM messages AS message
                 CROSS JOIN p
                 CROSS JOIN watermark
+                CROSS JOIN identity
                 LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
                 LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
                 -- received_at is when a message reached CDS. created_at is a
@@ -358,15 +401,33 @@ class OutboundGatewayRepository:
                 -- sent_at is the scraped timestamp, a day before it lands.
                 WHERE (p.as_of IS NULL OR message.received_at <= p.as_of)
                   AND (
-                      -- The wake's own channel is in the agent's context up
-                      -- to the watermark; anything that reached CDS after it
-                      -- is new.
-                      (message.channel_id = p.channel_id AND message.received_at > watermark.at)
-                      -- Other channels are not in its context: anything sent
-                      -- after the message it is answering is new.
+                      (
+                          -- Identity resolved: any other wake CDS resolved to
+                          -- the same person, whatever its channel or source.
+                          identity.entity_uuid IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1 FROM identity_wakes
+                              WHERE identity_wakes.message_id = message.id
+                          )
+                          AND message.received_at > watermark.at
+                      )
                       OR (
-                          message.channel_id IS DISTINCT FROM p.channel_id
-                          AND (message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)
+                          -- No resolved identity: today's channel matching,
+                          -- unchanged.
+                          identity.entity_uuid IS NULL
+                          AND (
+                              -- The wake's own channel is in the agent's
+                              -- context up to the watermark; anything that
+                              -- reached CDS after it is new.
+                              (message.channel_id = p.channel_id AND message.received_at > watermark.at)
+                              -- Other channels are not in its context:
+                              -- anything sent after the message it is
+                              -- answering is new.
+                              OR (
+                                  message.channel_id IS DISTINCT FROM p.channel_id
+                                  AND (message.sent_at, message.id) > (p.source_sent_at, p.source_message_id)
+                              )
+                          )
                       )
                   )
                   AND NOT EXISTS (
@@ -569,8 +630,9 @@ class OutboundGatewayRepository:
                     LIMIT 1
                 ), false)
             ), sent_action AS (
-                -- Another wake's gateway send to this subject that started
-                -- dispatch (it may not be ingested back as a message yet).
+                -- No resolved identity: today's fallback, unchanged -- another
+                -- wake's gateway send to this subject that started dispatch
+                -- (it may not be ingested back as a message yet).
                 SELECT
                     ledger.action_id,
                     ledger.operation,
@@ -579,11 +641,33 @@ class OutboundGatewayRepository:
                 FROM outbound_actions AS ledger
                 CROSS JOIN p
                 CROSS JOIN watermark
-                WHERE ledger.subject_key = p.subject
+                CROSS JOIN identity
+                WHERE identity.entity_uuid IS NULL
+                  AND ledger.subject_key = p.subject
                   AND ledger.wakeup_event_id IS DISTINCT FROM p.wake
                   AND ledger.created_at > watermark.at
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
                   AND (ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed')
+                  AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
+            ), identity_sent AS (
+                -- Identity resolved: any gateway send belonging to another
+                -- wake CDS resolved to the same person -- whatever its
+                -- operation, channel or source -- counts, whether or not it
+                -- has been ingested back as a message yet. Only a state that
+                -- means sent or may have been sent; a definitive failure
+                -- never counts.
+                SELECT
+                    ledger.action_id,
+                    ledger.operation,
+                    ledger.created_at,
+                    left(coalesce(ledger.arguments->>'text', ledger.arguments::text, ''), 300) AS preview
+                FROM outbound_actions AS ledger
+                JOIN identity_wakes ON identity_wakes.wakeup_event_id = ledger.wakeup_event_id
+                CROSS JOIN p
+                CROSS JOIN watermark
+                WHERE ledger.created_at > watermark.at
+                  AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
+                  AND ledger.state = ANY(ARRAY['completed', 'dispatching', 'unknown', 'reconciling', 'provider_accepted'])
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), found AS (
                 SELECT 'message:' || id AS ref, id AS message_id, NULL::uuid AS action_id, created_at,
@@ -593,6 +677,10 @@ class OutboundGatewayRepository:
                 SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
                        'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
                 FROM sent_action
+                UNION
+                SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
+                       'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
+                FROM identity_sent
             )
             SELECT found.*
             FROM found

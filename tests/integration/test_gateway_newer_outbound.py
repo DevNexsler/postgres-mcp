@@ -335,12 +335,104 @@ def build(conn):
     return service, store, adapter
 
 
+IDENTITY_WAKE = 27500
+IDENTITY_DM = "1424728044450751029"
+IDENTITY_SOURCE_AT = datetime(2026, 9, 28, 20, 2, 55, tzinfo=timezone.utc)
+IDENTITY_WATERMARK = datetime(2026, 9, 28, 20, 3, 45, tzinfo=timezone.utc)
+IDENTITY_PROSPECT = "identity-prospect@example.com"
+# Wake 27332's resolved identity (Aimee Tapia), reused verbatim from prod.
+ENTITY_UUID = "4b2d6a38-aa45-4010-9e36-6056d0ce0fd8"
+OTHER_ENTITY_UUID = "11111111-1111-1111-1111-111111111111"
+
+
+async def seed_identity_wake(conn) -> None:
+    """A wake CDS resolved to a person -- the same DM-sourced shape as wake
+    27279, on its own channel, carrying an `identity.factbook_entity_uuid`."""
+    await conn.execute("INSERT INTO channels VALUES (418, %s, 'dm', 'Dan Park (identity)')", (IDENTITY_DM,))
+    await conn.execute("INSERT INTO participants VALUES (1407, 'user', '720844989', 'Dan Park') ON CONFLICT DO NOTHING")
+    payload = {
+        "direction": "inbound",
+        "conversation_id": IDENTITY_DM,
+        "participants": [{"id": "720844989", "name": "Dan Park"}],
+        "provider_ids": {"cliq": IDENTITY_DM, "message": "identity-source-msg", "conversation": IDENTITY_DM},
+    }
+    await conn.execute("INSERT INTO raw_events VALUES (900100, %s)", (Jsonb(payload),))
+    await conn.execute(
+        "INSERT INTO messages VALUES (900100, NULL, 'zoho_cliq', 'identity-source-msg', %s, %s, %s, NULL, "
+        "'reply to Aimee', 'nigel-zoho', 418, 1407, NULL, 900100, 'inbound')",
+        (IDENTITY_SOURCE_AT, IDENTITY_SOURCE_AT, IDENTITY_SOURCE_AT),
+    )
+    envelope = {
+        "message": {
+            "id": 900100,
+            "phone": None,
+            "property": None,
+            "proxy_email": None,
+            "direct_email": None,
+            "prospect_name": None,
+            "sender": {"display_name": "Dan Park", "participant_key": "720844989", "participant_type": "user"},
+        },
+        "identity": {"factbook_entity_uuid": ENTITY_UUID, "link_type": "phone"},
+        "routing_hints": {},
+        "conversation_context": {"nearby_messages": []},
+    }
+    await conn.execute(
+        "INSERT INTO hermes_wakeup_events VALUES (%s, 'zoho_cliq', 'identity-source-msg', %s, %s, 'customer', NULL, 900100, %s, NULL)",
+        (IDENTITY_WAKE, IDENTITY_SOURCE_AT, IDENTITY_WATERMARK, Jsonb(envelope)),
+    )
+
+
+async def insert_identity_wake(conn, wake_id: int, entity_uuid: str | None) -> None:
+    """Another wake's own row: only `envelope.identity.factbook_entity_uuid`
+    matters to identity_wakes -- no message or channel needed."""
+    envelope = {"identity": {"factbook_entity_uuid": entity_uuid}} if entity_uuid else {}
+    await conn.execute(
+        "INSERT INTO hermes_wakeup_events VALUES (%s, 'tenantcloud_api', %s, %s, %s, 'customer', NULL, NULL, %s, NULL)",
+        (wake_id, f"tc-{wake_id}", IDENTITY_SOURCE_AT, IDENTITY_SOURCE_AT, Jsonb(envelope)),
+    )
+
+
+async def insert_ledger_send(
+    conn,
+    action_id: UUID,
+    wake_id: int,
+    *,
+    created_at: datetime,
+    state: str = "completed",
+    subject_key: str = "prospect:someone-unrelated@example.com",
+    operation: str = "tenantcloud.message.send",
+) -> None:
+    """Another wake's own outbound_actions row -- a completely different
+    operation and recipient than the requesting action's, to prove the match
+    is on identity, never on subject_key or the recipient address."""
+    await conn.execute(
+        "INSERT INTO outbound_actions VALUES (%s, %s, 'prospect_reply', %s, %s, %s, %s, '{}', '{}', %s, NULL, NULL, %s)",
+        (action_id, wake_id, operation, state, subject_key, created_at, created_at, f"tc-msg-{action_id}"),
+    )
+
+
+def identity_email_request(text: str = "Following up on Aimee's application.", to_address: str = IDENTITY_PROSPECT) -> ExecuteRequest:
+    parsed = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": IDENTITY_WAKE,
+            "action_role": "prospect_reply",
+            "operation": "email.send",
+            "intent_kind": "inquiry_reply",
+            "arguments": {"to_address": to_address, "text": text, "subject": "Application"},
+        }
+    )
+    assert isinstance(parsed, ExecuteRequest)
+    return parsed
+
+
 @pytest_asyncio.fixture
 async def conn(database):
     async with await psycopg.AsyncConnection.connect(database, autocommit=True) as connection:
         await connection.execute(SCHEMA)
         await seed_wake_27279(connection)
         await seed_quo_wake(connection)
+        await seed_identity_wake(connection)
         yield connection
 
 
@@ -558,3 +650,60 @@ async def test_an_outbound_text_to_another_prospect_on_the_same_line_is_not_this
 
     assert result.status is PublicStatus.SENT, result
     assert adapter.sent == ["Saturday at 9 works, see you then."]
+
+
+@pytest.mark.asyncio
+async def test_the_same_person_on_another_source_is_asked_regardless_of_channel_or_recipient(conn):
+    """Wakes 27331/27332 (2026-09-28): a TenantCloud-sourced wake and a
+    Zillow-sourced wake, resolved to the SAME person, sent to two unrelated
+    addresses. The old per-channel/per-subject match never saw the other
+    wake's send; identity does, regardless of operation or recipient."""
+    other_action = UUID("22222222-2222-2222-2222-222222222222")
+    await insert_identity_wake(conn, 27331, ENTITY_UUID)
+    await insert_ledger_send(conn, other_action, 27331, created_at=IDENTITY_WATERMARK + timedelta(minutes=1))
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(identity_email_request())
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
+    assert [(item.id, item.source) for item in result.new_context] == [(f"action:{other_action}", "outbound_actions")]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_different_person_is_not_asked(conn):
+    other_action = UUID("33333333-3333-3333-3333-333333333333")
+    await insert_identity_wake(conn, 27331, OTHER_ENTITY_UUID)
+    await insert_ledger_send(conn, other_action, 27331, created_at=IDENTITY_WATERMARK + timedelta(minutes=1))
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(identity_email_request())
+
+    assert result.status is PublicStatus.SENT, result
+    assert adapter.sent == ["Following up on Aimee's application."]
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_send_before_the_context_time_is_not_asked(conn):
+    other_action = UUID("44444444-4444-4444-4444-444444444444")
+    await insert_identity_wake(conn, 27331, ENTITY_UUID)
+    await insert_ledger_send(conn, other_action, 27331, created_at=IDENTITY_WATERMARK - timedelta(minutes=1))
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(identity_email_request())
+
+    assert result.status is PublicStatus.SENT, result
+    assert adapter.sent == ["Following up on Aimee's application."]
+
+
+@pytest.mark.asyncio
+async def test_a_definitively_failed_send_does_not_count(conn):
+    other_action = UUID("55555555-5555-5555-5555-555555555555")
+    await insert_identity_wake(conn, 27331, ENTITY_UUID)
+    await insert_ledger_send(conn, other_action, 27331, created_at=IDENTITY_WATERMARK + timedelta(minutes=1), state="definitive_failed")
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(identity_email_request())
+
+    assert result.status is PublicStatus.SENT, result
+    assert adapter.sent == ["Following up on Aimee's application."]
