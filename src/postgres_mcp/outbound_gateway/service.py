@@ -54,6 +54,24 @@ from .traffic_control import in_flight_hold
 
 logger = logging.getLogger(__name__)
 
+_RELOAD_REASON_MAX_CHARS = 300
+
+# _await_dispatch_pending's recheck cadence: short enough that a job which
+# finishes in the first second or two (the common case) is caught quickly,
+# small enough relative to _response_budget_seconds (capped at 29s) to leave
+# several rechecks inside the window.
+_DISPATCH_POLL_INTERVAL_SECONDS = 2.0
+
+
+def _bounded_reload_reason(error: Exception) -> str:
+    """A ContextDerivationError's own message, one line, capped so it never
+    dominates a log line or an attempt's persisted observation. Every raise
+    site (context.py) is a static, developer-authored sentence -- no
+    provider payload or credential ever reaches this string -- but this
+    stays defensive about length and newlines regardless."""
+    text = " ".join(str(error).split())
+    return text[:_RELOAD_REASON_MAX_CHARS] if text else type(error).__name__
+
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
     {
@@ -319,9 +337,9 @@ class OutboundActionService:
             return action_result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
             return action_result(successor)
-        context, context_detail = await self._verified_context(successor)
+        context, context_detail, reason = await self._verified_context(successor)
         if context is None:
-            return action_result(successor, detail=context_detail)
+            return action_result(successor, detail=reason or context_detail)
         return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
 
     async def prepare(self, action_id: UUID) -> PublicResult:
@@ -329,9 +347,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if action.state is not ActionState.RECEIVED or not self._is_due(action):
             return action_result(action)
-        context, context_detail = await self._verified_context(action)
+        context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return action_result(action, detail=context_detail)
+            return action_result(action, detail=reason or context_detail)
         return await self._drive(action, context, dispatch=False)
 
     async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
@@ -459,9 +477,9 @@ class OutboundActionService:
         action = await self._require_action(action_id)
         if not self._is_due(action):
             return action_result(action)
-        context, context_detail = await self._verified_context(action)
+        context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return await self._recovery.manual_review(action, context_detail)
+            return await self._recovery.manual_review(action, context_detail, reason=reason)
         held = await self._hold_in_flight(action, context)
         if held is not None:
             return held
@@ -617,6 +635,8 @@ class OutboundActionService:
                     observation,
                 )
             if observation.disposition is ProviderDisposition.PENDING:
+                observation, dispatching = await self._await_dispatch_pending(dispatching, adapter, observation)
+            if observation.disposition is ProviderDisposition.PENDING:
                 observation = ProviderObservation(
                     ProviderDisposition.AMBIGUOUS,
                     "provider_queue_timeout",
@@ -624,6 +644,39 @@ class OutboundActionService:
                     provider_call_id=observation.provider_call_id,
                 )
         return await self._finish_observation(dispatching, context, adapter, observation)
+
+    async def _await_dispatch_pending(
+        self,
+        dispatching: OutboundActionRecord,
+        adapter: ProviderAdapter,
+        observation: ProviderObservation,
+    ) -> tuple[ProviderObservation, OutboundActionRecord]:
+        """A queued job's first recheck still PENDING is not yet a failure:
+        re-poll on a short interval up to the response budget before
+        `_invoke` calls it `provider_queue_timeout` (wake 27321: the
+        gateway's own timestamps showed `provider_queue_timeout` fired
+        ~0.12s after `provider_request_recorded`, while the agent-email
+        job's write landed ~0.42s later -- one immediate recheck gave up
+        before a queued-but-healthy job had any real chance to answer).
+        Stays inside `_response_budget_seconds` (constructor-capped at 29s)
+        so the MCP tool call itself never times out silently; never
+        re-dispatches, only re-polls the same job."""
+        budget = self._response_budget_seconds
+        waited = 0.0
+        while observation.disposition is ProviderDisposition.PENDING and waited < budget:
+            interval = min(_DISPATCH_POLL_INTERVAL_SECONDS, budget - waited)
+            if interval <= 0:
+                break
+            await self._sleep(interval)
+            waited += interval
+            observation = await adapter.poll(self._provider_client, observation)
+            if observation.provider_request_ref and observation.provider_request_ref != dispatching.provider_request_ref:
+                dispatching = await self._store.record_provider_request(
+                    dispatching.action_id,
+                    self._lease_owner,
+                    observation,
+                )
+        return observation, dispatching
 
     async def _finish_observation(
         self,
@@ -731,7 +784,7 @@ class OutboundActionService:
     async def _verified_context(
         self,
         action: OutboundActionRecord,
-    ) -> tuple[ActionContext | None, str]:
+    ) -> tuple[ActionContext | None, str, str | None]:
         """The context the worker executes an existing action with: the saved
         record of what was asked and derived at execute time (Comm-Data-Store
         migration 206 makes it immutable), never a fresh derivation compared
@@ -739,15 +792,30 @@ class OutboundActionService:
         re-threaded -- and comparing against it parked real sends (wake
         27244). The wake is re-read only for facts the record does not carry
         (the message's source and send time, the property label, aliases),
-        none of which decides who receives what."""
+        none of which decides who receives what.
+
+        A failed reload never discards its own reason (wake 27321: a
+        transient ContextDerivationError parked an in-flight action on
+        `persisted_context_unavailable` with no hint why, and the identical
+        reload succeeded minutes later): the third element is that reload's
+        own bounded message, logged here and handed back for a caller to
+        record on the attempt (recovery.py) or show the agent (`detail`).
+        None on any success."""
         try:
             live = await self._context_loader.load(action.execute_request())
-        except ContextDerivationError:
-            return None, "persisted_context_unavailable"
+        except ContextDerivationError as error:
+            reason = _bounded_reload_reason(error)
+            logger.warning(
+                "context reload failed for action %s (wake %s): %s",
+                action.action_id,
+                action.wakeup_event_id,
+                reason,
+            )
+            return None, "persisted_context_unavailable", reason
         live = self._context_for(action, live)
         if not action.payload_hash:
-            return live, "context_verified"
-        return _recorded_context(action, live), "context_recorded"
+            return live, "context_verified", None
+        return _recorded_context(action, live), "context_recorded", None
 
     @staticmethod
     def _matches_durable_subject_alias_promotion(

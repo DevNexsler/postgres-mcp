@@ -1770,6 +1770,57 @@ async def test_worker_executes_the_saved_record_when_live_context_has_drifted():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_pending_job_is_caught_by_the_poll_window():
+    """wake 27321: the gateway's own timestamps showed provider_queue_timeout
+    firing ~0.12s after dispatch while the provider's own write landed
+    ~0.42s later -- one immediate recheck gave up long before a queued but
+    healthy job had a real chance to answer. A second poll inside the
+    response-budget window now catches it, so the send completes instead of
+    going ambiguous."""
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter(
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+        ProviderObservation(
+            ProviderDisposition.ACCEPTED,
+            "provider_accepted",
+            provider_request_ref="req-1",
+            message_id="mail-1",
+            accepted_at=NOW,
+            evidence={"kind": "provider_message_id"},
+        ),
+    )
+    svc = service(store, adapter)
+
+    result = await svc.resume(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert store.current.state is ActionState.COMPLETED
+    assert [call[0] for call in adapter.calls].count("poll") == 2
+    svc._sleep.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pending_job_still_times_out_only_after_the_poll_window():
+    """A job that never answers inside the window still ends up
+    provider_queue_timeout -- the window is a wait, not an infinite one."""
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter(
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+        ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1"),
+    )
+    svc = service(store, adapter)
+
+    result = await svc.resume(ACTION_ID)
+
+    assert result.status is PublicStatus.UNKNOWN
+    assert result.detail_code == "provider_queue_timeout"
+    assert [call[0] for call in adapter.calls].count("poll") == 2
+    svc._sleep.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
 async def test_worker_accepts_one_way_durable_subject_alias_promotion():
     stored_prospect = "prospect:factbook:stable-id"
     current_prospect = "subject:durable-alias-id"
@@ -1843,12 +1894,12 @@ async def test_worker_accepts_one_way_durable_subject_alias_promotion():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("method", "initial_state"),
-    [("resume", ActionState.PREPARED), ("reconcile", ActionState.UNKNOWN)],
-)
-async def test_worker_terminalizes_context_that_can_no_longer_be_derived(method, initial_state):
-    store = FakeStore(row(initial_state, action_uid=ACTION_UID, payload_hash="a" * 64))
+async def test_worker_terminalizes_context_that_can_no_longer_be_derived():
+    """resume() only ever runs for a pre-dispatch row (dependency_wait /
+    prepared / retry_ready): nothing was sent, so a reload failure parks it
+    for a person straight away -- unlike reconcile() below, there is no
+    in-flight send whose outcome would otherwise be abandoned."""
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID, payload_hash="a" * 64))
     adapter = FakeAdapter()
     loader = AsyncMock()
     loader.load.side_effect = ContextDerivationError("wakeup event does not exist")
@@ -1863,12 +1914,126 @@ async def test_worker_terminalizes_context_that_can_no_longer_be_derived(method,
         lease_owner="gateway-test",
     )
 
-    result = await getattr(gateway, method)(ACTION_ID)
+    result = await gateway.resume(ACTION_ID)
 
     assert result.status is PublicStatus.MANUAL_REVIEW
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+    assert result.detail == "wakeup event does not exist"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retries_a_reload_failure_on_an_unknown_action_instead_of_parking():
+    """wake 27321: action 497fcaf8 went dispatching -> provider_queue_timeout
+    -> unknown, then a transient ContextDerivationError on the very next
+    reconcile parked it manual_review/persisted_context_unavailable -- with
+    the provider's own outcome still unconfirmed. A reload failure on an
+    action reconcile() only ever sees in UNKNOWN state (dispatched, outcome
+    unconfirmed) must retry on the ordinary schedule, never park immediately
+    -- exhaust() (once the retry budget is actually spent) is what may
+    finally end this in manual_review, not reconcile()."""
+    store = FakeStore(row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref=None, payload_hash="a" * 64))
+    adapter = FakeAdapter()
+    loader = AsyncMock()
+    loader.load.side_effect = ContextDerivationError("wakeup event does not exist")
+    proof_loader = AsyncMock()
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    result = await gateway.reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.UNKNOWN
+    assert store.current.state is ActionState.UNKNOWN
+    assert adapter.calls == []
+    assert not any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
+    assert not any(call[0] == "transition" and call[2] is ActionState.MANUAL_REVIEW for call in store.calls)
+    assert [call[0] for call in store.calls] == ["claim", "schedule"]
+    assert result.detail == "wakeup event does not exist"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_continues_normally_once_the_reload_succeeds():
+    """The retry is not a dead end: once the identical transient failure
+    resolves (the next reload succeeds, as it did minutes later for wake
+    27321's own action), the ordinary reconcile path runs to completion --
+    it does not keep retrying forever, and it never re-dispatches."""
+    store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref=None))
+    settled = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "email_reconciled_by_message_id",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=NOW,
+        evidence={"kind": "exact_message_id"},
+    )
+    adapter = FakeAdapter(settled)
+    loader = AsyncMock()
+    loader.load.side_effect = [ContextDerivationError("wakeup event does not exist"), context()]
+    proof_loader = AsyncMock()
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        # A fixed clock past the retry's short backoff so the second
+        # reconcile() call is due -- FakeStore.schedule_next_attempt always
+        # anchors the delay off the module's own NOW.
+        clock=lambda: NOW + timedelta(seconds=10),
+        lease_owner="gateway-test",
+    )
+
+    first = await gateway.reconcile(ACTION_ID)
+    assert first.status is PublicStatus.UNKNOWN
+    assert [call[0] for call in store.calls] == ["claim", "schedule"]
+    assert adapter.calls == []
+
+    result = await gateway.reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.SENT
+    assert store.current.state is ActionState.COMPLETED
+    assert adapter.calls == [("reconcile",)]
+    assert not any(call[0] == "build" for call in adapter.calls)
+
+
+@pytest.mark.asyncio
+async def test_exhaust_parks_in_manual_review_carrying_the_real_reload_reason():
+    """Only once the retry budget is actually spent (exhaust(), which the
+    worker calls in place of reconcile() past list_exhausted's threshold --
+    never reconcile() itself) does a repeated reload failure end in
+    manual_review, and it carries the real cause instead of a bare
+    retry_budget_exhausted with no hint why."""
+    store = FakeStore(
+        row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref=None, payload_hash="a" * 64, attempt_count=5)
+    )
+    adapter = FakeAdapter()
+    loader = AsyncMock()
+    loader.load.side_effect = ContextDerivationError("wakeup event does not exist")
+    proof_loader = AsyncMock()
+    gateway = OutboundActionService(
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof_loader,
+        adapters={Operation.EMAIL_SEND: adapter},
+        provider_client=object(),
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+    )
+
+    result = await gateway.exhaust(ACTION_ID)
+
+    assert result.status is PublicStatus.MANUAL_REVIEW
+    assert store.current.state is ActionState.MANUAL_REVIEW
+    assert adapter.calls == []
+    assert result.detail == "wakeup event does not exist"
 
 
 def _accepted_observation() -> ProviderObservation:
@@ -2461,7 +2626,33 @@ async def test_a_dispatched_send_is_settled_by_its_provider_job_before_the_conte
 
 @pytest.mark.asyncio
 async def test_a_job_still_running_is_looked_at_again_not_parked():
+    """PENDING is not a failure: it is rescheduled on the pending-wait
+    ladder with no claim() (no attempt spent), so a job that is merely slow
+    never burns toward the ordinary 5-attempt exhaustion budget the way a
+    real ambiguous/failed outcome does."""
     store = FakeStore(_identity_matched_row(ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1"))
+    running = ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1")
+    adapter = FakeAdapter(outcome_polls=[running])
+
+    result = await service(store, adapter).reconcile(ACTION_ID)
+
+    assert result.status is PublicStatus.UNKNOWN
+    assert store.current.state is ActionState.UNKNOWN
+    assert [call[0] for call in store.calls] == ["schedule"]
+
+
+@pytest.mark.asyncio
+async def test_pending_wait_past_its_ceiling_rejoins_the_ordinary_retry_budget():
+    """The several-hour ceiling is a safety net, not an escape hatch: a job
+    still PENDING long after it should plausibly still be running rejoins
+    the ordinary claim()-then-schedule path, so it still eventually reaches
+    a person instead of waiting on the pending ladder forever."""
+    old_created_at = NOW - timedelta(hours=7)
+    store = FakeStore(
+        _identity_matched_row(
+            ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1", created_at=old_created_at
+        )
+    )
     running = ProviderObservation(ProviderDisposition.PENDING, "provider_pending", provider_request_ref="req-1")
     adapter = FakeAdapter(outcome_polls=[running])
 

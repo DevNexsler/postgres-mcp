@@ -518,3 +518,27 @@ def tenantcloud_auth_wait_seconds(elapsed_seconds: float) -> int:
     TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS."""
     tier = max(0, int(elapsed_seconds // TENANTCLOUD_AUTH_WAIT_STEP_SECONDS))
     return min(TENANTCLOUD_AUTH_WAIT_MAX_SECONDS, TENANTCLOUD_AUTH_WAIT_BASE_SECONDS * (tier + 1))
+
+
+# A provider job reconcile finds still PENDING ("did job X finish?" ->
+# "still running") is not a failure, so it must not burn the ordinary
+# 5-attempt retry budget the way an actual ambiguous/failed outcome does
+# (wake 27321's own dispatch-time timing showed a queued job finishing well
+# inside a second; a job that is merely slow, not stuck, should never reach
+# manual_review just because the worker happened to look 5 times). Same
+# shape as the TenantCloud auth wait: schedule without claim() so no attempt
+# is spent, stepped up over a several-hour ceiling well past any real
+# provider queue depth seen so far -- past it the row rejoins the ordinary
+# retry/exhaust path, so a genuinely stuck job still reaches a person.
+PROVIDER_PENDING_WAIT_BASE_SECONDS = 30
+PROVIDER_PENDING_WAIT_MAX_SECONDS = 600
+PROVIDER_PENDING_WAIT_STEP_SECONDS = 300
+PROVIDER_PENDING_WAIT_CEILING_SECONDS = 6 * 3600
+
+
+def provider_pending_wait_seconds(elapsed_seconds: float) -> int:
+    """30s for the first 5 minutes of a still-pending job, then a step up
+    every 5 minutes, capped at 10 minutes. Call only while elapsed_seconds is
+    under PROVIDER_PENDING_WAIT_CEILING_SECONDS."""
+    tier = max(0, int(elapsed_seconds // PROVIDER_PENDING_WAIT_STEP_SECONDS))
+    return min(PROVIDER_PENDING_WAIT_MAX_SECONDS, PROVIDER_PENDING_WAIT_BASE_SECONDS * (tier + 1))

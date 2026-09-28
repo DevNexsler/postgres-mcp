@@ -406,6 +406,15 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # retry_ready row.
     if _call(current, "store.schedule_next_attempt") and "tenantcloud_auth_wait" in new:
         return "tenantcloud_auth_wait_skips_the_retry_budget"
+    # FIX 4 (wake 27321): a dispatch-time poll still PENDING after the first
+    # immediate recheck now gets re-polled on a short window (up to the
+    # response budget) instead of becoming provider_queue_timeout on the
+    # spot -- the gateway's own timestamps showed the timeout firing ~0.12s
+    # after dispatch while the provider's write landed ~0.42s later. The
+    # extra adapter.poll call is the first observable sign; the legacy's own
+    # remaining trace for this call still shows the immediate timeout.
+    if _call(current, "adapter.poll") and "provider_queue_timeout" in old:
+        return "dispatch_pending_gets_a_poll_window"
     # The override resend of a legacy traffic_blocked row needed the terminal
     # block that no longer exists.
     if _call(legacy, "store.remediate_traffic_block"):
