@@ -35,6 +35,8 @@ from .adapters.tenantcloud import TenantCloudAdapter
 from .context import ACTION_NAMESPACE
 from .context import ActionContextLoader
 from .context import RoutingPolicy
+from .delivery_workflow import RestateWorkflowSubmitter
+from .delivery_workflow import SecretAuthGate
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
@@ -53,8 +55,6 @@ from .provider_client import McpServerConfig
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
-from .tenantcloud_delivery import RestateWorkflowSubmitter
-from .tenantcloud_delivery import TenantCloudAuthGate
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 from .worker import OutboundWorker
@@ -507,7 +507,7 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
     return TenantCloudAdapter(mutations_factory=build_mutations)
 
 
-def build_tenantcloud_auth_gate() -> TenantCloudAuthGate:
+def build_tenantcloud_auth_gate() -> SecretAuthGate:
     """Build same scoped auth path used by TenantCloud provider writes."""
     _reject_tenantcloud_origin_overrides()
     control_url = os.environ.get("TENANTCLOUD_RUNNER_CONTROL_URL", "").strip()
@@ -526,7 +526,7 @@ def build_tenantcloud_auth_gate() -> TenantCloudAuthGate:
             profile_access=False,
         )
 
-    return TenantCloudAuthGate(
+    return SecretAuthGate(
         factory,
         login_required_errors=(auth_module.TenantCloudLoginRequiredError,),
         transport_errors=(auth_module.TenantCloudAuthTransportError,),

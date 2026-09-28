@@ -8,6 +8,7 @@ from postgres_mcp.outbound_gateway import retry_policy
 from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation
 from postgres_mcp.outbound_gateway.adapters.base import initial_observation
+from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.provider_client import McpCallResult
 
 
@@ -165,8 +166,9 @@ def test_decide_for_observation_retries_an_ambiguous_observation() -> None:
 async def test_noop_staff_warning_port_warns_at_most_once_per_action(caplog: pytest.LogCaptureFixture) -> None:
     port = retry_policy.NoopStaffWarningPort()
     action_id = UUID("11111111-1111-1111-1111-111111111111")
+    kwargs = dict(wakeup_event_id=27000, operation=Operation.QUO_SMS_SEND, recipient="+15555550100")
     with caplog.at_level("WARNING"):
-        await port.warn_once(action_id, None, "retry_budget_exhausted")
-        await port.warn_once(action_id, None, "retry_budget_exhausted")
+        await port.warn_once(action_id, None, "retry_budget_exhausted", **kwargs)
+        await port.warn_once(action_id, None, "retry_budget_exhausted", **kwargs)
     warnings = [record for record in caplog.records if "no Cliq warning was sent" in record.getMessage()]
     assert len(warnings) == 1

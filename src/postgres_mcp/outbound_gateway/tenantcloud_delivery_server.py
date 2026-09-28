@@ -16,22 +16,28 @@ import os
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
+from .delivery_workflow import OutboundDeliveryCoordinator
+from .delivery_workflow import build_restate_app
 from .server import _restate_operations
 from .server import build_runtime
 from .server import build_tenantcloud_auth_gate
-from .tenantcloud_delivery import TenantCloudDeliveryCoordinator
-from .tenantcloud_delivery import build_restate_app
+from .staff_warning import DEFAULT_STAFF_WARNING_CHANNEL
+from .staff_warning import CliqStaffWarningPort
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 
 async def _serve() -> None:
     runtime = await build_runtime()
-    coordinator = TenantCloudDeliveryCoordinator(
+    coordinator = OutboundDeliveryCoordinator(
         store=runtime.store,
         service=runtime.service,
         auth=build_tenantcloud_auth_gate(),
         max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
         operations=TENANTCLOUD_OPERATIONS | _restate_operations(),
+        staff_warning=CliqStaffWarningPort(
+            runtime.service,
+            target_channel=os.environ.get("OUTBOUND_STAFF_WARNING_CHANNEL", DEFAULT_STAFF_WARNING_CHANNEL),
+        ),
     )
     config = Config()
     config.bind = [

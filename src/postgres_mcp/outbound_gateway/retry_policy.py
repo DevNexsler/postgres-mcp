@@ -42,6 +42,7 @@ from uuid import UUID
 
 from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
+from .models import Operation
 
 # Exponential backoff between ordinary retry attempts: base 5s, doubling,
 # capped at 5 minutes per step. Matches metrics.bounded_backoff_seconds'
@@ -175,19 +176,32 @@ def decide_for_observation(
 
 class StaffWarningPort(Protocol):
     """Exactly-one-warning seam for a definitively-failed action. A real
-    implementation posts through the existing internal-notification path
-    (``action_role=internal_notification``, ``intent_kind=manual_review_alert``,
-    ``cliq.channel.post`` -- see context.py:908 and server.py's
-    OUTBOUND_CLIQ_TARGETS_JSON "manual_review_alert" entry) keyed so a
-    replay of the same action_id can never send a second warning.
+    implementation (``staff_warning.CliqStaffWarningPort``) posts through the
+    existing internal-notification path (``action_role=internal_notification``,
+    ``intent_kind=manual_review_alert``, ``cliq.channel.post`` -- see
+    context.py:908 and server.py's OUTBOUND_CLIQ_TARGETS_JSON
+    "manual_review_alert" entry), keyed so a replay of the same action_id can
+    never send a second warning, and never recurses (see that module's
+    docstring for why).
 
-    NOT wired to a live sender in this change -- see the worklog note in the
-    PR description. ``warn_once`` must be idempotent on ``action_id`` alone:
-    callers may call it more than once for the same action (a Restate
-    workflow replay, or a worker.py re-poll of the same exhausted row).
+    ``warn_once`` must be idempotent on ``action_id`` alone: callers may call
+    it more than once for the same action (a Restate workflow replay, or a
+    worker.py re-poll of the same exhausted row). ``wakeup_event_id``,
+    ``operation`` and ``recipient`` are the context the warning text names,
+    per the migration brief -- the failed action's own wake, operation, and
+    best-effort recipient, not the coordinator's.
     """
 
-    async def warn_once(self, action_id: UUID, action_uid: UUID | None, reason: str) -> None: ...
+    async def warn_once(
+        self,
+        action_id: UUID,
+        action_uid: UUID | None,
+        reason: str,
+        *,
+        wakeup_event_id: int,
+        operation: Operation,
+        recipient: str,
+    ) -> None: ...
 
 
 class NoopStaffWarningPort:
@@ -199,15 +213,27 @@ class NoopStaffWarningPort:
     def __init__(self) -> None:
         self._warned: set[UUID] = set()
 
-    async def warn_once(self, action_id: UUID, action_uid: UUID | None, reason: str) -> None:
+    async def warn_once(
+        self,
+        action_id: UUID,
+        action_uid: UUID | None,
+        reason: str,
+        *,
+        wakeup_event_id: int,
+        operation: Operation,
+        recipient: str,
+    ) -> None:
         if action_id in self._warned:
             return
         self._warned.add(action_id)
         import logging
 
         logging.getLogger(__name__).warning(
-            "outbound action %s definitively failed (%s) but no StaffWarningPort is configured; "
-            "no Cliq warning was sent",
+            "outbound action %s (wake %s, operation %s, recipient %s) definitively failed (%s) but no "
+            "StaffWarningPort is configured; no Cliq warning was sent",
             action_id,
+            wakeup_event_id,
+            operation,
+            recipient,
             reason,
         )
