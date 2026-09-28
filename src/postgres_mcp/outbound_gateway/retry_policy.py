@@ -40,6 +40,9 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from .adapters.base import ProviderDisposition
+from .adapters.base import ProviderObservation
+
 # Exponential backoff between ordinary retry attempts: base 5s, doubling,
 # capped at 5 minutes per step. Matches metrics.bounded_backoff_seconds'
 # shape (this module intentionally does not import that one -- it is the
@@ -89,6 +92,18 @@ def should_wait_for_context_reload(
     return detail_code in CONTEXT_RELOAD_WAIT_DETAILS and not ceiling_exceeded(elapsed_seconds, ceiling_seconds=ceiling_seconds)
 
 
+def is_definitive_rejection(observation: ProviderObservation) -> bool:
+    """The one place this policy reads "was this a definitive rejection?" --
+    reusing each adapter's own classification (``adapters.base.initial_observation``:
+    a synchronous tool-level refusal, e.g. Cliq's ``provider_rejected_request``
+    for a malformed target -- PR #59, 2026-09-28) rather than re-deriving it
+    from raw provider payloads a second time. ``retryable`` is read too: an
+    adapter marking a DEFINITIVE_NON_ACCEPTANCE observation retryable (none
+    do today) would mean "definitive, but worth one more look" and must not
+    stop the workflow outright."""
+    return observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE and not observation.retryable
+
+
 class RetryOutcome(StrEnum):
     """What the coordinator should do with an advance() step's result."""
 
@@ -133,6 +148,29 @@ def decide(
     if ceiling_exceeded(elapsed_seconds, ceiling_seconds=ceiling_seconds):
         return RetryDecision(RetryOutcome.STOP_DEFINITIVE, warn_staff=True)
     return RetryDecision(RetryOutcome.RETRY, wait_seconds=backoff_seconds(attempt_count))
+
+
+def decide_for_observation(
+    *,
+    attempt_count: int,
+    elapsed_seconds: float,
+    observation: ProviderObservation,
+    ceiling_seconds: int = RETRY_CEILING_SECONDS,
+) -> RetryDecision:
+    """``decide()`` for a caller that already has the adapter's
+    ``ProviderObservation`` in hand (e.g. after ``adapter.invoke()`` /
+    ``adapter.reconcile()``) -- reads the definitive-vs-transient call off it
+    via ``is_definitive_rejection`` instead of asking the caller to compute
+    that bool itself, so every caller reuses the exact same adapter-level
+    signal (Cliq's ``provider_rejected_request``, PR #59; TenantCloud's own
+    facade classification; etc.) with no second copy of the judgment."""
+    return decide(
+        attempt_count=attempt_count,
+        elapsed_seconds=elapsed_seconds,
+        detail_code=observation.detail_code,
+        is_definitive=is_definitive_rejection(observation),
+        ceiling_seconds=ceiling_seconds,
+    )
 
 
 class StaffWarningPort(Protocol):
