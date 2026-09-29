@@ -310,6 +310,26 @@ class PostgresActionStore:
             evidence_kind = None
             evidence_reference = None
             evidence_hash = None
+            if observation.evidence and next_state is not ActionState.PROVIDER_ACCEPTED:
+                # _observation() only ever keeps detail_code/disposition --
+                # everything else on a ProviderObservation (recovery.py's
+                # `_ambiguous`/`_ceiling_fail` attach `evidence={"reload_error":
+                # reason}` for exactly this: a context reload failure's own
+                # bounded message) used to be silently dropped for every
+                # ordinary transition (dead_letter, manual_review, the
+                # ambiguous UNKNOWN/RECONCILING steps): actions
+                # ddc5a0d8/497fcaf8 (2026-09-28) both parked with an empty
+                # `uncertainty_reason` despite `_verified_context()` always
+                # computing a non-empty reason. Neither `authoritative` nor
+                # `verified_readback` applies here (those have their own,
+                # separately-guarded evidence columns), so it is safe to
+                # carry it straight through in p_observation -- except a
+                # PROVIDER_ACCEPTED transition without the verified-readback
+                # shape, which must leave its evidence columns (and
+                # p_observation) exactly as bare as before
+                # (test_transition_to_provider_accepted_without_readback_shape_leaves_evidence_columns_unset).
+                sanitized = dict(sanitized)
+                sanitized["evidence"] = dict(observation.evidence)
         return await self._one(
             """
             SELECT * FROM transition_outbound_action(

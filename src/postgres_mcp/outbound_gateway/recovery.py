@@ -528,7 +528,7 @@ class ActionRecovery:
             return answered
         context, context_detail, reason = await self._verified_context(action)
         if context is None:
-            return await self._reload_retry(action, context_detail, reason)
+            return await self.reload_retry(action, context_detail, reason)
         adapter = self._adapter_for(context.operation)
         reconciling = await self._apply(action, plan_start_reconciliation(action))
         if reconciling.action_uid is None:
@@ -545,7 +545,7 @@ class ActionRecovery:
         )
         return await self._finish_observation(reconciling, context, adapter, observation)
 
-    async def _reload_retry(self, action: OutboundActionRecord, detail_code: str, reason: str | None) -> PublicResult:
+    async def reload_retry(self, action: OutboundActionRecord, detail_code: str, reason: str | None) -> PublicResult:
         """A context reload failure never parks an in-flight/unknown-outcome
         action straight to manual_review (wake 27321: a provider_queue_timeout
         action went to manual_review/persisted_context_unavailable on one
@@ -555,8 +555,28 @@ class ActionRecovery:
         retry/backoff machinery (schedule_next_attempt via _schedule) every
         other ambiguous outcome already uses, and let this cycle's
         _provider_outcome() poll run again first next time -- never
-        re-dispatch. Once the caller's own retry budget is spent, list_work
-        stops handing this action to reconcile() and the worker calls
+        re-dispatch.
+
+        Public (not ``_reload_retry``): ``service.py``'s ``resume()`` calls
+        this directly for a Restate-flagged operation's own reload failure
+        (actions ddc5a0d8/497fcaf8, 2026-09-28, calendar.update) -- the same
+        wake-27321 failure class this method exists for, but reached from
+        resume()'s ``PREPARED``/``RETRY_READY``/``DEPENDENCY_WAIT`` branch
+        instead of reconcile()'s ``UNKNOWN`` one, which used to call
+        ``self._recovery.manual_review()`` unconditionally with no wait at
+        all: an ambiguous, still-possibly-in-flight action got parked
+        irrevocably a few hundred milliseconds after being prepared, before
+        the Restate coordinator's own elapsed-time ceiling
+        (retry_policy.RETRY_CEILING_SECONDS) ever had a chance to run out.
+        For a Restate-flagged operation, resume() never calls
+        ``manual_review()`` at all any more: once the coordinator's own
+        ceiling is exceeded it stops calling resume() and calls exhaust()
+        instead (delivery_workflow.OutboundDeliveryCoordinator.advance()),
+        whose plan_exhaust() already ends PREPARED/RETRY_READY in
+        `definitive_failed` with the coordinator's existing one-time staff
+        warning -- never a silent dead end. Once the caller's own retry
+        budget is spent, list_work stops handing this action to
+        reconcile() and the worker calls
         exhaust() instead, whose own final provider check + plan_exhaust
         parks it in manual_review carrying this same reason."""
         claimed = await self._apply(action, (Claim(action.state),))
