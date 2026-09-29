@@ -502,6 +502,30 @@ class OutboundActionService:
             return action_result(action)
         context, context_detail, reason = await self._verified_context(action)
         if context is None:
+            if action.operation in self._restate_operations:
+                # Restate (delivery_workflow.OutboundDeliveryCoordinator) owns
+                # every retry/backoff/ceiling decision for this operation --
+                # it only ever calls resume() while its own elapsed-time
+                # ceiling has NOT yet passed (retry_policy.RETRY_CEILING_SECONDS),
+                # switching to exhaust() once it has. Parking straight to
+                # manual_review() here -- unconditionally, with no wait --
+                # used to end an ambiguous, still-possibly-in-flight action
+                # (actions ddc5a0d8/497fcaf8, 2026-09-28, calendar.update: a
+                # transient reload failure parked the row in manual_review a
+                # few hundred milliseconds after prepare(), and the identical
+                # reload succeeded minutes later) irrevocably, WELL inside
+                # the ceiling the coordinator's own wait logic
+                # (delivery_workflow.py's `_CONTEXT_WAIT_DETAILS` check)
+                # exists to honor -- by the time that check ran, the row was
+                # already committed to a terminal state and the wait
+                # decision no longer mattered. Retry it the same way
+                # reconcile() already does for the exact same failure class
+                # (wake 27321): spend one attempt and let the next cycle
+                # reload again. Once the ceiling passes, the coordinator
+                # calls exhaust() instead of resume(), and plan_exhaust()
+                # already ends this in `definitive_failed` with exactly one
+                # staff warning -- never a silent dead end.
+                return await self._recovery.reload_retry(action, context_detail, reason)
             return await self._recovery.manual_review(action, context_detail, reason=reason)
         held = await self._hold_in_flight(action, context)
         if held is not None:

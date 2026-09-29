@@ -52,6 +52,7 @@ docstrings.
 
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -68,6 +69,7 @@ from postgres_mcp.outbound_gateway.adapters.email import EmailAdapter
 from postgres_mcp.outbound_gateway.adapters.quo import QuoSmsAdapter
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
 from postgres_mcp.outbound_gateway.context import ActionContext
+from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.delivery_workflow import AuthResult
 from postgres_mcp.outbound_gateway.delivery_workflow import AuthState
@@ -1384,3 +1386,115 @@ async def test_tenantcloud_maintenance_status_ambiguous_forever_reinvokes_safely
     # produced before the fix.
     reinvokes = [call[0] for call in facade.calls].count("update_maintenance_status")
     assert 1 < reinvokes < 30, reinvokes
+
+
+# ==========================================================================
+# resume()'s own context-reload failure (PREPARED -> dispatch), a Restate-
+# flagged operation -- distinct from prepare()'s RECEIVED-only reload wait
+# this matrix's other calendar cases exercise. Actions ddc5a0d8/497fcaf8
+# (2026-09-28, calendar.update, live prod): a transient
+# `persisted_context_unavailable` reload failure inside resume() used to go
+# straight to `self._recovery.manual_review()` -- one Claim + two Transitions
+# (PREPARED -> dead_letter -> manual_review) with no wait and no retry at
+# all, well inside retry_policy.RETRY_CEILING_SECONDS, even though the
+# identical reload succeeded minutes later on both real actions. RED on
+# a8e2492 for both cases below: resume() had no branch that ever called
+# ActionRecovery.reload_retry()/rescheduled instead of parking.
+# ==========================================================================
+
+
+def _resume_reload_service(
+    store: FakeStore,
+    context_loader: Any,
+    provider_client: Any,
+    clock: FakeClock,
+) -> OutboundActionService:
+    evidence_loader = AsyncMock()
+    evidence_loader.load.return_value = object()
+    return OutboundActionService(
+        store=store,
+        context_loader=context_loader,
+        evidence_loader=evidence_loader,
+        adapters={Operation.CALENDAR_UPDATE: calendar_adapter()},
+        provider_client=provider_client,
+        clock=clock,
+        lease_owner="outbound-gateway-test",
+        response_budget_seconds=6,
+        lease_seconds=60,
+        sleep=AsyncMock(),
+        traffic_mode="off",
+        restate_operations=frozenset({Operation.CALENDAR_UPDATE}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_calendar_resume_context_reload_transient_failure_then_succeeds_no_warning():
+    """The first reload resume() attempts fails once (ContextDerivationError,
+    the same "wakeup event does not exist" shape service.py's
+    _verified_context bounds and logs), the next one succeeds: this must
+    retry and complete with a receipt, never touching manual_review, and
+    never warning staff."""
+    record = dataclass_replace(cal_update_record(), state=ActionState.PREPARED, action_uid=ACTION_UID)
+    store = FakeStore(record)
+    clock = FakeClock(CREATED_AT)
+    context_loader = AsyncMock()
+    context_loader.load.side_effect = [
+        ContextDerivationError("wakeup event does not exist (wakeup_event_id 27400)"),
+        cal_update_context(),
+    ]
+    client = ScriptThenRepeatClient(
+        pending(),
+        McpCallResult(
+            structured_content={
+                "status": "completed",
+                "request_id": "req-matrix-1",
+                "result": {
+                    "tool_name": "calendar_update_event",
+                    "structured_content": {
+                        "status": "success",
+                        "data": {"content": [{"type": "text", "text": "**Event Updated**\nUID: existing-event"}]},
+                    },
+                },
+            }
+        ),
+    )
+    service = _resume_reload_service(store, context_loader, client, clock)
+    staff_warning = RecordingStaffWarningPort()
+    coordinator = build_coordinator(store, service, clock, staff_warning, Operation.CALENDAR_UPDATE)
+
+    result = await drive(coordinator, CAL_UPDATE_ID, clock)
+
+    assert result.phase is DeliveryPhase.COMPLETE
+    assert store.current.state is ActionState.COMPLETED
+    assert staff_warning.calls == []
+    assert context_loader.load.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_calendar_resume_context_reload_always_fails_reaches_ceiling_definitive_failed_one_warning():
+    """The reload never succeeds: this must retry (never manual_review) up
+    to the ceiling, then end definitive_failed with exactly one staff
+    warning -- and must never invoke the provider, since a context that
+    never loads can never build a request."""
+    record = dataclass_replace(cal_update_record(), state=ActionState.PREPARED, action_uid=ACTION_UID)
+    store = FakeStore(record)
+    clock = FakeClock(CREATED_AT)
+    context_loader = AsyncMock()
+    context_loader.load.side_effect = ContextDerivationError("wakeup event does not exist (wakeup_event_id 27400)")
+    client = AsyncMock()
+
+    async def _never(*_args, **_kwargs):
+        raise AssertionError("the provider must never be called while the context reload never succeeds")
+
+    client.call.side_effect = _never
+    service = _resume_reload_service(store, context_loader, client, clock)
+    staff_warning = RecordingStaffWarningPort()
+    coordinator = build_coordinator(store, service, clock, staff_warning, Operation.CALENDAR_UPDATE)
+
+    result = await drive(coordinator, CAL_UPDATE_ID, clock)
+
+    assert result.phase is DeliveryPhase.TERMINAL
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert (clock.now - CREATED_AT).total_seconds() >= RETRY_CEILING_SECONDS
+    assert len(staff_warning.calls) == 1
+    client.call.assert_not_called()
