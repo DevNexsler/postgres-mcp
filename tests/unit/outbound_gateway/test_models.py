@@ -780,6 +780,36 @@ def test_a_stored_action_with_old_emoji_text_still_rebuilds_so_it_can_settle():
     assert "\U0001f98a" not in ExecuteRequest.model_validate(raw).arguments.text
 
 
+def test_a_tenantcloud_message_is_accepted_up_to_1000_characters_and_refused_past_it():
+    from postgres_mcp.outbound_gateway.models import TenantCloudMessageArguments
+
+    assert len(TenantCloudMessageArguments(thread_id=1, text="x" * 1000).text) == 1000
+    with pytest.raises(ValidationError, match="text is 1001 characters; a TenantCloud message can be at most 1000 characters"):
+        TenantCloudMessageArguments(thread_id=1, text="x" * 1001)
+
+
+def test_the_limit_is_counted_after_emoji_are_removed():
+    from postgres_mcp.outbound_gateway.models import TenantCloudMessageArguments
+
+    text = "x" * 999 + " \U0001f600"
+    assert TenantCloudMessageArguments(thread_id=1, text=text).text == "x" * 999
+
+
+def test_a_stored_over_long_message_still_rebuilds_so_it_can_settle():
+    """Five sends of 1025-1227 characters were stored before the limit and
+    failed definitively; reading them back must not raise."""
+    from postgres_mcp.outbound_gateway.models import STORED_ACTION_CONTEXT
+
+    raw = {
+        "op": "execute", "wakeup_event_id": 27426, "action_role": "prospect_reply",
+        "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+        "arguments": {"thread_id": 2076062, "text": "x" * 1031},
+    }
+    assert len(ExecuteRequest.model_validate(raw, context=STORED_ACTION_CONTEXT).arguments.text) == 1031
+    with pytest.raises(ValidationError, match="at most 1000 characters"):
+        ExecuteRequest.model_validate(raw)
+
+
 SAMPLE_ARGUMENTS = {
     Operation.EMAIL_SEND: {"to_address": "dan@pfg.io", "text": "hi"},
     Operation.QUO_SMS_SEND: {"to_phone": "+12015756789", "text": "hi"},
