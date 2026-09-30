@@ -20,6 +20,7 @@ from postgres_mcp.outbound_gateway.delivery_workflow import build_restate_app
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
+from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 
@@ -473,6 +474,72 @@ async def test_an_operations_set_generalizes_which_operations_the_coordinator_ad
 
     assert result.phase is DeliveryPhase.COMPLETE
     service.resume.assert_awaited_once_with(ACTION_ID)
+
+
+# Production (2026-09-29/30, Restate journal of TenantCloudDelivery): while
+# TenantCloud's runner reported login_required, quo.sms.send c1c9193a /
+# 37e17b0c, email.send 0108a062 / 23093f4f and cliq.chat.post a5a17dad /
+# 11e69c3e each returned WAIT tenantcloud_auth_login_required and slept 300s
+# before sending. The auth gate is TenantCloud's runner; it gates only
+# TenantCloud operations on the shared production-shaped coordinator.
+_PRODUCTION_RESTATE_OPERATIONS = frozenset(
+    {
+        Operation.QUO_SMS_SEND,
+        Operation.EMAIL_SEND,
+        Operation.CLIQ_CHAT_POST,
+        Operation.CLIQ_CHANNEL_POST,
+        Operation.CALENDAR_CREATE,
+        Operation.CALENDAR_UPDATE,
+        Operation.CALENDAR_DELETE,
+    }
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", sorted(_PRODUCTION_RESTATE_OPERATIONS))
+async def test_a_non_tenantcloud_operation_never_waits_on_tenantcloud_auth(operation) -> None:
+    row = _generic_action()
+    row.operation = operation
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(status=PublicStatus.SENT, detail_code="sent", detail=None)
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.LOGIN_REQUIRED, retry_after_seconds=300)
+    coordinator = OutboundDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=TENANTCLOUD_OPERATIONS | _PRODUCTION_RESTATE_OPERATIONS,
+        clock=lambda: row.created_at + timedelta(seconds=5),
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.COMPLETE
+    service.resume.assert_awaited_once_with(ACTION_ID)
+    auth.ensure_ready.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_tenantcloud_operation_on_the_shared_coordinator_still_waits_on_tenantcloud_auth() -> None:
+    row = action(ActionState.RETRY_READY, attempts=1)
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.LOGIN_REQUIRED, retry_after_seconds=300)
+    coordinator = OutboundDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=TENANTCLOUD_OPERATIONS | _PRODUCTION_RESTATE_OPERATIONS,
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result == DeliveryResult(DeliveryPhase.WAIT, "tenantcloud_auth_login_required", 300)
+    service.resume.assert_not_called()
 
 
 @pytest.mark.asyncio

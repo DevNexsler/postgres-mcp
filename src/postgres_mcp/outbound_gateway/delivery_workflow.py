@@ -238,7 +238,10 @@ class OutboundDeliveryCoordinator:
         if action.state not in (_AMBIGUOUS_STATES | _RESUMABLE_STATES):
             return DeliveryResult(DeliveryPhase.WAIT, "action_not_prepared", 5)
 
-        auth = await self._auth.ensure_ready()
+        # ``auth`` is TenantCloud's runner (build_tenantcloud_auth_gate), so it
+        # gates only TenantCloud operations: an email/SMS/Cliq/calendar send
+        # on this same coordinator must not wait out a TenantCloud login.
+        auth = await self._auth.ensure_ready() if action.operation in TENANTCLOUD_OPERATIONS else AuthResult(AuthState.READY)
         if auth.state is not AuthState.READY:
             default_delay = {
                 AuthState.LOGIN_REQUIRED: 300,
