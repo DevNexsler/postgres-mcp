@@ -42,7 +42,6 @@ def test_execute_has_exact_required_top_level_contract():
     assert isinstance(request.arguments, EmailArguments)
 
     for field in (
-        "op",
         "wakeup_event_id",
         "action_role",
         "operation",
@@ -53,6 +52,27 @@ def test_execute_has_exact_required_top_level_contract():
         invalid.pop(field)
         with pytest.raises(ValidationError):
             parse_outbound_request(invalid)
+
+
+def test_execute_op_defaults_when_request_is_unambiguously_a_send():
+    payload = execute_payload()
+    payload.pop("op")
+    request = parse_outbound_request(payload)
+    assert isinstance(request, ExecuteRequest)
+    assert request.op == "execute"
+    assert "op" not in payload
+
+
+def test_missing_op_is_still_rejected_when_the_request_is_not_a_send():
+    action_id = "8f8f1a45-13a7-4bd3-a15a-f8d265bbc567"
+    with pytest.raises(ValidationError):
+        parse_outbound_request({"action_id": action_id})
+    with pytest.raises(ValidationError):
+        parse_outbound_request({"wakeup_event_id": 1})
+    with pytest.raises(ValidationError):
+        parse_outbound_request(
+            {"wakeup_event_id": 1, "action_id": action_id, "decision": "yes", "operation": "email.send"}
+        )
 
 
 def test_execute_rejects_unknown_fields_and_non_positive_or_non_integer_wake_ids():
