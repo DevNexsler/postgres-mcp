@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# The landing gate's git side (#3965): refuse to advance `main` with a tree
+# `scripts/run_test_suite.sh` never proved. Install with
+# `scripts/merge_gate.py install`.
+set -Eeuo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+gate="${root}/scripts/merge_gate.py"
+# core.hooksPath is clone-wide while the hooks are per-worktree, so a checkout
+# cut before the gate landed reaches this only through a stale path. It has no
+# gate to run and must not be wedged by one.
+[[ -f "${gate}" ]] || exit 0
+
+exec "${POSTGRES_MCP_MERGE_GATE_PYTHON:-python3}" "${gate}" pre-push "$@"
