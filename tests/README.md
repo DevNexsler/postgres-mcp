@@ -22,6 +22,22 @@ To run a specific test:
 uv run pytest tests/unit/test_db_conn_pool.py::test_pool_connect_success
 ```
 
+## Landing Gate
+
+GitHub Actions does not run on this fork, so `main` is gated locally instead.
+A push that advances `main` is refused unless the full suite passed on the
+tree being pushed:
+
+```bash
+./scripts/run_test_suite.sh      # `uv run pytest`; a green run attests the committed tree
+git push origin main
+```
+
+Land PRs by merging locally and pushing, never with `gh pr merge` or the GitHub
+merge button: a server-side merge runs no hook. Install the hook once per clone
+with `python3 scripts/merge_gate.py install`. A run over a dirty tree, or with
+any pytest argument, records nothing.
+
 ## Test Structure
 
 - **Unit Tests** (`tests/unit/`): Tests for individual components and functions
