@@ -66,6 +66,13 @@ class QuoSmsAdapter:
         action_uid: UUID,
         observation: ProviderObservation,
     ) -> ProviderObservation:
+        """Settle an ambiguous send against Quo's own record of the thread.
+
+        Quo is the source of truth for what it sent: our exact text in the
+        thread means it was sent; a thread that loads, holds messages, and does
+        not contain it means Quo never created it, so the send is retried.
+        A thread that cannot be read, or is empty, proves nothing either way.
+        """
         result = await client.call(
             "quo",
             "list_messages",
@@ -75,18 +82,29 @@ class QuoSmsAdapter:
                 "max_results": 50,
             },
         )
+        inconclusive = ProviderObservation(
+            ProviderDisposition.AMBIGUOUS,
+            "quo_reconciliation_inconclusive",
+            provider_request_ref=observation.provider_request_ref,
+        )
         if initial_observation(result) is not None:
-            return ProviderObservation(
-                ProviderDisposition.AMBIGUOUS,
-                "quo_reconciliation_inconclusive",
-                provider_request_ref=observation.provider_request_ref,
+            return inconclusive
+        # Quo's MCP returns the list as JSON text; older fixtures carry it as
+        # structured content. Either way, only objects that look like
+        # messages count.
+        messages = [
+            item
+            for item in json_objects(
+                result.structured_content if result.structured_content is not None else result.text
             )
+            if self._message_id(item) and self._content(item) is not None
+        ]
+        if not messages:
+            return inconclusive
         expected_text = str(context.arguments["text"])
-        for item in json_objects(result.structured_content):
-            if not self._matches(item, context, expected_text):
-                continue
-            message_id = self._message_id(item)
-            if message_id:
+        for item in messages:
+            if self._matches(item, context, expected_text):
+                message_id = self._message_id(item)
                 return accepted_observation(
                     request_ref_value=observation.provider_request_ref,
                     message_id=message_id,
@@ -94,9 +112,11 @@ class QuoSmsAdapter:
                     evidence={"kind": "exact_target_content_time", "provider_message_id": message_id},
                 )
         return ProviderObservation(
-            ProviderDisposition.AMBIGUOUS,
-            "quo_reconciliation_inconclusive",
+            ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+            "quo_message_not_sent",
             provider_request_ref=observation.provider_request_ref,
+            category="provider_state_not_yet_applied",
+            retryable=True,
         )
 
     @staticmethod
@@ -108,15 +128,28 @@ class QuoSmsAdapter:
         return None
 
     @staticmethod
-    def _matches(payload: Mapping[str, Any], context: ActionContext, expected_text: str) -> bool:
+    def _content(payload: Mapping[str, Any]) -> str | None:
+        for key in ("content", "text", "body"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value
+        return None
+
+    @classmethod
+    def _matches(cls, payload: Mapping[str, Any], context: ActionContext, expected_text: str) -> bool:
         direction = str(payload.get("direction") or payload.get("type") or "").casefold()
         if direction and direction not in {"outgoing", "outbound", "sent"}:
             return False
         target = payload.get("to") or payload.get("participant") or payload.get("phone_number")
-        content = payload.get("content") or payload.get("text") or payload.get("body")
-        if target != context.recipient_phone or content != expected_text:
+        recipients = target if isinstance(target, list) else [target]
+        if context.recipient_phone not in recipients or cls._content(payload) != expected_text:
             return False
-        timestamp = payload.get("created_at") or payload.get("sent_at") or payload.get("timestamp")
+        timestamp = (
+            payload.get("createdAt")
+            or payload.get("created_at")
+            or payload.get("sent_at")
+            or payload.get("timestamp")
+        )
         if not isinstance(timestamp, str):
             return False
         try:

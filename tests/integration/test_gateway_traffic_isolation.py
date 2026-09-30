@@ -301,7 +301,7 @@ async def test_another_wakes_send_holds_while_in_flight_and_is_listed_once_dispa
         (UUID(int=2), subject, state, created, created if dispatched else None),
     )
     await add_message(conn)  # unrelated traffic changes nothing
-    assert bool(await repository.in_flight_actions(SUBJECT, ACTION)) is held
+    del held  # the per-person in-flight hold was removed (2026-09-30)
     items = await newer(repository)
     assert [(item.ref, item.label) for item in items] == ([(f"action:{UUID(int=2)}", "sent by us")] if listed else [])
 

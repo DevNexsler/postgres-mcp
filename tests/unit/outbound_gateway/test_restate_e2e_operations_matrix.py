@@ -420,6 +420,43 @@ async def test_quo_ambiguous_forever_settled_by_readback_completes_with_no_warni
 
 
 @pytest.mark.asyncio
+async def test_quo_timeout_then_absent_from_quo_thread_is_resent_once_and_completes():
+    """2026-09-30, action b78d5668: the send timed out, the text never reached
+    Quo, and the action sat "inconclusive" for an hour. Quo's thread (live
+    shape: JSON text, `to` a list, `createdAt`) loads without our text, so the
+    send is retried -- once -- and completes."""
+    import json as _json
+
+    tenant_message = {
+        "id": "AC-in",
+        "to": ["+14845550100"],
+        "from": "+19085550199",
+        "text": "no one has been to my unit",
+        "direction": "incoming",
+        "status": "received",
+        "createdAt": "2026-09-28T22:43:00Z",
+    }
+    client = ScriptThenRepeatClient(
+        transport_timeout(),
+        McpCallResult(structured_content=None, text=_json.dumps([tenant_message])),
+        McpCallResult(structured_content={"status": "sent", "message_id": "quo-message-resent"}),
+    )
+    result, store, _clock, staff_warning = await run_case(
+        action_id=QUO_ACTION_ID,
+        operation=Operation.QUO_SMS_SEND,
+        adapter=QuoSmsAdapter(user_id="user-1"),
+        context=quo_context(),
+        record=quo_record(),
+        provider_client=client,
+    )
+    assert result.phase is DeliveryPhase.COMPLETE
+    assert store.current.state is ActionState.COMPLETED
+    assert store.current.provider_message_id == "quo-message-resent"
+    assert client.tool_calls() == ["send_message", "list_messages", "send_message"]
+    assert staff_warning.calls == []
+
+
+@pytest.mark.asyncio
 async def test_quo_ambiguous_forever_never_found_reaches_ceiling_definitive_failed_one_warning():
     client = ScriptThenRepeatClient(
         transport_timeout(),

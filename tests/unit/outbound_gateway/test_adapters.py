@@ -1861,3 +1861,150 @@ def test_calendar_adapter_defaults_still_make_a_tour():
     assert request.arguments["summary"] == "Tour — Amanda Snyder"
     assert request.arguments["end"] == "2026-07-17T15:00:00Z"
     assert "attendees" not in request.arguments
+
+
+# --- Quo reconcile against the shape the live Quo MCP actually returns ------
+#
+# 2026-09-30, action b78d5668: a quo.sms.send timed out and every reconcile
+# came back "inconclusive" for an hour. Quo's list_messages answers with its
+# message list as JSON *text* (structured_content is None), each message's
+# `to` is a list and the timestamp is `createdAt` -- the adapter read none of
+# that, so it could never see a message, sent or not. The text also never
+# reached Quo, and "not in Quo's own list" was never read as "not sent", so
+# nothing re-sent it. Payloads below are the live shape, values replaced.
+
+QUO_TEXT = "Friday at 10:30 works. — Nigel"
+QUO_TO = "+19085550199"
+
+
+def quo_message(**overrides):
+    message = {
+        "id": "AC-live-shape-1",
+        "to": [QUO_TO],
+        "from": "+14845550100",
+        "text": QUO_TEXT,
+        "phoneNumberId": "leasing-line",
+        "conversationId": "CN-live-shape",
+        "direction": "outgoing",
+        "userId": "US-1",
+        "status": "delivered",
+        "createdAt": NOW.isoformat().replace("+00:00", "Z"),
+        "updatedAt": NOW.isoformat().replace("+00:00", "Z"),
+        "media": [],
+    }
+    message.update(overrides)
+    return message
+
+
+def quo_list_as_text(*messages):
+    import json
+
+    return McpCallResult(structured_content=None, text=json.dumps(list(messages), indent=2))
+
+
+def quo_ctx():
+    return context(Operation.QUO_SMS_SEND, recipient_phone=QUO_TO)
+
+
+PRIOR = ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous", provider_request_ref="req-1")
+
+
+@pytest.mark.asyncio
+async def test_quo_reconcile_reads_the_live_text_shape_and_finds_the_sent_message():
+    incoming = quo_message(id="AC-in", direction="incoming", to=["+14845550100"], text="See you then")
+    client = FakeClient(quo_list_as_text(incoming, quo_message()))
+
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+
+    assert observed.disposition is ProviderDisposition.ACCEPTED
+    assert observed.message_id == "AC-live-shape-1"
+    assert observed.detail_code == "quo_reconciled_by_exact_tuple"
+
+
+@pytest.mark.asyncio
+async def test_quo_reconcile_absent_from_a_loaded_thread_is_not_sent_and_retryable():
+    """The 2026-09-30 case: the thread loads, holds the tenant's own message,
+    and our text is not in it -- Quo never created it, so send it again."""
+    tenant_message = quo_message(
+        id="AC-in", direction="incoming", to=["+14845550100"], text="no one has been to my unit"
+    )
+    client = FakeClient(quo_list_as_text(tenant_message))
+
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+
+    assert observed.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+    assert observed.retryable is True
+    assert observed.detail_code == "quo_message_not_sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "near_miss",
+    [
+        quo_message(direction="incoming"),
+        quo_message(to=["+19085550000"]),
+        quo_message(text=QUO_TEXT + " "),
+        quo_message(createdAt="2026-01-01T00:00:00Z"),
+    ],
+    ids=["incoming_not_ours", "other_recipient", "different_text", "older_than_the_message_answered"],
+)
+async def test_quo_reconcile_never_accepts_a_near_miss(near_miss):
+    client = FakeClient(quo_list_as_text(near_miss))
+
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+
+    assert observed.disposition is not ProviderDisposition.ACCEPTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        McpCallResult(structured_content=None, text="[]"),
+        McpCallResult(structured_content={"messages": []}),
+        McpCallResult(error_kind=TransportErrorKind.TIMEOUT, is_error=True, safe_detail="transport_timeout"),
+        McpCallResult(structured_content=None, text="not json"),
+        McpCallResult(is_error=True, text="upstream 500"),
+    ],
+    ids=["empty_text_list", "empty_structured_list", "list_call_timed_out", "unparseable", "list_call_errored"],
+)
+async def test_quo_reconcile_stays_uncertain_when_the_thread_cannot_be_read(result):
+    """No thread evidence is not proof of absence: never resend on it."""
+    client = FakeClient(result)
+
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS
+    assert observed.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_quo_reconcile_still_reads_the_structured_shape():
+    client = FakeClient(
+        McpCallResult(
+            structured_content={
+                "messages": [
+                    {
+                        "id": "quo-message-2",
+                        "direction": "outgoing",
+                        "to": QUO_TO,
+                        "content": QUO_TEXT,
+                        "created_at": NOW.isoformat(),
+                    }
+                ]
+            }
+        )
+    )
+
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+
+    assert observed.disposition is ProviderDisposition.ACCEPTED
+    assert observed.message_id == "quo-message-2"
+
+
+def test_quo_provider_calls_wait_as_long_as_quo_waits_for_its_carrier():
+    from postgres_mcp.outbound_gateway.server import quo_server_config
+
+    config = quo_server_config()
+    assert config.timeout_seconds == 30.0
+    assert config.allowed_tools == frozenset({"send_message", "list_messages", "get_message"})

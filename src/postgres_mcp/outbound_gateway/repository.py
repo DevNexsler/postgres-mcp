@@ -14,7 +14,6 @@ from postgres_mcp.sql import SafeSqlDriver
 from .models import ActionRole
 from .models import NewerActivity
 from .models import Operation
-from .traffic_control import InFlightAction
 
 if TYPE_CHECKING:
     from .context import ActionContext
@@ -23,16 +22,6 @@ if TYPE_CHECKING:
 # states still has an in-flight lease on its recipient. Everything else
 # (completed, stale, rejected, definitive_failed, dead_letter,
 # manual_review) is terminal or parked and does not hold the lease.
-NON_TERMINAL_STATES = (
-    "received",
-    "dependency_wait",
-    "prepared",
-    "dispatching",
-    "provider_accepted",
-    "unknown",
-    "reconciling",
-    "retry_ready",
-)
 
 
 @dataclass(frozen=True)
@@ -92,10 +81,6 @@ class ContextRepository(Protocol):
         aliases: tuple[str, ...],
         property_scope: str,
     ) -> AliasResolution: ...
-
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]: ...
 
     async def newer_context(
         self,
@@ -205,43 +190,6 @@ class OutboundGatewayRepository:
             canonical_subject=cells.get("canonical_subject"),
             ambiguous=int(cells.get("subject_count") or 0) > 1,
         )
-
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]:
-        rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT
-                action_id,
-                operation,
-                state,
-                created_at,
-                left(coalesce(arguments::text,''), 120) AS preview
-            FROM outbound_actions
-            WHERE subject_key = {}
-              AND action_id <> {}
-              -- The wake's own other actions are its agent's work, not
-              -- someone else's send racing this one (CDS migration 204).
-              AND wakeup_event_id IS DISTINCT FROM (
-                  SELECT own.wakeup_event_id FROM outbound_actions AS own
-                  WHERE own.action_id = {}
-              )
-              AND state = ANY({})
-            ORDER BY created_at
-            """,
-            [recipient_key, exclude_action_id, exclude_action_id, list(NON_TERMINAL_STATES)],
-        )
-        return [
-            InFlightAction(
-                action_id=UUID(str(row.cells["action_id"])),
-                operation=str(row.cells["operation"]),
-                state=str(row.cells["state"]),
-                created_at=row.cells["created_at"],
-                preview=str(row.cells.get("preview") or ""),
-            )
-            for row in rows or []
-        ]
 
     async def newer_context(
         self,
