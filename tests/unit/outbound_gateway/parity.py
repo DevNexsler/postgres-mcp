@@ -66,7 +66,6 @@ STORE_METHODS = (
 ADAPTER_METHODS = ("build_request", "invoke", "poll", "parse_receipt", "reconcile")
 LOADER_METHODS = ("load", "suggest_targets")
 PROBE_METHODS = (
-    "in_flight_actions",
     "newer_context",
     "activity_after",
     "context_watermark",
@@ -415,6 +414,12 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # remaining trace for this call still shows the immediate timeout.
     if _call(current, "adapter.poll") and "provider_queue_timeout" in old:
         return "dispatch_pending_gets_a_poll_window"
+    # The per-recipient in-flight hold is gone (action b78d5668, 2026-09-30:
+    # one uncertain SMS held that person's calendar update and staff Cliq
+    # post for up to an hour). Where the legacy returned lease_held, the
+    # action now carries on to its own claim/dispatch.
+    if legacy_result is not None and legacy_result.get("detail_code") == "lease_held":
+        return "in_flight_hold_removed"
     # The override resend of a legacy traffic_blocked row needed the terminal
     # block that no longer exists.
     if _call(legacy, "store.remediate_traffic_block"):

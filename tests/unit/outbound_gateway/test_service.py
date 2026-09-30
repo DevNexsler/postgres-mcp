@@ -14,6 +14,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from types import MappingProxyType
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
@@ -51,7 +52,6 @@ from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_persisted_arguments
-from postgres_mcp.outbound_gateway.traffic_control import InFlightAction
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -2048,79 +2048,26 @@ def _accepted_observation() -> ProviderObservation:
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_defers_lease_held_instead_of_terminalizing():
-    """Important 6: a lease block is inherently short-lived -- the other
-    in-flight action will reach a terminal state on its own -- unlike a
-    stale-context block, which needs a conscious agent decision. A
-    deterministic action_id plus a terminal DEFINITIVE_FAILED meant a
-    seconds-long lease overlap would brick that resend forever, since
-    override never bypasses a lease (only staleness). So enforce+lease_held
-    must defer: no claim()/definitive_fail() at all, the row stays exactly
-    where prepare() (the same call _preflight()'s READY branch uses) left
-    it -- non-terminal and worker-visible, so the worker's next resume()
-    (PREPARED is in worker.py's list_work -> resume() routing) re-runs this
-    same gate and self-heals once the lease clears.
-
-    FakeStore() with no initial row means create_or_load() lands on a
-    fresh RECEIVED row (row()'s default state) -- claim_outbound_action's
-    live whitelist excludes 'received' (migrations/
-    068_outbound_gateway_observability.sql:156-159), so this also exercises
-    the RECEIVED regression: the gate still moves the row through
-    prepare() first (to reach a worker-visible state), it just never goes
-    on to claim()/definitive_fail() for a lease_held verdict."""
-    store = FakeStore()
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="Friday works for us too.",
-            )
-        ]
+@pytest.mark.parametrize("entry", ["execute", "resume"])
+async def test_another_wakes_uncertain_send_never_holds_this_action(entry):
+    """2026-09-30: an uncertain quo.sms.send (action b78d5668) held a
+    calendar update 22 min and a staff Cliq post 9.5 min for the same person.
+    There is no per-person hold any more: this action goes out on its own;
+    a newer send the agent has not seen is the stale-context question."""
+    store = FakeStore() if entry == "execute" else FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter(_accepted_observation())
+    uncertain_sms = SimpleNamespace(
+        action_id=uuid4(), operation="quo.sms.send", state="unknown", created_at=NOW, preview="Hi Carol"
     )
+    probe = FakeProbe(in_flight=[uncertain_sms])
+    gateway = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
 
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
+    result = await (gateway.execute(request()) if entry == "execute" else gateway.resume(ACTION_ID))
 
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "lease_held"
-    assert result.detail is not None
-    assert "Friday works for us too." in result.detail
-    assert [call[0] for call in store.calls] == ["create", "prepare"]
-    assert store.current.state is ActionState.PREPARED
-    assert adapter.calls == []
-
-
-@pytest.mark.asyncio
-async def test_resume_enforce_defers_lease_held_on_an_already_prepared_action():
-    """Same Important 6 behavior, but from resume() on an action that was
-    already PREPARED (no RECEIVED->prepare() dance involved at all --
-    claimable is just the action as-is, so this proves the defer applies
-    independent of the RECEIVED special case)."""
-    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="Friday works for us too.",
-            )
-        ]
-    )
-
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
-
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "lease_held"
-    assert result.detail is not None
-    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
-    assert store.current.state is ActionState.PREPARED
-    assert adapter.calls == []
+    assert result.status is PublicStatus.SENT
+    assert result.detail_code != "lease_held"
+    assert adapter.calls
+    assert not any(call[0] == "in_flight" for call in probe.calls)
 
 
 @pytest.mark.asyncio
@@ -2197,38 +2144,12 @@ async def test_traffic_control_shadow_logs_and_dispatches(caplog):
 async def test_traffic_control_off_never_calls_probe():
     store = FakeStore()
     adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="would block if consulted",
-            )
-        ]
-    )
+    probe = FakeProbe()
 
     result = await service(store, adapter, traffic_mode="off", traffic_probe=probe).execute(request())
 
     assert result.status is PublicStatus.SENT
     assert probe.calls == []
-
-
-@pytest.mark.asyncio
-async def test_traffic_control_fails_open_and_dispatches_on_probe_error(caplog):
-    store = FakeStore()
-    adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(raise_on_in_flight=True)
-
-    with caplog.at_level(logging.WARNING):
-        result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
-
-    assert result.status is PublicStatus.SENT
-    assert adapter.calls
-    assert not any(call[0] == "definitive_fail" for call in store.calls)
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("traffic control" in message for message in messages)
 
 
 def test_traffic_mode_rejects_unknown_value():
@@ -2577,7 +2498,7 @@ async def test_a_later_action_of_the_same_role_carries_its_own_identity():
     assert result.status is PublicStatus.SENT
     assert result.action_id == later
     assert store.calls[0] == ("create", ACTION_ID)
-    assert probe.calls[0] == ("in_flight", "prospect:amanda", later)
+    assert probe.calls[0] == ("newer_context", "prospect:amanda", later)
     assert probe.calls[-1][-1] == later
 
 

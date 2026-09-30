@@ -51,7 +51,6 @@ from .stale_context import StaleContextQuestions
 from .stale_context import execute_answer
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
-from .traffic_control import in_flight_hold
 
 logger = logging.getLogger(__name__)
 
@@ -239,8 +238,7 @@ class OutboundActionService:
         # docstring).
         self._restate_operations = restate_operations
         self._traffic_mode = traffic_mode
-        # One probe: the in-flight lease (traffic_control.InFlightProbe) and
-        # the newer-context query (stale_context.NewerContextProbe).
+        # The newer-context query (stale_context.NewerContextProbe).
         self._traffic_probe = traffic_probe
         self._stale = StaleContextQuestions(
             store=store,
@@ -335,13 +333,9 @@ class OutboundActionService:
         confirm_stale: bool = False,
         dispatch: bool = True,
     ) -> PublicResult:
-        """The send gate every action passes: the in-flight lease, the
-        stale-context question (asked only of the agent), then the calendar
-        dependency and dispatch (or, with dispatch=False, prepare for Restate
-        without provider I/O)."""
-        held = await self._hold_in_flight(action, context)
-        if held is not None:
-            return held
+        """The send gate every action passes: the stale-context question
+        (asked only of the agent), then the calendar dependency and dispatch
+        (or, with dispatch=False, prepare for Restate without provider I/O)."""
         asked = await self._stale.check(action, context, agent_facing=agent_facing, confirm=confirm_stale, dispatch=dispatch)
         if asked is not None:
             return asked
@@ -453,35 +447,6 @@ class OutboundActionService:
                 ),
             )
 
-    async def _hold_in_flight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult | None:
-        """Another wake's send to this recipient still in flight: wait. Not a
-        judgment -- the row stays re-drivable and the worker's next resume()
-        re-runs this check. off: no probe call; shadow: log only."""
-        if self._traffic_mode == "off" or self._traffic_probe is None:
-            return None
-        detail = await in_flight_hold(
-            self._traffic_probe, recipient_key=context.prospect_id, action_id=context.action_id, logger=logger
-        )
-        if detail is None:
-            return None
-        if self._traffic_mode != "enforce":
-            logger.warning(
-                "traffic control shadow would-block: lease_held %s wake=%s recipient=%s",
-                detail,
-                context.wakeup_event_id,
-                context.prospect_id,
-            )
-            return None
-        held = action
-        if action.state is ActionState.RECEIVED:
-            # claim_outbound_action's live whitelist excludes 'received': a
-            # fresh row first moves through prepare_outbound_action_and_acquire_lock,
-            # the same call the READY path uses (Comm-Data-Store 067/068).
-            held = await self._store.prepare(context, action.state)
-            if held.state is ActionState.COMPLETED:
-                return action_result(held, repeated=True)
-        return action_result(held, detail_code="lease_held", detail=detail)
-
     async def status(self, action_id: UUID) -> PublicResult:
         return action_result(await self._require_action(action_id))
 
@@ -527,9 +492,6 @@ class OutboundActionService:
                 # staff warning -- never a silent dead end.
                 return await self._recovery.reload_retry(action, context_detail, reason)
             return await self._recovery.manual_review(action, context_detail, reason=reason)
-        held = await self._hold_in_flight(action, context)
-        if held is not None:
-            return held
         unasked = await self._stale.check(action, context, agent_facing=False)
         if unasked is not None:
             return unasked

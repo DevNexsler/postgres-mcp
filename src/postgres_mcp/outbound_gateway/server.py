@@ -507,6 +507,23 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
     return TenantCloudAdapter(mutations_factory=build_mutations)
 
 
+# Quo's own call to its carrier API waits up to 30 s (QUO-Gated-MCP
+# quo_client.py). Cutting it off at the 10 s default turned a slow carrier into
+# an ambiguous send (action b78d5668, 2026-09-30); 30 s is this client's cap.
+QUO_PROVIDER_TIMEOUT_SECONDS = 30.0
+
+
+def quo_server_config() -> McpServerConfig:
+    return McpServerConfig(
+        name="quo",
+        url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
+        transport="sse",
+        headers=_bearer_headers("QUO_MCP_TOKEN"),
+        allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
+        timeout_seconds=QUO_PROVIDER_TIMEOUT_SECONDS,
+    )
+
+
 def build_tenantcloud_auth_gate() -> SecretAuthGate:
     """Build same scoped auth path used by TenantCloud provider writes."""
     _reject_tenantcloud_origin_overrides()
@@ -675,13 +692,7 @@ async def build_runtime() -> GatewayRuntime:
                     }
                 ),
             ),
-            "quo": McpServerConfig(
-                name="quo",
-                url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
-                transport="sse",
-                headers=_bearer_headers("QUO_MCP_TOKEN"),
-                allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
-            ),
+            "quo": quo_server_config(),
         }
     )
     email_domains = _json_mapping(
