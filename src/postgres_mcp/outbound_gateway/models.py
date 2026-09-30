@@ -557,6 +557,13 @@ def parse_iso_date(value: Any, *, field: str) -> date:
     return parsed
 
 
+# TenantCloud refuses a thread message over 1000 characters with HTTP 422.
+# Every rejected send through 2026-09-30 was 1025-1227 characters and every
+# accepted one was at most 837; the longest body TenantCloud ever returned is
+# exactly 1000 (an inbound tenant message cut off mid-sentence).
+TENANTCLOUD_MESSAGE_MAX_CHARACTERS = 1000
+
+
 class TenantCloudMessageArguments(StrictModel):
     thread_id: PositiveBigInt
     text: str
@@ -565,7 +572,15 @@ class TenantCloudMessageArguments(StrictModel):
     @classmethod
     def normalize_text(cls, value: Any, info: ValidationInfo) -> str:
         text = normalize_tenantcloud_text(value, field="text", maximum=10_000)
-        return refuse_tenantcloud_wide_characters(text, field="text", info=info)
+        text = refuse_tenantcloud_wide_characters(text, field="text", info=info)
+        # A stored action is rebuilt on reconcile and resume; the rejected
+        # over-long ones must still rebuild so they can settle.
+        if len(text) > TENANTCLOUD_MESSAGE_MAX_CHARACTERS and not (info.context or {}).get("stored_action"):
+            raise ValueError(
+                f"text is {len(text)} characters; a TenantCloud message can be at most "
+                f"{TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters. Shorten it and send again"
+            )
+        return text
 
 
 class LeadStatusArguments(StrictModel):
@@ -666,7 +681,11 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
     Operation.CALENDAR_CREATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),
     Operation.CALENDAR_UPDATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),
     Operation.CALENDAR_DELETE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),
-    Operation.TENANTCLOUD_MESSAGE_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "reply in a TenantCloud thread"),
+    Operation.TENANTCLOUD_MESSAGE_SEND: (
+        ActionRole.PROSPECT_REPLY,
+        IntentKind.INQUIRY_REPLY,
+        f"reply in a TenantCloud thread; text at most {TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters",
+    ),
     Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_LEAD_STATUS, "mark a lead working"),
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: (
         ActionRole.PROVIDER_MUTATION,
