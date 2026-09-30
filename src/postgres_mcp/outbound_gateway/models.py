@@ -856,7 +856,25 @@ _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 
 def parse_outbound_request(payload: Any) -> OutboundRequest:
-    return _REQUEST_ADAPTER.validate_python(payload)
+    return _REQUEST_ADAPTER.validate_python(_default_execute_op(payload))
+
+
+def _default_execute_op(payload: Any) -> Any:
+    """Fill a missing `op` with "execute" when the request can only be an execute.
+
+    Agents often send a complete send request without `op`, and the discriminator
+    error it produces does not tell them what to add. Only execute carries
+    `operation`; status and confirm carry `action_id` instead, so a request with
+    `operation` and no `action_id` is unambiguous. Everything else is left for the
+    normal validation error."""
+    if (
+        isinstance(payload, dict)
+        and "op" not in payload
+        and "operation" in payload
+        and "action_id" not in payload
+    ):
+        return {"op": "execute", **payload}
+    return payload
 
 
 _SENT_DIRECTIONS = frozenset({"outbound", "outgoing", "sent"})
