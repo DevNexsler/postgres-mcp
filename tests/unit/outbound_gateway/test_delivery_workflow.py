@@ -62,6 +62,59 @@ async def test_auth_outage_waits_without_consuming_provider_attempt() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [Operation.CLIQ_CHAT_POST, Operation.EMAIL_SEND, Operation.QUO_SMS_SEND],
+)
+async def test_tenantcloud_login_state_never_holds_a_non_tenantcloud_send(operation: Operation) -> None:
+    # Action c6d15f16 (2026-09-30): a Cliq reply sat `prepared` for 300 s
+    # because TenantCloud reported login_required.
+    row = action(ActionState.PREPARED)
+    row.operation = operation
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    service.resume.return_value = SimpleNamespace(status=PublicStatus.SENT, detail_code="provider_receipt_verified")
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.LOGIN_REQUIRED, retry_after_seconds=300)
+    coordinator = OutboundDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({operation, Operation.TENANTCLOUD_MESSAGE_SEND}),
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.COMPLETE
+    service.resume.assert_awaited_once_with(ACTION_ID)
+    auth.ensure_ready.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tenantcloud_send_still_waits_for_login() -> None:
+    row = action(ActionState.PREPARED)
+    store = AsyncMock()
+    store.get.return_value = row
+    service = AsyncMock()
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.LOGIN_REQUIRED)
+    coordinator = OutboundDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({Operation.CLIQ_CHAT_POST, Operation.TENANTCLOUD_MESSAGE_SEND}),
+    )
+
+    result = await coordinator.advance(ACTION_ID)
+
+    assert result.phase is DeliveryPhase.WAIT
+    assert result.detail_code == "tenantcloud_auth_login_required"
+    assert result.retry_after_seconds == 300
+    service.resume.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_ready_action_resumes_once_after_auth_self_heals() -> None:
     row = action(ActionState.RETRY_READY, attempts=1)
     store = AsyncMock()
