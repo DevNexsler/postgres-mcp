@@ -90,7 +90,8 @@ async def traffic(traffic_database):
             );
             CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
             CREATE TEMP TABLE hermes_wakeup_events (
-                id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz
+                id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz,
+                webui_session_id text, webui_stream_id text
             );
         """)
         await conn.execute("INSERT INTO hermes_wakeup_events VALUES (26817, %s, %s)", (WATERMARK, WATERMARK))

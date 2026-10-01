@@ -141,7 +141,8 @@ SCHEMA = """
     CREATE TEMP TABLE hermes_wakeup_events (
         id bigint PRIMARY KEY, source text, source_event_id text, created_at timestamptz,
         webui_accepted_at timestamptz, provenance text, qualification_run_id text,
-        message_id bigint, envelope jsonb, tenantcloud_claim_id bigint
+        message_id bigint, envelope jsonb, tenantcloud_claim_id bigint,
+        webui_session_id text, webui_stream_id text  -- the Hermes turn (CDS steering)
     );
     CREATE TEMP TABLE tenantcloud_event_claims (
         claim_id bigint PRIMARY KEY, event_family text, claim_state text, action_owner text,
@@ -324,7 +325,7 @@ def build(conn):
         store=store,
         context_loader=ActionContextLoader(repository, POLICY),
         evidence_loader=DatabasePreflightEvidenceLoader(SqlDriver(conn=conn)),
-        adapters={Operation.EMAIL_SEND: adapter, Operation.QUO_SMS_SEND: adapter},
+        adapters={Operation.EMAIL_SEND: adapter, Operation.QUO_SMS_SEND: adapter, Operation.CLIQ_CHAT_POST: adapter},
         provider_client=object(),
         clock=lambda: datetime(2026, 9, 26, 13, 11, 2, tzinfo=timezone.utc),
         lease_owner="outbound-gateway",
@@ -707,3 +708,219 @@ async def test_a_definitively_failed_send_does_not_count(conn):
 
     assert result.status is PublicStatus.SENT, result
     assert adapter.sent == ["Following up on Aimee's application."]
+
+
+# One Hermes turn answering three wakes (CDS steering), as production stored
+# them on 2026-10-01: Dan sent "2+4", then "also tell me a short story" and
+# "and 9+4" while the turn was running; the last two were steered into it.
+# Nigel sent "6" (27457) and the story (27458); the story then made 27459's
+# "13" stale twice, so it went out 3.5 min late.
+TURN_SESSION = "gw0a206b9be42d44"
+TURN_STREAM = "c80c27ed14c64289bedaa3754536fcac"
+TURN_WAKES = {
+    27457: (
+        839373,
+        "1790822607653_9165281454634",
+        "2026-10-01 02:43:27.653+00",
+        "2026-10-01 02:43:31.494932+00",
+        "2026-10-01 02:43:31.531572+00",
+        "2026-10-01 02:43:31.791453+00",
+        "{@918334727} this is quick test message.   2+4",
+    ),
+    27458: (
+        839377,
+        "1790822615181_9169576429470",
+        "2026-10-01 02:43:35.181+00",
+        "2026-10-01 02:44:01.507186+00",
+        "2026-10-01 02:44:01.526953+00",
+        "2026-10-01 02:44:01.807227+00",
+        "{@918334727}  also tell me a short story",
+    ),
+    27459: (
+        839378,
+        "1790822623382_9173871404969",
+        "2026-10-01 02:43:43.382+00",
+        "2026-10-01 02:44:01.527349+00",
+        "2026-10-01 02:44:01.736748+00",
+        "2026-10-01 02:44:02.057595+00",
+        "{@918334727}  and 9+4",
+    ),
+}
+SIX = UUID("eb73af99-c747-5fcd-8a9a-5e91207dcab6")
+STORY = UUID("0d59a25f-b523-59bc-9e5c-73400854dc6b")
+# (message id, provider id, sent_at, received_at, ledger action, wake, created, dispatch started, text)
+TURN_SENDS = (
+    (
+        839375,
+        "1790822640801_9178166389921",
+        "2026-10-01 02:44:00.801+00",
+        "2026-10-01 02:44:01.054811+00",
+        SIX,
+        27457,
+        "2026-10-01 02:43:59.996057+00",
+        "2026-10-01 02:44:00.555177+00",
+        "6",
+    ),
+    (
+        839398,
+        "1790822716297_9182461432713",
+        "2026-10-01 02:45:16.297+00",
+        "2026-10-01 02:45:16.534519+00",
+        STORY,
+        27458,
+        "2026-10-01 02:45:15.676178+00",
+        "2026-10-01 02:45:16.121499+00",
+        "Here's a short one: A lighthouse keeper's cat sat by the lamp every evening.",
+    ),
+)
+
+
+def _turn_payload(provider_message_id: str) -> dict[str, Any]:
+    return {
+        "direction": "inbound",
+        "conversation_id": DM,
+        "participants": [{"id": "918334727", "name": "Nigel Pine"}, {"id": "720844989", "name": "Dan Park"}],
+        "provider_ids": {"cliq": DM, "message": provider_message_id, "conversation": DM},
+    }
+
+
+async def seed_steered_turn(conn, *, story_stream: str = TURN_STREAM) -> None:
+    """Wakes 27457-27459 and the two sends. Dan's messages are stored
+    `outbound` (Dan's own account posted them), as in production.
+    story_stream: the turn 27458 was delivered into."""
+    for wake, (message_id, provider_id, sent_at, received_at, created_at, accepted_at, body) in TURN_WAKES.items():
+        await conn.execute("INSERT INTO raw_events VALUES (%s, %s)", (message_id, Jsonb(_turn_payload(provider_id))))
+        await conn.execute(
+            "INSERT INTO messages VALUES (%s, NULL, 'zoho_cliq', %s, %s, %s, %s, NULL, %s, 'dan-zoho', 417, 407, NULL, %s, 'outbound', %s)",
+            (message_id, provider_id, sent_at, sent_at, sent_at, body, message_id, received_at),
+        )
+        envelope = {
+            "message": {
+                "id": message_id,
+                "phone": None,
+                "property": None,
+                "proxy_email": None,
+                "direct_email": None,
+                "prospect_name": None,
+                "sender": {"display_name": "Dan Park", "participant_key": "720844989", "participant_type": "user"},
+            },
+            "identity": {"factbook_entity_uuid": None, "link_type": "source_participant"},
+            "routing_hints": {},
+            "conversation_context": {"nearby_messages": []},
+        }
+        await conn.execute(
+            "INSERT INTO hermes_wakeup_events VALUES (%s, 'zoho_cliq', %s, %s, %s, 'customer', NULL, %s, %s, NULL, %s, %s)",
+            (wake, provider_id, created_at, accepted_at, message_id, Jsonb(envelope), TURN_SESSION, story_stream if wake == 27458 else TURN_STREAM),
+        )
+    for message_id, provider_id, sent_at, received_at, action_id, wake, created_at, started_at, text in TURN_SENDS:
+        await conn.execute("INSERT INTO raw_events VALUES (%s, %s)", (message_id, Jsonb(_turn_payload(provider_id))))
+        await conn.execute(
+            "INSERT INTO messages VALUES (%s, NULL, 'zoho_cliq', %s, %s, %s, %s, NULL, %s, 'nigel-zoho', 417, 997, NULL, %s, 'outbound', %s)",
+            (message_id, provider_id, sent_at, sent_at, sent_at, text, message_id, received_at),
+        )
+        await conn.execute(
+            "INSERT INTO outbound_actions VALUES (%s, %s, 'internal_reply', 'cliq.chat.post', 'completed', %s, %s, %s, '{}', %s, NULL, NULL, %s)",
+            (
+                action_id,
+                wake,
+                f"internal:{DM}",
+                created_at,
+                Jsonb({"text": text, "channel_or_chat_id": DM}),
+                started_at,
+                provider_id.replace("_", "%20"),
+            ),
+        )
+
+
+def turn_reply(text: str = "13", wake: int = 27459) -> ExecuteRequest:
+    parsed = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": wake,
+            "action_role": "internal_reply",
+            "operation": "cliq.chat.post",
+            "intent_kind": "internal_reply",
+            "arguments": {"text": text, "channel_or_chat_id": DM},
+        }
+    )
+    assert isinstance(parsed, ExecuteRequest)
+    return parsed
+
+
+@pytest.mark.asyncio
+async def test_wake_27459_a_send_by_another_wake_of_the_same_turn_is_not_news(conn):
+    """The story (wake 27458, same turn) reached Dan after 27459's context
+    was built. The agent sent it itself: "13" goes out at once."""
+    await seed_steered_turn(conn)
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(turn_reply())
+
+    assert result.status is PublicStatus.SENT, result
+    assert adapter.sent == ["13"]
+
+
+@pytest.mark.asyncio
+async def test_the_same_send_from_another_turn_is_still_asked(conn):
+    """Had 27458 been its own turn, its story is another agent's send: asked,
+    as before steering (message and ledger action both listed)."""
+    await seed_steered_turn(conn, story_stream="another-turn")
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(turn_reply())
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
+    assert {item.id for item in result.new_context} == {"message:839398", f"action:{STORY}"}
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_new_message_from_dan_in_the_same_turn_is_still_asked(conn):
+    """Inbound is never the turn's own work: a message steered in after
+    27459's context may not have reached the agent yet."""
+    await seed_steered_turn(conn)
+    at = "2026-10-01 02:45:30+00"
+    await conn.execute("INSERT INTO raw_events VALUES (839400, %s)", (Jsonb(_turn_payload("never-mind")),))
+    await conn.execute(
+        "INSERT INTO messages VALUES (839400, NULL, 'zoho_cliq', 'never-mind', %s, %s, %s, NULL, "
+        "'{@918334727} never mind the math', 'dan-zoho', 417, 407, NULL, 839400, 'outbound', %s)",
+        (at, at, at, at),
+    )
+    await conn.execute(
+        "INSERT INTO hermes_wakeup_events VALUES (27460, 'zoho_cliq', 'never-mind', %s, %s, 'customer', NULL, 839400, '{}', NULL, %s, %s)",
+        (at, at, TURN_SESSION, TURN_STREAM),
+    )
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(turn_reply())
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
+    assert [item.id for item in result.new_context] == ["message:839400"]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_same_person_send_by_a_wake_of_the_same_turn_is_not_news(conn):
+    """Identity path: another wake of the same person counts, unless it is
+    in this wake's turn."""
+    await conn.execute(
+        "UPDATE hermes_wakeup_events SET webui_session_id = 'gw-identity', webui_stream_id = 'turn-1' WHERE id = %s",
+        (IDENTITY_WAKE,),
+    )
+    for wake, stream in ((27331, "turn-1"), (27332, "turn-2")):
+        await insert_identity_wake(conn, wake, ENTITY_UUID)
+        await conn.execute(
+            "UPDATE hermes_wakeup_events SET webui_session_id = 'gw-identity', webui_stream_id = %s WHERE id = %s",
+            (stream, wake),
+        )
+    same_turn = UUID("66666666-6666-6666-6666-666666666666")
+    other_turn = UUID("77777777-7777-7777-7777-777777777777")
+    await insert_ledger_send(conn, same_turn, 27331, created_at=IDENTITY_WATERMARK + timedelta(minutes=1))
+    await insert_ledger_send(conn, other_turn, 27332, created_at=IDENTITY_WATERMARK + timedelta(minutes=2))
+    service, _store, adapter = build(conn)
+
+    result = await service.execute(identity_email_request())
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION, result
+    assert [item.id for item in result.new_context] == [f"action:{other_turn}"]
+    assert adapter.sent == []
