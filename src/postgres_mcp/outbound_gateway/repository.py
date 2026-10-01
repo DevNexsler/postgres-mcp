@@ -234,10 +234,21 @@ class OutboundGatewayRepository:
           phone, a post in that Cliq chat, a message in that TenantCloud
           thread), and another wake's gateway send to the same subject that
           started dispatch.
-        - Never this wake's own sends, the source message or its duplicates,
+        - Never this turn's own sends, the source message or its duplicates,
           certified-older Zillow scrapes, or Nigel's automated cron alerts.
 
-        waive_shown leaves out what this wake's agent was already shown for
+        One Hermes turn is one agent. CDS steers a person's later messages
+        into the turn already running for them, so one turn answers several
+        wakes, and every wake delivered into it carries that turn's
+        (webui_session_id, webui_stream_id). A send by ANY of those wakes is
+        the agent's own work, never news to another of them; a wake that was
+        not steered is a turn of its own, exactly as before. Inbound
+        messages still count (a steered message may not have reached the
+        agent yet when it sends). Wakes 27457-27459 (2026-10-01): "2+4",
+        "tell me a short story" and "9+4" in one turn; the story sent for
+        27458 made 27459's "13" stale twice, and it went out 3.5 min late.
+
+        waive_shown leaves out what this turn's agent was already shown for
         this recipient (migration 192), by identity (the shown-refs ledger,
         unrelated to CDS person identity above).
 
@@ -271,6 +282,21 @@ class OutboundGatewayRepository:
                 SELECT coalesce(event.webui_accepted_at, event.created_at) AS at
                 FROM hermes_wakeup_events AS event, p
                 WHERE event.id = p.wake
+            ), turn AS (
+                -- The agent: this wake and every wake delivered into the same
+                -- Hermes turn (CDS steering). A wake that was not steered is
+                -- a turn of its own.
+                SELECT p.wake AS wakeup_event_id FROM p
+                UNION
+                SELECT other.id
+                FROM hermes_wakeup_events AS this
+                JOIN hermes_wakeup_events AS other
+                  ON other.webui_session_id = this.webui_session_id
+                 AND other.webui_stream_id = this.webui_stream_id
+                CROSS JOIN p
+                WHERE this.id = p.wake
+                  AND this.webui_session_id IS NOT NULL
+                  AND this.webui_stream_id IS NOT NULL
             ), identity AS (
                 -- CDS's own identity resolution for this wake (the same
                 -- envelope the agent reads). When resolved, "newer" is
@@ -297,11 +323,11 @@ class OutboundGatewayRepository:
                 FROM outbound_actions AS action
                 CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref), p
                 WHERE p.waive_shown
-                  AND action.wakeup_event_id = p.wake
+                  AND action.wakeup_event_id IN (SELECT turn.wakeup_event_id FROM turn)
                   AND action.subject_key = p.subject
                   AND action.state = 'stale'
             ), own_send AS (
-                -- This wake's own sends are its agent's work, not news.
+                -- This turn's own sends are its agent's work, not news.
                 -- Providers spell the id differently in the ledger and in
                 -- messages ("tenantcloud-message:1" vs
                 -- "tenantcloud:thread-message:1", "a%20b" vs "a_b"): compare
@@ -311,8 +337,8 @@ class OutboundGatewayRepository:
                     nullif(regexp_replace(replace(regexp_replace(
                         own.provider_message_id, '^.*:', ''), '%20', ''),
                         '[^0-9A-Za-z]', '', 'g'), '') AS message_key
-                FROM outbound_actions AS own, p
-                WHERE own.wakeup_event_id = p.wake
+                FROM outbound_actions AS own
+                WHERE own.wakeup_event_id IN (SELECT turn.wakeup_event_id FROM turn)
             ), candidate AS (
                 SELECT
                     message.id,
@@ -578,9 +604,9 @@ class OutboundGatewayRepository:
                     LIMIT 1
                 ), false)
             ), sent_action AS (
-                -- No resolved identity: today's fallback, unchanged -- another
-                -- wake's gateway send to this subject that started dispatch
-                -- (it may not be ingested back as a message yet).
+                -- No resolved identity: today's fallback -- another turn's
+                -- gateway send to this subject that started dispatch (it may
+                -- not be ingested back as a message yet).
                 SELECT
                     ledger.action_id,
                     ledger.operation,
@@ -592,14 +618,16 @@ class OutboundGatewayRepository:
                 CROSS JOIN identity
                 WHERE identity.entity_uuid IS NULL
                   AND ledger.subject_key = p.subject
-                  AND ledger.wakeup_event_id IS DISTINCT FROM p.wake
+                  AND NOT EXISTS (
+                      SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
+                  )
                   AND ledger.created_at > watermark.at
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
                   AND (ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed')
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), identity_sent AS (
                 -- Identity resolved: any gateway send belonging to another
-                -- wake CDS resolved to the same person -- whatever its
+                -- turn's wake CDS resolved to the same person -- whatever its
                 -- operation, channel or source -- counts, whether or not it
                 -- has been ingested back as a message yet. Only a state that
                 -- means sent or may have been sent; a definitive failure
@@ -615,6 +643,9 @@ class OutboundGatewayRepository:
                 CROSS JOIN watermark
                 WHERE ledger.created_at > watermark.at
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
+                  )
                   AND ledger.state = ANY(ARRAY['completed', 'dispatching', 'unknown', 'reconciling', 'provider_accepted'])
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), found AS (
