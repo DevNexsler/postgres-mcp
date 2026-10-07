@@ -165,13 +165,13 @@ async def test_an_unknown_action_id_says_where_to_get_the_right_one():
 
 @pytest.mark.asyncio
 async def test_an_invalid_request_says_nothing_was_sent_and_where_the_shapes_are():
-    with pytest.raises(ValueError) as raised:
-        await handle_outbound_action(
-            AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False),
-            {"op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply", "operation": "email.send",
-             "intent_kind": "inquiry_reply", "arguments": {"to": "dan@pfg.io", "text": "hi"}},
-        )
-    text = str(raised.value)
+    result = await handle_outbound_action(
+        AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False),
+        {"op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply", "operation": "email.send",
+         "intent_kind": "inquiry_reply", "arguments": {"to": "dan@pfg.io", "text": "hi"}},
+    )
+    assert (result["status"], result["detail_code"]) == ("rejected", "invalid_request")
+    text = result["detail"]
     assert text.startswith("invalid outbound action request: ")
     assert "Nothing was sent" in text and "tool description" in text
 
@@ -181,14 +181,14 @@ async def test_a_tenantcloud_message_over_1000_characters_says_the_limit_and_not
     """Wake 27426 (2026-09-30) sent 1031 characters; TenantCloud answered 422
     and the agent guessed a CAPTCHA. The refusal now names the limit."""
     service = AsyncMock()
-    with pytest.raises(ValueError) as raised:
-        await handle_outbound_action(
-            service, FeaturePolicy(writes_enabled=True, kill_switch=False),
-            {"op": "execute", "wakeup_event_id": 27426, "action_role": "prospect_reply",
-             "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
-             "arguments": {"thread_id": 2076062, "text": "x" * 1031}},
-        )
-    text = str(raised.value)
+    result = await handle_outbound_action(
+        service, FeaturePolicy(writes_enabled=True, kill_switch=False),
+        {"op": "execute", "wakeup_event_id": 27426, "action_role": "prospect_reply",
+         "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+         "arguments": {"thread_id": 2076062, "text": "x" * 1031}},
+    )
+    assert (result["status"], result["detail_code"]) == ("rejected", "invalid_request")
+    text = result["detail"]
     assert text.startswith("invalid outbound action request: ")
     assert "text is 1031 characters" in text
     assert "a TenantCloud message can be at most 1000 characters" in text

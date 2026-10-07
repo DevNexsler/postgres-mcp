@@ -131,10 +131,19 @@ async def handle_outbound_action(
             hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
         elif location.endswith("operation"):
             hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
-        raise ValueError(
-            f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
-            "that field and send again; the tool description lists each operation's exact arguments."
-        ) from exc
+        # A malformed request is the caller's mistake, answered as an ordinary
+        # result rather than an MCP tool error: hermes-agent counts tool errors
+        # toward a breaker that parks the whole server for every caller
+        # (#3264). No action exists yet, so there is no action_id to return.
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "invalid_request",
+            "detail": (
+                f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
+                "that field and send again; the tool description lists each operation's exact arguments."
+            ),
+        }
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
@@ -290,7 +299,9 @@ def create_server(
             "messages, including any we already sent to that recipient (direction \"sent by us\") -- and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
-            "message content changed). Every send, from any wake, goes through this tool: "
+            "message content changed). A malformed request returns status rejected, "
+            "detail_code invalid_request: nothing was recorded or sent -- fix the field its "
+            "detail names and call again. Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "
