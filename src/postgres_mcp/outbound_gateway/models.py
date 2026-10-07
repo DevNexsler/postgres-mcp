@@ -815,7 +815,8 @@ class SuggestRequest(StrictModel):
 
 
 class ConfirmRequest(StrictModel):
-    """Answer to a needs_confirmation (stale_context) result.
+    """Answer to a needs_confirmation (stale_context) result, or the agent's
+    override of an action that was not sent.
 
     `yes` sends the blocked message unchanged, `revise` sends `arguments`
     instead (same operation, role, intent and target -- only content fields
@@ -824,19 +825,32 @@ class ConfirmRequest(StrictModel):
     decline and sends nothing. One answer per blocked action: repeating it
     returns the recorded result, a different answer is refused.
     wakeup_event_id is REQUIRED and must be the blocked action's own wake --
-    a confirmation never crosses wakes."""
+    a confirmation never crosses wakes.
+
+    On a result that carries `override` (rejected, failed, a no-send
+    duplicate, ...), `yes` with a `reason` sends the same message anyway
+    through a successor action (Comm-Data-Store override_outbound_action);
+    the first reason is recorded on the refused action."""
 
     op: Literal["confirm"]
     wakeup_event_id: PositiveBigInt
     action_id: UUID
     decision: StaleContextDecision
     arguments: dict[str, Any] | None = None
+    reason: Annotated[str, Field(max_length=500)] | None = None
 
     @field_validator("decision", mode="before")
     @classmethod
     def normalize_decision(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().casefold()
+        return value
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
         return value
 
     @model_validator(mode="after")
@@ -949,6 +963,18 @@ class RequestRefusedError(ValueError):
     A gateway fault is never one of these."""
 
 
+class OverrideRequest(StrictModel):
+    """The exact outbound_action request that still sends a message that was
+    not sent: confirm yes on the refused action, with the agent's reason in
+    place of the placeholder. Never another tool or route."""
+
+    op: Literal["confirm"] = "confirm"
+    wakeup_event_id: PositiveBigInt
+    action_id: UUID
+    decision: Literal["yes"] = "yes"
+    reason: str = "<required: why you still want to send it>"
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
@@ -958,16 +984,17 @@ class PublicResult(StrictModel):
     # Every other result keeps the historical False.
     retryable: bool = False
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
-    # Human-readable elaboration of detail_code. None everywhere except traffic-control
-    # blocks: that is the one path where the calling agent must read *why* (which
-    # in-flight action or newer message) to decide skip vs. record needs_human --
-    # detail_code alone ("lease_held"/"stale_context") does not carry that. Override
-    # is an operator remediation and is not named in this text. Left unset (None)
-    # for every other result so existing consumers see no new key on the wire
-    # (server.py omits it from the response payload when None).
+    # Human-readable elaboration of detail_code: what happened and what to do
+    # next. Set on every result that did not send (and on pending/unknown);
+    # None on a plain send, and then omitted from the wire (server.py drops
+    # every None optional key).
     detail: str | None = None
     # needs_confirmation only: every item newer than the context the agent
     # was shown (newest last, capped) and the exact yes/no question. None
     # everywhere else, and omitted from the wire like `detail`.
     new_context: tuple[ContextItem, ...] | None = None
     question: str | None = None
+    # Set when nothing was sent and the agent may still send it unchanged:
+    # the request to make (record.overridable). None otherwise, and omitted
+    # from the wire like `detail`.
+    override: OverrideRequest | None = None

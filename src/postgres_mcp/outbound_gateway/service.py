@@ -27,6 +27,7 @@ from .metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
+from .models import STALE_CONTEXT_DETAILS
 from .models import ActionState
 from .models import CompletionKind
 from .models import ConfirmRequest
@@ -34,21 +35,25 @@ from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
+from .models import RequestRefusedError
 from .models import StaleContextDecision
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
 from .preflight import PreflightOutcome
 from .preflight import SafetyPreflight
+from .record import AGENT_OVERRIDE
 from .record import ActionStore as ActionStore
 from .record import OutboundActionRecord as OutboundActionRecord
 from .record import action_result
 from .record import is_due
+from .record import overridable
 from .record import require_action
 from .recovery import ActionRecovery
 from .retry_policy import elapsed_step_backoff_seconds
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
 from .stale_context import execute_answer
+from .stale_context import refusal
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 
@@ -71,6 +76,32 @@ def _bounded_reload_reason(error: Exception) -> str:
     stays defensive about length and newlines regardless."""
     text = " ".join(str(error).split())
     return text[:_RELOAD_REASON_MAX_CHARS] if text else type(error).__name__
+
+# A row nothing has started on: no lock taken, nothing sent. An error here
+# leaves it where nothing picks it up again (claim and the worker skip
+# `received`), so it is ended as a recorded refusal instead.
+_UNSTARTED_STATES = frozenset({ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT})
+GATEWAY_ERROR_DETAIL = "gateway_error"
+
+# A refused override (Comm-Data-Store override_outbound_action: the cap, a
+# parent already answered or sent) is the database's own words, which carry
+# the next step.
+_OVERRIDE_REFUSAL_SQLSTATE_CLASSES = ("22", "23", "42", "55", "P0")
+
+
+def error_text(error: BaseException) -> str:
+    """An exception's first line, bounded: what the agent reads and the
+    refused row records (psycopg appends CONTEXT/DETAIL lines after it). A
+    database refusal or a gateway refusal is already in words; anything
+    else is named by its type."""
+    lines = str(error).strip().splitlines()
+    first = " ".join(lines[0].split()) if lines else ""
+    if not first:
+        return type(error).__name__
+    if not isinstance(error, RequestRefusedError) and getattr(error, "sqlstate", None) is None:
+        first = f"{type(error).__name__}: {first}"
+    return first[:300]
+
 
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
@@ -299,6 +330,25 @@ class OutboundActionService:
                 action = existing
         if action is None:
             action = await self._store.create_or_load(context)
+        try:
+            return await self._execute_recorded(action, context, request, enabled=enabled, dispatch=dispatch)
+        except Exception as error:
+            # The row is committed: an error before it was prepared must not
+            # leave it `received`, where nothing picks it up again.
+            refused = await self._refuse_unstarted(action.action_id, error)
+            if refused is None:
+                raise
+            return refused
+
+    async def _execute_recorded(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        request: ExecuteRequest,
+        *,
+        enabled: bool,
+        dispatch: bool,
+    ) -> PublicResult:
         # A wake may hold several actions per role (CDS migration 204); the one
         # the database returned is this request's, whatever its ordinal.
         context = self._context_for(action, context)
@@ -320,9 +370,83 @@ class OutboundActionService:
         return await self._drive(action, context, agent_facing=True, confirm_stale=request.override, dispatch=dispatch)
 
     async def confirm(self, request: ConfirmRequest, *, dispatch: bool = True) -> PublicResult:
-        """Answer a needs_confirmation (stale_context) result: see
-        StaleContextQuestions.confirm."""
-        return await self._stale.confirm(request, dispatch=dispatch)
+        """op confirm. On an action holding a stale_context question it is
+        that question's answer (StaleContextQuestions.confirm); on any other
+        action it is the agent's override: still send what was not sent."""
+        parent = await self._require_action(request.action_id)
+        if parent.state is ActionState.STALE and parent.detail_code in STALE_CONTEXT_DETAILS:
+            return await self._stale.confirm(request, dispatch=dispatch, parent=parent)
+        return await self._override(parent, request, dispatch=dispatch)
+
+    async def _override(self, parent: OutboundActionRecord, request: ConfirmRequest, *, dispatch: bool) -> PublicResult:
+        """Send a refused, failed or deduplicated action anyway: a successor
+        with the same request (Comm-Data-Store override_outbound_action),
+        through the same gate as any send, minus the judgments the agent has
+        just overruled (the stale_context question, the calendar dependency,
+        the intent-lock dedupe). Repeating it returns the same successor."""
+        if parent.wakeup_event_id != request.wakeup_event_id:
+            raise refusal(
+                f"confirm refused: action {parent.action_id} belongs to wake {parent.wakeup_event_id}, "
+                f"not wake {request.wakeup_event_id}; a confirmation never crosses wakes."
+            )
+        if request.decision is StaleContextDecision.REVISE:
+            raise refusal(
+                f"confirm refused: revise answers a stale_context question, and action {parent.action_id} "
+                "has none. To send different content, execute it as a new message."
+            )
+        if not overridable(parent):
+            raise refusal(_not_overridable(parent))
+        if request.decision is StaleContextDecision.NO:
+            logger.info("override declined: wake=%s action=%s", parent.wakeup_event_id, parent.action_id)
+            return action_result(parent).model_copy(
+                update={"detail": "Not sent, as you decided: nothing more goes out for this action.", "override": None}
+            )
+        if request.reason is None:
+            raise refusal(
+                f"confirm refused: sending action {parent.action_id} anyway needs a reason -- say in \"reason\" "
+                "why you still want to send it."
+            )
+        try:
+            successor = await self._store.override(
+                parent.action_id,
+                wakeup_event_id=request.wakeup_event_id,
+                actor=self._lease_owner,
+                reason=request.reason,
+            )
+        except RequestRefusedError:
+            raise
+        except Exception as error:
+            if not str(getattr(error, "sqlstate", "") or "").startswith(_OVERRIDE_REFUSAL_SQLSTATE_CLASSES):
+                raise
+            raise refusal(
+                f"confirm refused for action {parent.action_id}: {error_text(error).rstrip('.')}. Nothing was sent by "
+                "this answer."
+            ) from error
+        logger.warning(
+            "agent override: wake=%s action=%s successor=%s reason=%r",
+            parent.wakeup_event_id,
+            parent.action_id,
+            successor.action_id,
+            request.reason,
+        )
+        return await self._drive_answered(successor, dispatch=dispatch)
+
+    async def _refuse_unstarted(self, action_id: UUID, error: BaseException) -> PublicResult | None:
+        """End an action nothing started on as a recorded refusal
+        (Comm-Data-Store reject_outbound_action): rejected, with the error's
+        own words, and overridable. None when the row has moved on (another
+        caller prepared or ended it) or the refusal itself cannot be written
+        -- the caller then raises as before."""
+        try:
+            current = await self._store.get(action_id)
+            if current is None or current.state not in _UNSTARTED_STATES:
+                return None
+            logger.error("action %s could not be prepared; nothing was sent, recording it rejected", action_id, exc_info=error)
+            rejected = await self._store.reject(action_id, GATEWAY_ERROR_DETAIL, error_text(error))
+        except Exception:
+            logger.error("refusal for action %s could not be recorded", action_id, exc_info=True)
+            return None
+        return action_result(rejected)
 
     async def _drive(
         self,
@@ -348,29 +472,51 @@ class OutboundActionService:
         return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
 
     async def _drive_answered(self, successor: OutboundActionRecord, *, dispatch: bool) -> PublicResult:
-        """A yes/revise successor executes its own saved record, like any
-        action, through the same gate as the agent's execute."""
+        """A yes/revise/override successor executes its own saved record,
+        like any action, through the same gate as the agent's execute."""
         if successor.state is ActionState.COMPLETED:
             return action_result(successor, repeated=True)
         if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
             return action_result(successor)
-        context, context_detail, reason = await self._verified_context(successor)
-        if context is None:
-            return action_result(successor, detail=reason or context_detail)
-        return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
+        try:
+            context, context_detail, reason = await self._verified_context(successor)
+            if context is None:
+                return action_result(successor, detail=reason or context_detail)
+            return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
+        except Exception as error:
+            refused = await self._refuse_unstarted(successor.action_id, error)
+            if refused is None:
+                raise
+            return refused
 
     async def prepare(self, action_id: UUID) -> PublicResult:
-        """Prepare a persisted remediation successor without provider I/O."""
+        """Prepare a persisted remediation successor without provider I/O.
+        Restate's coordinator calls this for a `received` row: an error
+        ends the row as a recorded refusal instead of a retry that can only
+        fail the same way (the coordinator then stops)."""
         action = await self._require_action(action_id)
         if action.state is not ActionState.RECEIVED or not self._is_due(action):
             return action_result(action)
-        context, context_detail, reason = await self._verified_context(action)
-        if context is None:
-            return action_result(action, detail=reason or context_detail)
-        return await self._drive(action, context, dispatch=False)
+        try:
+            context, context_detail, reason = await self._verified_context(action)
+            if context is None:
+                return action_result(action, detail=reason or context_detail)
+            return await self._drive(action, context, dispatch=False)
+        except Exception as error:
+            refused = await self._refuse_unstarted(action_id, error)
+            if refused is None:
+                raise
+            return refused
+
+    async def _evaluate_preflight(self, action: OutboundActionRecord, context: ActionContext) -> PreflightDecision:
+        """The calendar dependency -- except for an agent's override, which
+        sends whether or not this wake's calendar mutation went through."""
+        if action.remediation_reason == AGENT_OVERRIDE:
+            return PreflightDecision(PreflightOutcome.READY, "ready")
+        return SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
 
     async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        decision = await self._evaluate_preflight(action, context)
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             return action_result(prepared, repeated=prepared.state is ActionState.COMPLETED)
@@ -403,10 +549,14 @@ class OutboundActionService:
         - Once adapter.invoke() has started (_ProviderCallAttemptedError) the
           provider may have the request: log at ERROR and return the row's
           durable state (dispatching -> lease expiry -> reconcile).
-        - Before it, nothing was sent: log at ERROR and tell the caller so.
-          The row stays where it was left; executing the same request again
-          re-runs the send from there. Nothing is retried on the agent's
-          behalf -- it decides.
+        - Before it, nothing was sent: log at ERROR. A row nothing started
+          on (received, dependency_wait) is ended rejected with the error's
+          words and the override that still sends it -- left as it was,
+          nothing would pick it up again. Any other row (a request that
+          could not be built goes back to retry_ready) stays where it was
+          left, and the caller is told "not sent"; executing the same
+          request again re-runs the send from there. Nothing is retried on
+          the agent's behalf -- it decides.
 
         Context load/validation (everything in execute() before this call)
         still raises.
@@ -433,6 +583,9 @@ class OutboundActionService:
                 action.action_id,
                 exc_info=True,
             )
+            refused = await self._refuse_unstarted(action.action_id, error)
+            if refused is not None:
+                return refused
             lines = str(error).strip().splitlines()
             reason = f"{type(error).__name__}: {lines[0][:200]}" if lines else type(error).__name__
             return PublicResult(
@@ -510,7 +663,7 @@ class OutboundActionService:
 
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         """The calendar dependency, then dispatch (execute and confirm)."""
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        decision = await self._evaluate_preflight(action, context)
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
@@ -527,7 +680,7 @@ class OutboundActionService:
             self._lease_owner,
             self._lease_seconds,
         )
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        decision = await self._evaluate_preflight(action, context)
         if decision.outcome is PreflightOutcome.READY:
             prepared = await self._store.prepare(context, action.state)
             if prepared.state is ActionState.COMPLETED:
@@ -891,6 +1044,25 @@ class OutboundActionService:
 
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return is_due(action, self._clock())
+
+
+def _not_overridable(action: OutboundActionRecord) -> str:
+    """Why confirm cannot send this action anyway, and what to do instead."""
+    if action.state is ActionState.COMPLETED:
+        when = f" at {action.provider_accepted_at.isoformat()}" if action.provider_accepted_at else ""
+        return (
+            f"confirm refused: action {action.action_id} was already sent{when}; send a new message instead "
+            "(a new execute with the new content)."
+        )
+    if action.state in {ActionState.UNKNOWN, ActionState.RECONCILING}:
+        return (
+            f"confirm refused: action {action.action_id} may already have reached the recipient and is still "
+            'being checked. Check it with op "status" before sending anything else.'
+        )
+    return (
+        f"confirm refused: action {action.action_id} is still being delivered (state {action.state.value}); "
+        'nothing failed, so there is nothing to override. Check it with op "status".'
+    )
 
 
 class _ProviderCallAttemptedError(Exception):

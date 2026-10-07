@@ -47,6 +47,7 @@ from .retry_policy import RETRY_CEILING_SECONDS
 from .retry_policy import NoopStaffWarningPort
 from .retry_policy import StaffWarningPort
 from .retry_policy import ceiling_exceeded
+from .retry_policy import elapsed_step_backoff_seconds
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
@@ -141,6 +142,9 @@ _TERMINAL_STATES = {
     ActionState.DEAD_LETTER,
     ActionState.MANUAL_REVIEW,
 }
+# service._dispatch_stage's "nothing was sent" result for a pre-send error:
+# a synthesized result, not the row's state.
+_GATEWAY_INTERNAL_ERROR = "gateway_internal_error"
 # Kept as an alias of retry_policy's shared constant: several call sites and
 # tests in this module predate the generalized policy module and refer to
 # the old local name.
@@ -295,6 +299,17 @@ class OutboundDeliveryCoordinator:
                 result = await self._service.resume(action_id)
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
+        if result.status is PublicStatus.FAILED and result.detail_code == _GATEWAY_INTERNAL_ERROR:
+            # A pre-send error on a row that is still live (a request that
+            # could not be built goes back to retry_ready; an unstarted row
+            # is already ended as rejected by the service). Ending the
+            # workflow here would leave that row with nobody to advance it
+            # -- every resubmission answers 409 for the retention window.
+            # Wait and try again under the same elapsed ceiling, which ends
+            # it definitive_failed.
+            action_created_at = getattr(action, "created_at", None)
+            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
+            return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, elapsed_step_backoff_seconds(elapsed))
         if result.status is PublicStatus.MANUAL_REVIEW:
             # None (a hand-built record, or a store that predates
             # created_at) is treated as "just created" -- same convention

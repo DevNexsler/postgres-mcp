@@ -60,6 +60,8 @@ STORE_METHODS = (
     "remediate_traffic_block",
     "block_stale_context",
     "confirm_stale_context",
+    "reject",
+    "override",
     "get",
     "schedule_next_attempt",
 )
@@ -398,6 +400,25 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # to retry_ready, where a re-execute dispatches it).
     if "gateway_internal_error" in new and "gateway_internal_error" not in old:
         return "pre_send_error_is_reported_not_sent"
+    # The same error on a row nothing had started on (received,
+    # dependency_wait) now ends it rejected, with the error's words and the
+    # override that still sends it: a `received` row is one nothing picks up
+    # again.
+    if (_call(current, "store.reject") or (current_result or {}).get("detail_code") == "gateway_error") and "gateway_error" not in old:
+        return "pre_send_error_ends_the_action_rejected"
+    # op confirm on an action holding no stale_context question is now the
+    # agent's override (send what was not sent, with a reason), refused with
+    # its own words where there is nothing to override. The legacy refused
+    # every such confirm ("not awaiting", or "confirmation is not enabled"
+    # when the question was switched off).
+    if (
+        legacy is not None
+        and legacy[:2] == ("service_raise", "confirm")
+        and ("is not awaiting a stale_context confirmation" in old or "<confirmation disabled refusal>" in old)
+        and current is not None
+        and current[1] == "confirm"
+    ):
+        return "confirm_without_a_question_is_the_override"
     # FIX 3: a TenantCloud auth rejection proven pre-dispatch
     # (tenantcloud_auth_rejected_before_dispatch / category=provider_authentication)
     # now waits out the outage -- schedule_next_attempt with no claim() --

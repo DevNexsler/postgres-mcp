@@ -54,7 +54,9 @@ from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
 from .repository import OutboundGatewayRepository
+from .service import GATEWAY_ERROR_DETAIL
 from .service import OutboundActionService
+from .service import error_text
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
@@ -176,6 +178,7 @@ async def handle_outbound_action(
                     provider_request_ref=None,
                     retryable=False,
                     detail_code=detail,
+                    detail=SENDING_PAUSED_DETAIL,
                 )
             elif parsed.operation not in policy.enabled_operations:
                 action_id = uuid5(
@@ -189,6 +192,7 @@ async def handle_outbound_action(
                     provider_request_ref=None,
                     retryable=False,
                     detail_code="operation_disabled",
+                    detail=_operation_disabled_detail(parsed.operation, policy),
                 )
             else:
                 routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
@@ -219,16 +223,46 @@ async def handle_outbound_action(
             "detail_code": "request_refused",
             "detail": str(refused),
         }
+    except Exception as error:
+        # Any other failure is the gateway's, and still an ordinary result:
+        # an MCP tool error counts toward hermes-agent's breaker, and its raw
+        # text reads to the agent as an outage to route around. A row this
+        # call committed is ended rejected (and overridable) by the service
+        # wherever that can still be written; reaching here, nothing was.
+        logger.exception("outbound_action %s failed", parsed.op)
+        return {
+            "status": PublicStatus.FAILED.value,
+            "retryable": False,
+            "detail_code": GATEWAY_ERROR_DETAIL,
+            "detail": (
+                f"The gateway hit an error ({error_text(error)}); nothing was sent by this call. Make the same "
+                "call again; if it fails again, record needs_human. Never send it through any other tool or route."
+            ),
+        }
     payload = result.model_dump(mode="json")
-    # Every result except a traffic-control block leaves detail unset, and
-    # every result except needs_confirmation leaves new_context/question
-    # unset -- omit those keys entirely so existing consumers see no new
-    # field on the wire, instead of a `null` that would still be a shape
-    # change for strict clients.
-    for optional in ("detail", "new_context", "question"):
+    # A plain send leaves detail unset, and every result except
+    # needs_confirmation leaves new_context/question unset (override is set
+    # only when nothing was sent) -- omit unset keys entirely so consumers
+    # see no `null` field on the wire.
+    for optional in ("detail", "new_context", "question", "override"):
         if payload.get(optional) is None:
             payload.pop(optional, None)
     return payload
+
+
+SENDING_PAUSED_DETAIL = (
+    "Not sent: an operator has paused sending through this gateway, and nothing was recorded. Record "
+    "needs_human with what you meant to send. Never send it through any other tool or route."
+)
+
+
+def _operation_disabled_detail(operation: Operation, policy: FeaturePolicy) -> str:
+    enabled = ", ".join(sorted(op.value for op in policy.enabled_operations)) or "none"
+    return (
+        f"Not sent: {operation.value} is not enabled on this gateway, and nothing was recorded. Enabled "
+        f"operations: {enabled}. Use one of them, or record needs_human. Never send it through any other "
+        "tool or route."
+    )
 
 
 async def _confirm(
@@ -239,10 +273,10 @@ async def _confirm(
     tenantcloud_submitter: RestateWorkflowSubmitter | None,
     restate_operations: frozenset[Operation] | None = None,
 ) -> PublicResult:
-    """Route a stale_context answer. A decline is a ledger write only and is
-    always accepted; a yes is a send and obeys the same write switches as
-    execute. TenantCloud sends are prepared here and handed to Restate, like
-    enqueue()."""
+    """Route a stale_context answer or an override. A decline is a ledger
+    write only and is always accepted; a yes is a send and obeys the same
+    write switches as execute. A Restate-routed successor is prepared here
+    and handed to Restate, like enqueue()."""
     sends = request.decision.value != "no"
     if sends:
         if not policy.writes_enabled or policy.kill_switch:
@@ -253,6 +287,7 @@ async def _confirm(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code="kill_switch_open" if policy.kill_switch else "writes_disabled",
+                detail=SENDING_PAUSED_DETAIL,
             )
     parent_operation = await service.action_operation(request.action_id)
     if sends and parent_operation is not None and parent_operation not in policy.enabled_operations:
@@ -263,6 +298,7 @@ async def _confirm(
             provider_request_ref=None,
             retryable=False,
             detail_code="operation_disabled",
+            detail=_operation_disabled_detail(parent_operation, policy),
         )
     routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
     routed = parent_operation in routed_operations and tenantcloud_submitter is not None
@@ -311,9 +347,14 @@ def create_server(
             "messages, including any we already sent to that recipient (direction \"sent by us\") -- and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
-            "message content changed). A malformed request returns status rejected, "
-            "detail_code invalid_request: nothing was recorded or sent -- fix the field its "
-            "detail names and call again. Every send, from any wake, goes through this tool: "
+            "message content changed). Any other result that did not send (status rejected, "
+            "failed, duplicate, manual_review or stale) says why in detail. When it also carries "
+            "\"override\", you may still send it unchanged: call this tool with that request, your "
+            "reason filled in -- {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", "
+            "\"decision\": \"yes\", \"reason\": \"<why>\"}; decision \"no\" drops it; different content "
+            "is a new execute. A malformed request (detail_code invalid_request) recorded nothing: "
+            "fix the field its detail names. Never send through any other tool or route. "
+            "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "

@@ -120,10 +120,13 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
         assert "request-1" not in result.detail
     else:
         assert result.detail is None
-    # needs_confirmation's two fields exist on every result but are only set
-    # on that one; server.py omits unset ones from the wire.
+    # needs_confirmation's two fields and the override request exist on every
+    # result but are only set where they apply (the override request by
+    # record.action_result, from the row); server.py omits unset ones from
+    # the wire.
     assert result.new_context is None
     assert result.question is None
+    assert result.override is None
     assert set(result.model_dump()) == {
         "status",
         "action_id",
@@ -134,6 +137,7 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
         "detail",
         "new_context",
         "question",
+        "override",
     }
     with pytest.raises(ValidationError):
         type(result)(**result.model_dump(), raw_provider_payload={"secret": "x"})

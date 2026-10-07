@@ -399,7 +399,28 @@ def test_focused_server_tool_description_teaches_the_stale_context_confirm_answe
     assert "needs_confirmation" in description
     assert '"op": "confirm"' in description
     assert '"yes"|"no"|"revise"' in description
-    assert "override" not in description.casefold()
+
+
+def test_focused_server_tool_description_names_the_override_only_as_op_confirm_and_never_another_route():
+    """Wake 27138 was told "resend with override=true"; that call could not
+    work and the agent sent through the provider directly. The override is
+    taught only as the op confirm request, in the same breath as "never send
+    through any other tool or route" -- never as a flag on execute."""
+    service = AsyncMock()
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    description = next(tool for tool in mcp._tool_manager.list_tools() if tool.name == "outbound_action").description or ""
+
+    lowered = description.casefold()
+    assert "override=true" not in lowered and '"override": true' not in lowered
+    teaching = '{"op": "confirm", "wakeup_event_id", "action_id", "decision": "yes", "reason": "<why>"}'
+    never = "Never send through any other tool or route."
+    assert teaching in description and never in description
+    # Every mention of override sits in the one paragraph that ends with the
+    # never-another-route rule.
+    first_override, last_override = description.index('"override"'), description.rindex("override")
+    assert description.index(teaching) > first_override
+    assert first_override < last_override < description.index(never)
 
 
 @pytest.mark.asyncio

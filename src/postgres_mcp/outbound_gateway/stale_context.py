@@ -61,6 +61,9 @@ from .models import PublicResult
 from .models import PublicStatus
 from .models import RequestRefusedError
 from .models import StaleContextDecision
+from .record import AGENT_OVERRIDE
+from .record import DECLINED_DETAIL
+from .record import UNASKED_DETAIL
 from .record import ActionStore
 from .record import OutboundActionRecord
 from .record import action_result
@@ -74,15 +77,11 @@ logger = logging.getLogger("postgres_mcp.outbound_gateway.service")
 # Comm-Data-Store migration 153): only these can hold a question.
 STALE_BLOCKABLE_STATES = frozenset({ActionState.RECEIVED, ActionState.PREPARED, ActionState.DEPENDENCY_WAIT})
 
-DECLINED_DETAIL = "Declined: nothing was sent for this action. This is a recorded no-send, not a failure."
-
 # Nobody could be asked and something newer was unshown: a deliberate no-send.
-# Not a stale_context question (confirm refuses it; STALE_CONTEXT_DETAILS).
+# Not a stale_context question (STALE_CONTEXT_DETAILS): the agent may still
+# override it (record.overridable). Its words (UNASKED_DETAIL) and the
+# decline's (DECLINED_DETAIL) live with the result mapping in record.py.
 UNASKED_DETAIL_CODE = "stale_context_unasked"
-UNASKED_DETAIL = (
-    "Not sent: newer messages reached this recipient since your context was built, and nobody could be "
-    "asked about them. This is a deliberate no-send, not a failure."
-)
 
 # How many newer items a question lists. The newest are shown; anything older
 # stays unshown, so it asks again after the answer.
@@ -373,6 +372,10 @@ class StaleContextQuestions:
             # itself was blocked as stale_context, delaying it behind a
             # confirm round trip it never needed). Always send.
             return None
+        if action.remediation_reason == AGENT_OVERRIDE:
+            # The agent already saw this message refused and chose to send it
+            # anyway: asking again would only refuse its own answer.
+            return None
         if self._mode == "off" or self._probe is None:
             return None
         askable = agent_facing and self.enabled and action.state in STALE_BLOCKABLE_STATES
@@ -448,7 +451,9 @@ class StaleContextQuestions:
         )
         return action_result(ended, detail=UNASKED_DETAIL)
 
-    async def confirm(self, request: ConfirmRequest, *, dispatch: bool) -> PublicResult:
+    async def confirm(
+        self, request: ConfirmRequest, *, dispatch: bool, parent: OutboundActionRecord | None = None
+    ) -> PublicResult:
         """Answer a needs_confirmation (stale_context) result.
 
         `no` records the decline and sends nothing. `yes` mints (once) a
@@ -459,7 +464,8 @@ class StaleContextQuestions:
         prepared for Restate instead of dispatched inline."""
         if not self.enabled:
             raise confirmation_disabled()
-        parent = await require_action(self._store, request.action_id)
+        if parent is None:
+            parent = await require_action(self._store, request.action_id)
         check_confirmable(parent, request)
         if request.decision is StaleContextDecision.NO:
             declined = await self._answer(parent, StaleContextDecision.NO, None, wakeup_event_id=request.wakeup_event_id)

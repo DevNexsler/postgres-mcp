@@ -702,7 +702,9 @@ async def test_confirm_is_refused_for_another_wake_and_for_a_non_stale_action():
     sent = await service.execute(execute_request())
     assert sent.status is PublicStatus.SENT
 
-    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+    # A confirm on an action with no question is an override, and a sent
+    # message has nothing to override: send a new one instead.
+    with pytest.raises(ValueError, match="was already sent; send a new message instead"):
         await service.confirm(confirm(BLOCKED, "yes"))
 
     service, store, _probe, adapter = harness(CRON_ALERT)
@@ -836,8 +838,8 @@ async def test_worker_resume_over_newer_context_is_a_deliberate_no_send_never_a_
     assert adapter.sent == []
     logged = [record.getMessage() for record in caplog.records]
     assert any("nobody to ask (worker)" in line and "message:750824" in line for line in logged), logged
-    # And it is not a question: confirm refuses it.
-    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+    # And it is not a question: confirm is the override, which needs a reason.
+    with pytest.raises(ValueError, match='needs a reason -- say in "reason" why you still want to send it'):
         await service.confirm(confirm(BLOCKED, "yes"))
 
 

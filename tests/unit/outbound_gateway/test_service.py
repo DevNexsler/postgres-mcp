@@ -304,6 +304,14 @@ class FakeStore:
         )
         return self.current
 
+    async def reject(self, action_id, detail_code, error_detail):
+        """Comm-Data-Store reject_outbound_action: received/dependency_wait
+        -> rejected with its reason; anything else comes back unchanged."""
+        self.calls.append(("reject", detail_code, error_detail))
+        if self.current.state in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
+            self.current = replace(self.current, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail)
+        return self.current
+
     async def get(self, action_id):
         return self.current if self.current and self.current.action_id == action_id else None
 
@@ -1413,10 +1421,11 @@ async def test_tenantcloud_message_send_404_says_the_thread_does_not_exist_and_t
 
     assert result.status is PublicStatus.FAILED
     assert store.current.state is ActionState.DEFINITIVE_FAILED
-    assert result.detail == (
+    assert result.detail.startswith(
         "TenantCloud has no messenger thread 555 (a lead id is not a thread id). If this lead has no "
-        "thread, reply with email.send to the lead's email instead."
+        "thread, reply with email.send to the lead's email instead. "
     )
+    assert result.override is not None and result.override.action_id == result.action_id
 
 
 @pytest.mark.asyncio
@@ -1494,7 +1503,8 @@ async def test_an_unrelated_tenantcloud_rejection_keeps_the_ordinary_detail():
     result = await svc.execute(request())
 
     assert result.status is PublicStatus.FAILED
-    assert result.detail is None
+    assert result.detail.startswith("Not sent: tenantcloud_provider_rejected. ")
+    assert "messenger thread" not in result.detail
 
 
 @pytest.mark.asyncio
@@ -1920,7 +1930,7 @@ async def test_worker_terminalizes_context_that_can_no_longer_be_derived():
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
-    assert result.detail == "wakeup event does not exist"
+    assert result.detail.startswith("wakeup event does not exist. ")
 
 
 @pytest.mark.asyncio
@@ -2033,7 +2043,7 @@ async def test_exhaust_parks_in_manual_review_carrying_the_real_reload_reason():
     assert result.status is PublicStatus.MANUAL_REVIEW
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
-    assert result.detail == "wakeup event does not exist"
+    assert result.detail.startswith("wakeup event does not exist. ")
 
 
 def _accepted_observation() -> ProviderObservation:
@@ -2317,6 +2327,20 @@ def _assert_not_sent(result, adapter, caplog, error_type):
     assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
 
 
+def _assert_refused(result, store, adapter, error_type):
+    """An error before the row was prepared ends it rejected, with the
+    error's words and the override that still sends it -- never a
+    `received` row nothing picks up again."""
+    assert result.status is PublicStatus.REJECTED
+    assert result.detail_code == "gateway_error"
+    assert store.current.state is ActionState.REJECTED
+    assert result.detail.startswith(f"Not sent: {error_type}: ")
+    assert '"override" request' in result.detail and "Never send it through any other tool or route." in result.detail
+    assert result.override is not None
+    assert (result.override.op, result.override.decision, result.override.action_id) == ("confirm", "yes", ACTION_ID)
+    assert ("invoke",) not in adapter.calls
+
+
 @pytest.mark.asyncio
 async def test_an_evidence_loading_error_is_reported_not_sent(caplog):
     store = FakeStore()
@@ -2327,9 +2351,10 @@ async def test_an_evidence_loading_error_is_reported_not_sent(caplog):
     with caplog.at_level(logging.ERROR):
         result = await svc.execute(request())
 
-    _assert_not_sent(result, adapter, caplog, "TypeError")
-    assert store.current.state is ActionState.RECEIVED
+    _assert_refused(result, store, adapter, "TypeError")
     assert not any(call[0] == "schedule" for call in store.calls)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
 
 
 @pytest.mark.asyncio
@@ -2347,8 +2372,7 @@ async def test_a_preflight_error_is_reported_not_sent(caplog):
     ):
         result = await svc.execute(request())
 
-    _assert_not_sent(result, adapter, caplog, "AttributeError")
-    assert store.current.state is ActionState.RECEIVED
+    _assert_refused(result, store, adapter, "AttributeError")
 
 
 def _accepted(ref="req-1"):
@@ -2363,7 +2387,9 @@ def _accepted(ref="req-1"):
 
 
 @pytest.mark.asyncio
-async def test_an_evidence_error_then_the_same_request_again_sends_once(caplog):
+async def test_an_evidence_error_then_the_same_request_again_is_the_same_refusal(caplog):
+    """The identical request is the same action: it reports the refusal
+    again and never sends; sending it anyway is the override (op confirm)."""
     store = FakeStore()
     adapter = FakeAdapter(_accepted())
     svc = service(store, adapter)
@@ -2371,13 +2397,11 @@ async def test_an_evidence_error_then_the_same_request_again_sends_once(caplog):
 
     with caplog.at_level(logging.ERROR):
         first = await svc.execute(request())
-        _assert_not_sent(first, adapter, caplog, "TypeError")
-        assert store.current.state is ActionState.RECEIVED
+        _assert_refused(first, store, adapter, "TypeError")
         second = await svc.execute(request())
 
-    assert second.status is PublicStatus.SENT
-    assert second.action_id == first.action_id
-    assert adapter.calls.count(("invoke",)) == 1
+    assert (second.status, second.action_id, second.override) == (PublicStatus.REJECTED, first.action_id, first.override)
+    assert ("invoke",) not in adapter.calls
 
 
 @pytest.mark.asyncio
@@ -2410,7 +2434,10 @@ async def test_a_request_build_error_goes_back_to_retry_ready_and_the_same_reque
 
 
 @pytest.mark.asyncio
-async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left_for_the_worker(caplog):
+async def test_a_worker_resume_error_before_the_provider_call_ends_the_waiting_row_rejected(caplog):
+    """A dependency_wait row that cannot be prepared is ended as a recorded
+    refusal: Restate stops on it (a rejected result is terminal) instead of
+    ending its workflow over a row nobody would advance again."""
     store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
     adapter = FakeAdapter()
     svc = service(store, adapter)
@@ -2419,10 +2446,8 @@ async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left
     with caplog.at_level(logging.ERROR):
         result = await svc.resume(ACTION_ID)
 
-    _assert_not_sent(result, adapter, caplog, "TypeError")
-    # Claimed (one attempt spent), still listed by the worker.
-    assert store.current.state is ActionState.DEPENDENCY_WAIT
-    assert [call[0] for call in store.calls] == ["claim"]
+    _assert_refused(result, store, adapter, "TypeError")
+    assert [call[0] for call in store.calls] == ["claim", "reject"]
 
 
 @pytest.mark.asyncio

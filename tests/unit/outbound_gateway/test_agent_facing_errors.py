@@ -264,14 +264,24 @@ async def test_a_refused_request_is_a_rejected_result_not_an_mcp_tool_error():
 
 
 @pytest.mark.asyncio
-async def test_a_gateway_fault_is_still_an_mcp_tool_error():
+@pytest.mark.parametrize("method,payload", [("execute", EXECUTE), ("confirm", CONFIRM), ("status", STATUS)])
+async def test_a_gateway_fault_is_a_failed_result_not_an_mcp_tool_error(method, payload):
+    """A gateway fault is not the caller's mistake, but a raw MCP tool error
+    still counts toward hermes-agent's breaker and reads as an outage to
+    route around. Every op answers it as an ordinary failed result that
+    says nothing was sent and never to use another route."""
     service = AsyncMock()
-    service.execute.side_effect = await _create_raising("connection reset by peer")
+    service.action_operation.return_value = None
+    getattr(service, method).side_effect = await _create_raising("connection reset by peer")
     mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
     async with create_connected_server_and_client_session(mcp) as client:
-        result = await client.call_tool("outbound_action", {"request": EXECUTE})
-    assert result.isError
-    assert "connection reset by peer" in str(result.content)
+        result = await client.call_tool("outbound_action", {"request": payload})
+    assert not result.isError
+    body = result.structuredContent or {}
+    assert (body["status"], body["detail_code"], body["retryable"]) == ("failed", "gateway_error", False)
+    assert "connection reset by peer" in body["detail"]
+    assert "nothing was sent by this call" in body["detail"]
+    assert "Never send it through any other tool or route." in body["detail"]
 
 
 def test_an_invalid_transition_says_to_check_status_first():

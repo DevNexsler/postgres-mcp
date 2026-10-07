@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -39,8 +38,6 @@ from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
 from .repository import WakeEventRecord
 
-logger = logging.getLogger(__name__)
-
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 INTERNAL_ACTION_NAMESPACE = UUID("9af724c8-470b-54be-a4cc-e77a159b49ae")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -61,6 +58,9 @@ _TENANTCLOUD_OPERATIONS = frozenset(
         Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE,
     }
 )
+# Messages to staff, keyed on their recipient (see load()). Cliq is staff only.
+_STAFF_ROLES = frozenset({ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY})
+_CLIQ_OPERATIONS = frozenset({Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST})
 _ADDRESS_WORDS = {
     "n": "north",
     "s": "south",
@@ -289,31 +289,33 @@ class ActionContextLoader:
                 "if it is right, record needs_human."
             )
 
-        if aliases:
+        if request.action_role in _STAFF_ROLES or request.operation in _CLIQ_OPERATIONS:
+            # A message to staff (a review-channel alert, a reply to Dan's
+            # DM, any Cliq post) is about the wake's prospect, not to them:
+            # it is keyed on its recipient, never on the prospect's aliases.
+            # Those aliases joined the prospect's outbound-action subject to
+            # every staff post, so a prospect split across two subjects
+            # refused the staff alert about it too (wake 27865). The
+            # recipient key is the resolved Cliq channel/chat id
+            # (target.target_id for CLIQ_CHANNEL_POST/CLIQ_CHAT_POST already
+            # *is* arguments.channel_or_chat_id -- see _target() -- the
+            # getattr fallback below only matters if that ever stops being
+            # true), so concurrent posts to different chats never
+            # cross-block each other.
+            channel_or_chat_id = target.target_id or str(getattr(request.arguments, "channel_or_chat_id", "") or "none")
+            prospect_id = f"internal:{channel_or_chat_id}"
+            aliases = ()
+        elif aliases:
+            # Aliases that span several subjects are one person first seen
+            # apart: the database merges them when it takes the intent lock
+            # (Comm-Data-Store migration 251). Until then the preferred alias
+            # names the person.
             resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
-            if resolved.ambiguous:
-                logger.warning(
-                    "ambiguous aliases for wake %s; using address fallback",
-                    request.wakeup_event_id,
-                )
-                prospect_id = f"prospect:{self._preferred_alias(aliases)}"
-            else:
-                prospect_id = resolved.canonical_subject or f"prospect:{self._preferred_alias(aliases)}"
-        elif request.action_role in {ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY} or request.operation in _TENANTCLOUD_OPERATIONS:
+            canonical = None if resolved.ambiguous else resolved.canonical_subject
+            prospect_id = canonical or f"prospect:{self._preferred_alias(aliases)}"
+        elif request.operation in _TENANTCLOUD_OPERATIONS:
             if record.tenantcloud_claim_id is not None:
                 prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}"
-            elif request.action_role in {ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY}:
-                # Internal actions without a TenantCloud claim must not use
-                # the shared "internal:none" traffic-control lease key.
-                # Concurrent actions to different Cliq chats then cannot
-                # cross-block each other. The spec's internal
-                # recipient key is the channel: key on the resolved Cliq
-                # channel/chat id (target.target_id for CLIQ_CHANNEL_POST/
-                # CLIQ_CHAT_POST already *is* arguments.channel_or_chat_id --
-                # see _target() -- the getattr fallback below only matters if
-                # that ever stops being true).
-                channel_or_chat_id = target.target_id or str(getattr(request.arguments, "channel_or_chat_id", "") or "none")
-                prospect_id = f"internal:{channel_or_chat_id}"
             else:
                 prospect_id = "internal:none"
         else:

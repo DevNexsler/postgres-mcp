@@ -485,6 +485,33 @@ class PostgresActionStore:
             ],
         )
 
+    async def reject(self, action_id: UUID, detail_code: str, error_detail: str) -> OutboundActionRecord:
+        """End an action nothing started on (received or dependency_wait) as
+        a recorded refusal, with its reason; an already terminal action is
+        returned unchanged. Comm-Data-Store migration 251."""
+        return await self._one(
+            "SELECT * FROM reject_outbound_action({}, {}, {})",
+            [action_id, detail_code, error_detail],
+        )
+
+    async def override(
+        self,
+        action_id: UUID,
+        *,
+        wakeup_event_id: int,
+        actor: str,
+        reason: str,
+    ) -> OutboundActionRecord:
+        """The agent still sends an action that was not sent: the successor
+        (same request, fresh action_uid, retry_of_action_id = action_id,
+        remediation_reason agent_override), minted once -- repeating it
+        returns the same successor. The database owns every guard (own wake,
+        nothing sent, the per-wake cap). Comm-Data-Store migration 251."""
+        return await self._one(
+            "SELECT * FROM override_outbound_action({}, {}, {}, {})",
+            [action_id, wakeup_event_id, actor, reason],
+        )
+
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -589,6 +616,7 @@ class PostgresActionStore:
                 else None
             ),
             remediation_reason=cells.get("remediation_reason"),
+            error_detail=cells.get("error_detail"),
             stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
             created_at=cells.get("created_at"),
