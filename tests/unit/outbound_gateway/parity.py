@@ -503,12 +503,28 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     return None
 
 
+def _legacy_refusal_type(value: Any) -> Any:
+    """A refused stale_context answer is raised as RequestRefusedError, with
+    the legacy's exact words: the type server.handle_outbound_action answers
+    as a rejected result instead of an MCP tool error (#3463). The legacy
+    raised a plain ValueError. Read it as the legacy's type, so every event
+    after it is still compared."""
+    if isinstance(value, list | tuple):
+        if len(value) == 3 and value[0] == "raised" and value[1] == "RequestRefusedError":
+            return ("raised", "ValueError", value[2])
+        return type(value)(_legacy_refusal_type(item) for item in value)
+    return value
+
+
 def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
     """(name, where): IDENTICAL, SAME_OUTCOME, WORDING, a declared difference,
     or raises AssertionError naming the first unexplained divergence."""
     if legacy.events == current.events:
         return IDENTICAL, ""
-    plain_old, plain_new = observable(legacy.events), observable(current.events)
+    current_events = _legacy_refusal_type(current.events)
+    if legacy.events == current_events:
+        return "refusal_is_a_request_refused_error", ""
+    plain_old, plain_new = observable(legacy.events), observable(current_events)
     if plain_old == plain_new:
         return SAME_OUTCOME, ""
     old, new = _mask_wording(tuple(plain_old)), _mask_wording(tuple(plain_new))
@@ -519,8 +535,8 @@ def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
         # The legacy stopped (a replayed test's assertion on the words failed)
         # after an identical course that differed only in wording.
         return WORDING, ""
-    logs = " | ".join(str(event[1][3]) for event in current.events if event[1][0] == "log")
-    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current.events)
+    logs = " | ".join(str(event[1][3]) for event in current_events if event[1][0] == "log")
+    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current_events)
     name = _declared(old[index:], new[index:], prefix=old[:index], current_logs=logs, current_queried=queried)
     before = old[index] if index < len(old) else None
     after = new[index] if index < len(new) else None

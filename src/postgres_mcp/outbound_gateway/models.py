@@ -940,6 +940,15 @@ class ContextItem(StrictModel):
     preview: Annotated[str, Field(max_length=300)]
 
 
+class RequestRefusedError(ValueError):
+    """The gateway refused this request as asked. Nothing was sent, and the
+    message tells the caller what to do instead: fix the request, answer
+    differently, or record needs_human. The tool answers it as an ordinary
+    rejected result, not an MCP tool error, because hermes-agent counts tool
+    errors toward a breaker that parks the gateway for every caller (#3463).
+    A gateway fault is never one of these."""
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID

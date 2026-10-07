@@ -46,6 +46,7 @@ from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
+from .models import RequestRefusedError
 from .models import StatusRequest
 from .models import SuggestRequest
 from .models import operation_catalog
@@ -144,69 +145,80 @@ async def handle_outbound_action(
                 "that field and send again; the tool description lists each operation's exact arguments."
             ),
         }
-    if isinstance(parsed, SuggestRequest):
-        return {
-            "wakeup_event_id": parsed.wakeup_event_id,
-            "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
-        }
-    if isinstance(parsed, StatusRequest):
-        result = await service.status(parsed.action_id)
-    elif isinstance(parsed, ConfirmRequest):
-        result = await _confirm(
-            service,
-            policy,
-            parsed,
-            tenantcloud_submitter=tenantcloud_submitter,
-            restate_operations=restate_operations,
-        )
-    else:
-        assert isinstance(parsed, ExecuteRequest)
-        if not policy.writes_enabled or policy.kill_switch:
-            detail = "kill_switch_open" if policy.kill_switch else "writes_disabled"
-            action_id = uuid5(
-                ACTION_NAMESPACE,
-                f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
-            )
-            result = PublicResult(
-                status=PublicStatus.REJECTED,
-                action_id=action_id,
-                action_uid=None,
-                provider_request_ref=None,
-                retryable=False,
-                detail_code=detail,
-            )
-        elif parsed.operation not in policy.enabled_operations:
-            action_id = uuid5(
-                ACTION_NAMESPACE,
-                f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
-            )
-            result = PublicResult(
-                status=PublicStatus.REJECTED,
-                action_id=action_id,
-                action_uid=None,
-                provider_request_ref=None,
-                retryable=False,
-                detail_code="operation_disabled",
+    try:
+        if isinstance(parsed, SuggestRequest):
+            return {
+                "wakeup_event_id": parsed.wakeup_event_id,
+                "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
+            }
+        if isinstance(parsed, StatusRequest):
+            result = await service.status(parsed.action_id)
+        elif isinstance(parsed, ConfirmRequest):
+            result = await _confirm(
+                service,
+                policy,
+                parsed,
+                tenantcloud_submitter=tenantcloud_submitter,
+                restate_operations=restate_operations,
             )
         else:
-            routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
-            if parsed.operation in routed_operations and tenantcloud_submitter is not None:
-                # Stays fast: persist + preflight only (no provider I/O), then
-                # fire-and-forget the durable Restate submission. Execute
-                # returns "accepted, delivering" immediately either way -- the
-                # 1h retry ceiling runs entirely in the background workflow, a
-                # wake session never waits on it.
-                result = await service.enqueue(parsed)
-                if result.status is PublicStatus.PENDING:
-                    try:
-                        await tenantcloud_submitter.submit(result.action_id)
-                    except Exception:
-                        logger.exception(
-                            "Restate delivery submission failed for action %s; CDS sweeper will retry",
-                            result.action_id,
-                        )
+            assert isinstance(parsed, ExecuteRequest)
+            if not policy.writes_enabled or policy.kill_switch:
+                detail = "kill_switch_open" if policy.kill_switch else "writes_disabled"
+                action_id = uuid5(
+                    ACTION_NAMESPACE,
+                    f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
+                )
+                result = PublicResult(
+                    status=PublicStatus.REJECTED,
+                    action_id=action_id,
+                    action_uid=None,
+                    provider_request_ref=None,
+                    retryable=False,
+                    detail_code=detail,
+                )
+            elif parsed.operation not in policy.enabled_operations:
+                action_id = uuid5(
+                    ACTION_NAMESPACE,
+                    f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
+                )
+                result = PublicResult(
+                    status=PublicStatus.REJECTED,
+                    action_id=action_id,
+                    action_uid=None,
+                    provider_request_ref=None,
+                    retryable=False,
+                    detail_code="operation_disabled",
+                )
             else:
-                result = await service.execute(parsed)
+                routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+                if parsed.operation in routed_operations and tenantcloud_submitter is not None:
+                    # Stays fast: persist + preflight only (no provider I/O), then
+                    # fire-and-forget the durable Restate submission. Execute
+                    # returns "accepted, delivering" immediately either way -- the
+                    # 1h retry ceiling runs entirely in the background workflow, a
+                    # wake session never waits on it.
+                    result = await service.enqueue(parsed)
+                    if result.status is PublicStatus.PENDING:
+                        try:
+                            await tenantcloud_submitter.submit(result.action_id)
+                        except Exception:
+                            logger.exception(
+                                "Restate delivery submission failed for action %s; CDS sweeper will retry",
+                                result.action_id,
+                            )
+                else:
+                    result = await service.execute(parsed)
+    except RequestRefusedError as refused:
+        # Refused as asked: the caller's to correct, answered as an ordinary
+        # result so it does not count toward hermes-agent's breaker (#3463).
+        # The refusal's own words say what happened and what to do next.
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "request_refused",
+            "detail": str(refused),
+        }
     payload = result.model_dump(mode="json")
     # Every result except a traffic-control block leaves detail unset, and
     # every result except needs_confirmation leaves new_context/question
