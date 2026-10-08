@@ -91,7 +91,6 @@ class DerivedTarget:
 class RoutingPolicy:
     version: str
     email_account_by_provider: Mapping[str, str]
-    quo_line_by_provider: Mapping[str, str]
     calendar_by_profile: Mapping[str, str]
     cliq_target_by_intent: Mapping[str, str]
     property_aliases: Mapping[str, str]
@@ -105,10 +104,13 @@ class RoutingPolicy:
     # Sender for an email from a wake whose source has no mailbox of its own
     # (a Quo text, a Cliq message): Nigel's mailbox.
     email_default_account: str = ""
-    # Line for a text from a wake whose source has no Quo line of its own (a
-    # TenantCloud notification email, a Cliq message): PFG-General per Dan's
-    # 2026-09-11 directive (wake 27269 recorded an empty line instead).
-    quo_default_line: str = ""
+    # The only lines a text goes out from, named by quo.sms.send's from_phone:
+    # E.164 number -> Quo phone_number_id. There is no default line: the
+    # agent always names one (a Notice to Quit dpark asked to send from
+    # Collections went out from PFG-General, action 9268804d). Config, not a
+    # judgment: a line that is absent (Listing, staff's own numbers) cannot
+    # be named.
+    quo_sending_lines: Mapping[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -240,7 +242,11 @@ class ActionContextLoader:
         self._repository = repository
         self._policy = policy
 
-    async def load(self, request: ExecuteRequest) -> ActionContext:
+    async def load(self, request: ExecuteRequest, *, recorded_account: str | None = None) -> ActionContext:
+        """The context for `request`. recorded_account is the provider_account
+        of the stored action being re-derived (a resume, reconcile, override
+        or revise): a text recorded before from_phone existed keeps the line
+        it was recorded with (sending_line)."""
         record = await self._repository.load_wake_event(request.wakeup_event_id)
         if record is None:
             raise ContextDerivationError(
@@ -280,7 +286,7 @@ class ActionContextLoader:
             provider,
             thread_identity,
             message,
-            raw,
+            recorded_account,
         )
         if not target.verified:
             raise ContextDerivationError(
@@ -843,7 +849,7 @@ class ActionContextLoader:
         provider: str,
         thread_identity: str,
         message: Mapping[str, Any],
-        raw: Mapping[str, Any],
+        recorded_account: str | None,
     ) -> tuple[DerivedTarget, str]:
         if request.operation is Operation.TENANTCLOUD_MESSAGE_SEND:
             assert isinstance(request.arguments, TenantCloudMessageArguments)
@@ -875,35 +881,10 @@ class ActionContextLoader:
             return DerivedTarget("email_thread", request.arguments.to_address, True), account
         if request.operation is Operation.QUO_SMS_SEND:
             assert isinstance(request.arguments, QuoSmsArguments)
-            configured_account = self._policy.quo_line_by_provider.get(provider, "") or self._policy.quo_default_line
-            nested = _mapping(_mapping(raw.get("data")).get("object"))
-            observed_account = _nonblank(nested.get("phoneNumberId") or nested.get("phone_number_id"))
-            observed_direction = _nonblank(nested.get("direction"))
-            observed_inbound = str(observed_direction or "").casefold() in {
-                "inbound",
-                "incoming",
-                "received",
-            }
-            # A Quo inbound webhook is server-side provider evidence for the
-            # receiving line.  Use that exact line for replies; one
-            # configured default cannot represent multiple PFG lines. This is
-            # account/line selection, not recipient identity -- the agent's
-            # to_phone (above) is the only thing that decides who receives
-            # the message.
-            account = (
-                observed_account
-                if provider == "quo" and observed_account and observed_inbound
-                else configured_account
+            return (
+                DerivedTarget("quo_conversation", request.arguments.to_phone, True),
+                self.sending_line(request.arguments, recorded_account),
             )
-            if not account:
-                # Refuse now, where the agent sees why, instead of recording a
-                # send no worker can ever deliver (wake 27269).
-                raise ContextDerivationError(
-                    f"no Quo line is configured for provider {provider!r}. Nothing was sent: this "
-                    "wake's source cannot text through the gateway. Reply on another operation the "
-                    "gateway offers for it, or record needs_human."
-                )
-            return DerivedTarget("quo_conversation", request.arguments.to_phone, True), account
         if request.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
             assert isinstance(request.arguments, CliqArguments)
             if request.intent_kind == IntentKind.INTERNAL_REPLY:
@@ -938,6 +919,42 @@ class ActionContextLoader:
         configured_calendar = self._policy.calendar_by_profile.get(profile, "")
         account = self._policy.calendar_account_by_profile.get(profile, configured_calendar)
         return DerivedTarget("calendar", request.arguments.calendar_id, True), account
+
+    def sending_line(self, arguments: QuoSmsArguments, recorded_account: str | None = None) -> str:
+        """The Quo line (phoneNumberId) a text goes out from: its from_phone
+        in quo_sending_lines. The agent always names the line (dpark
+        2026-10-07: no default, "just give error message and its options"),
+        so anything else is refused with the lines it can name. A stored
+        text from before from_phone existed (recorded_account set) keeps its
+        recorded line only while the map still holds it: re-deriving it must
+        never reopen a line left out on purpose (PFG Listing, dpark
+        2026-09-11), and no override can change that, so its refusal sends
+        the agent to a new execute instead of another override."""
+        from_phone = arguments.from_phone
+        if from_phone is None and recorded_account is not None:
+            if recorded_account in self._policy.quo_sending_lines.values():
+                return recorded_account
+            why = (
+                "this text was recorded on a line the gateway does not send from, and an override cannot "
+                "change its line. Nothing was sent."
+            )
+            step = "Execute it as a new message with one of them as from_phone."
+        else:
+            line = self._policy.quo_sending_lines.get(from_phone or "")
+            if line:
+                return line
+            why = (
+                "from_phone is missing. Nothing was sent: quo.sms.send must name the line to send from."
+                if from_phone is None
+                else f"from_phone {from_phone} is not a line the gateway can send from. Nothing was sent."
+            )
+            step = "Send again with one of them as from_phone."
+        lines = ", ".join(self._policy.quo_sending_lines)
+        if not lines:
+            raise ContextDerivationError(
+                f"{why} No Quo sending lines are configured, so the gateway cannot text: record needs_human."
+            )
+        raise ContextDerivationError(f"{why} Lines it can send from: {lines}. {step}")
 
     def _wake_tenantcloud_hints(self, record: WakeEventRecord) -> dict[str, str]:
         """Best-effort provider ids implied by a wake's TenantCloud claim

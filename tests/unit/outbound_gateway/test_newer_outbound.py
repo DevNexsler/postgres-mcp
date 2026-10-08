@@ -120,7 +120,7 @@ class Loader:
 
     source = "cliq"
 
-    async def load(self, request: ExecuteRequest) -> ActionContext:
+    async def load(self, request: ExecuteRequest, *, recorded_account: str | None = None) -> ActionContext:
         arguments = request.arguments.model_dump(mode="json", exclude_none=True)
         target_id = str(arguments.get("to_address") or arguments.get("to_phone"))
         kind = "email_thread" if request.operation is Operation.EMAIL_SEND else "quo_conversation"

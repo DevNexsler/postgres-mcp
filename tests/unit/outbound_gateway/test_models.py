@@ -16,6 +16,7 @@ from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import QuoSmsArguments
 from postgres_mcp.outbound_gateway.models import StatusRequest
 from postgres_mcp.outbound_gateway.models import SuggestRequest
+from postgres_mcp.outbound_gateway.models import operation_catalog
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 
 
@@ -467,6 +468,33 @@ def test_quo_to_phone_rejects_non_e164_values(bad):
         )
 
 
+def test_quo_from_phone_is_only_stripped_so_context_can_answer_with_the_lines():
+    """Context derivation, not the model, requires from_phone and checks it
+    against the sending lines: a text stored before it existed must still
+    parse (to None), and a malformed line must reach the refusal that lists
+    the lines it can send from, not a bare format error."""
+    def quo(**arguments):
+        return parse_outbound_request(
+            execute_payload(
+                operation="quo.sms.send",
+                intent_kind="inquiry_reply",
+                appointment_slot=None,
+                arguments={"to_phone": "+19085550100", "text": "Thanks", **arguments},
+            )
+        )
+
+    assert quo().arguments.from_phone is None
+    assert quo(from_phone=" +17579972130 ").arguments.from_phone == "+17579972130"
+    assert quo(from_phone=" (757) 997-2130 ").arguments.from_phone == "(757) 997-2130"
+    assert quo(from_phone="   ").arguments.from_phone is None
+
+
+@pytest.mark.parametrize("bad", [5, True, ["+17579972130"]])
+def test_quo_from_phone_rejects_non_string_values(bad):
+    with pytest.raises(ValidationError, match="from_phone must be a string"):
+        QuoSmsArguments.model_validate({"to_phone": "+19085550100", "text": "Thanks", "from_phone": bad})
+
+
 @pytest.mark.parametrize("operation", ["cliq.channel.post", "cliq.chat.post"])
 def test_cliq_arguments_carry_the_agent_supplied_channel_or_chat_id(operation):
     role = "internal_notification"
@@ -812,7 +840,7 @@ def test_a_stored_over_long_message_still_rebuilds_so_it_can_settle():
 
 SAMPLE_ARGUMENTS = {
     Operation.EMAIL_SEND: {"to_address": "dan@pfg.io", "text": "hi"},
-    Operation.QUO_SMS_SEND: {"to_phone": "+12015756789", "text": "hi"},
+    Operation.QUO_SMS_SEND: {"to_phone": "+12015756789", "text": "hi", "from_phone": "+16107095575"},
     Operation.CLIQ_CHANNEL_POST: {"channel_or_chat_id": "tenant-leads", "text": "hi"},
     Operation.CLIQ_CHAT_POST: {"channel_or_chat_id": "CT_1", "text": "hi"},
     Operation.CALENDAR_CREATE: {"calendar_id": "nigel"},
@@ -832,7 +860,7 @@ SAMPLE_ARGUMENTS = {
 def test_every_catalog_line_is_a_request_the_gateway_accepts(operation):
     """The tool description tells every profile how to call each operation;
     a line that the parser rejects would teach agents a broken request."""
-    from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS, OPERATION_USAGE, operation_catalog
+    from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS, OPERATION_USAGE, REQUIRED_OF_NEW_REQUESTS, operation_catalog
 
     role, intent, _purpose = OPERATION_USAGE[operation]
     payload = {
@@ -844,4 +872,13 @@ def test_every_catalog_line_is_a_request_the_gateway_accepts(operation):
     assert parse_outbound_request(payload).operation is operation
     line = next(line for line in operation_catalog().splitlines() if line.startswith(f"{operation.value}:"))
     for name, field in ARGUMENT_MODELS[operation].model_fields.items():
-        assert (name if field.is_required() else f"{name}?") in line
+        assert (name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?") in line
+
+
+def test_the_catalog_teaches_from_phone_as_required():
+    """from_phone is optional in the model only so stored texts still parse;
+    the agent must always name it, so the catalog must not mark it "?"."""
+    line = next(line for line in operation_catalog().splitlines() if line.startswith("quo.sms.send:"))
+    assert "arguments {to_phone, text, from_phone}" in line
+    assert "from_phone?" not in line
+    assert "from_phone (E.164) is the line to send from, always required" in line

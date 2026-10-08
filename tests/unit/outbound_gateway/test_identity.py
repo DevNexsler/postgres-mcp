@@ -4,6 +4,7 @@ effect, whatever the gateway derived around them."""
 from postgres_mcp.outbound_gateway.identity import request_arguments
 from postgres_mcp.outbound_gateway.identity import same_request
 from postgres_mcp.outbound_gateway.models import EmailArguments
+from postgres_mcp.outbound_gateway.models import QuoSmsArguments
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 
 
@@ -34,4 +35,15 @@ def test_omitted_later_optional_fields_are_left_out_of_the_stored_form():
     }
     assert request_arguments(EmailArguments(to_address="dan@pfg.io", text="hi", subject="S")) == {
         "to_address": "dan@pfg.io", "text": "hi", "subject": "S",
+    }
+
+
+def test_a_text_without_from_phone_stores_exactly_as_before():
+    """from_phone was added after texts were stored; a text that leaves it
+    out must store (and hash) exactly as before."""
+    assert request_arguments(QuoSmsArguments(to_phone="+12015756789", text="hi")) == {
+        "to_phone": "+12015756789", "text": "hi",
+    }
+    assert request_arguments(QuoSmsArguments(to_phone="+12015756789", text="hi", from_phone="+17579972130")) == {
+        "to_phone": "+12015756789", "text": "hi", "from_phone": "+17579972130",
     }

@@ -208,6 +208,8 @@ class ActionStore(Protocol):
 
     async def get(self, action_id: UUID) -> OutboundActionRecord | None: ...
 
+    async def request_account(self, request: ExecuteRequest) -> str | None: ...
+
     async def schedule_next_attempt(
         self,
         action_id: UUID,

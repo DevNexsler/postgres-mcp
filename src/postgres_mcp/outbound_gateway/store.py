@@ -15,9 +15,11 @@ from postgres_mcp.sql import SafeSqlDriver
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
+from .identity import request_arguments
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
+from .models import ExecuteRequest
 from .models import Operation
 from .models import RequestRefusedError
 from .service import OutboundActionRecord
@@ -524,6 +526,36 @@ class PostgresActionStore:
             [action_id],
         )
         return await self._hydrated_record(rows[0].cells) if rows else None
+
+    async def request_account(self, request: ExecuteRequest) -> str | None:
+        """provider_account of the stored action `request` repeats word for
+        word -- the same match Comm-Data-Store migration 251's
+        create_or_load_outbound_action makes -- or None."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT provider_account FROM outbound_actions
+            WHERE identity_version = 'v1'
+              AND wakeup_event_id = {}
+              AND action_role = {}
+              AND retry_of_action_id IS NULL
+              AND operation = {}
+              AND intent_kind = {}
+              AND appointment_slot IS NOT DISTINCT FROM {}
+              AND arguments = {}::jsonb
+            ORDER BY effect_ordinal
+            LIMIT 1
+            """,
+            [
+                request.wakeup_event_id,
+                request.action_role.value,
+                request.operation.value,
+                request.intent_kind,
+                request.appointment_slot,
+                _json(request_arguments(request.arguments)),
+            ],
+        )
+        return str(rows[0].cells["provider_account"] or "") if rows else None
 
     async def schedule_next_attempt(
         self,

@@ -92,6 +92,12 @@ def record(**overrides):
     return WakeEventRecord(**values)
 
 
+# CDS's compose default (prod channels table): PFG-General, Collections,
+# Maintenance. Listing (+17623726083) is deliberately absent.
+PFG_GENERAL, COLLECTIONS, MAINTENANCE, LISTING = "+16107095575", "+17579972130", "+14846260220", "+17623726083"
+SENDING_LINES = {PFG_GENERAL: "PN8ujudrpa", COLLECTIONS: "PNkmv4nD54", MAINTENANCE: "PNvHh9Fq2k"}
+
+
 def policy():
     return RoutingPolicy(
         version="appointment-v1",
@@ -99,11 +105,6 @@ def policy():
             "zillow": "nigel-zoho",
             "hotpads": "nigel-zoho",
             "tenantcloud": "nigel-zoho",
-        },
-        quo_line_by_provider={
-            "quo": "leasing-main",
-            "tenantcloud": "leasing-main",
-            "zillow": "leasing-main",
         },
         calendar_by_profile={"appointment-setter": "nigel"},
         cliq_target_by_intent={"lead_alert": "tenant-leads"},
@@ -116,6 +117,7 @@ def policy():
             "zillow:zrm-thread-44": "conversation:zillow-amanda-bullman",
             "hotpads:zrm-thread-44": "conversation:zillow-amanda-bullman",
         },
+        quo_sending_lines=SENDING_LINES,
     )
 
 
@@ -620,11 +622,11 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 operation="quo.sms.send",
                 intent_kind="inquiry_reply",
                 appointment_slot=None,
-                arguments={"to_phone": "+19085551234", "text": "Thanks"},
+                arguments={"to_phone": "+19085551234", "text": "Thanks", "from_phone": PFG_GENERAL},
             ),
             "quo_conversation",
             "+19085551234",
-            "leasing-main",
+            "PN8ujudrpa",
         ),
         (
             record(
@@ -793,11 +795,14 @@ async def test_provider_operation_allowlist_gate_is_removed_for_cross_channel_ro
     )
 
     context = await ActionContextLoader(FakeRepository(tenantcloud), policy()).load(
-        request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Friday at 10:30 works.\r\n— Nigel"})
+        request(
+            operation="quo.sms.send",
+            arguments={"to_phone": "+19085550199", "text": "Friday at 10:30 works.\r\n— Nigel", "from_phone": PFG_GENERAL},
+        )
     )
 
     assert context.source == "tenantcloud"
-    assert context.provider_account == "leasing-main"
+    assert context.provider_account == "PN8ujudrpa"
     assert context.target.target_id == "+19085550199"
 
 
@@ -965,7 +970,7 @@ async def test_live_shape_quo_phone_number_and_nested_conversation_are_canonical
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"to_phone": "+19085550199", "text": "Thanks"},
+            arguments={"to_phone": "+19085550199", "text": "Thanks", "from_phone": PFG_GENERAL},
         )
     )
 
@@ -1017,7 +1022,7 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"to_phone": "+19085550140", "text": "Hi, we missed your call. How can we help? — Nigel"},
+            arguments={"to_phone": "+19085550140", "text": "Hi, we missed your call. How can we help? — Nigel", "from_phone": PFG_GENERAL},
         )
     )
 
@@ -1025,48 +1030,19 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
     assert context.target.kind == "quo_conversation"
     assert context.target.target_id == "+19085550140"
     assert context.target.verified is True
-    assert context.provider_account == "leasing-main"
+    # The call rang the Listing line (related_call.to_number), which no agent
+    # sends from; the agent's from_phone decides.
+    assert context.provider_account == "PN8ujudrpa"
     assert context.recipient_phone == "+19085550140"
 
 
 @pytest.mark.asyncio
-async def test_quo_inbound_uses_observed_receiving_line_over_default_route():
-    event = record(
-        event_source="quo",
-        message_source="quo",
-        channel_type="phone_number",
-        participant_type="phone_number",
-        participant_key="+19085550199",
-        raw_payload={
-            "data": {
-                "object": {
-                    "conversationId": "quo-conversation-live",
-                    "phoneNumberId": "different-line",
-                    "direction": "incoming",
-                    "from": "+19085550199",
-                }
-            }
-        },
-        envelope={"identity": {}, "message": {"property": "16 N Main St #16"}},
-    )
-
-    context = await ActionContextLoader(FakeRepository(event), policy()).load(
-        request(
-            operation="quo.sms.send",
-            intent_kind="inquiry_reply",
-            appointment_slot=None,
-            arguments={"to_phone": "+19085550199", "text": "Thanks"},
-        )
-    )
-
-    # The phoneNumberId arrived from the Quo webhook, not agent input.  Reply
-    # from that receiving line so multi-line inbound threads remain replyable.
-    assert context.target.verified is True
-    assert context.provider_account == "different-line"
-
-
-@pytest.mark.asyncio
-async def test_maintenance_line_reply_uses_receiving_quo_account():
+@pytest.mark.parametrize(("from_phone", "line"), list(SENDING_LINES.items()))
+async def test_a_reply_to_a_quo_text_goes_out_from_the_line_the_agent_names(from_phone, line):
+    """A tenant texted the Maintenance line; the line the text came in on no
+    longer picks the sending line -- from_phone does, even when it names
+    another line (dpark's Notice to Quit, asked from Collections, went out
+    from PFG-General: action 9268804d)."""
     event = record(
         event_source="quo",
         message_source="quo",
@@ -1091,11 +1067,13 @@ async def test_maintenance_line_reply_uses_receiving_quo_account():
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"to_phone": "+19085550199", "text": "Thanks"},
+            arguments={"to_phone": "+19085550199", "text": "Thanks", "from_phone": from_phone},
         )
     )
 
-    assert context.provider_account == "PNvHh9Fq2k"
+    assert context.provider_account == line
+    assert context.canonical_context["provider_account"] == line
+    assert context.arguments["from_phone"] == from_phone
     assert context.recipient_phone == "+19085550199"
 
 
@@ -1136,13 +1114,13 @@ async def test_quo_route_allows_inquiry_reply_and_a_propertyless_showing_offer()
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"to_phone": "+19085550199", "text": "Thanks"},
+            arguments={"to_phone": "+19085550199", "text": "Thanks", "from_phone": PFG_GENERAL},
         )
     )
     assert inquiry.intent_kind == "inquiry_reply"
 
     showing_offer = await ActionContextLoader(FakeRepository(event), policy()).load(
-        request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks"})
+        request(operation="quo.sms.send", arguments={"to_phone": "+19085550199", "text": "Thanks", "from_phone": PFG_GENERAL})
     )
     assert showing_offer.intent_kind == "showing_offer"
     assert showing_offer.property_id == "target:quo_conversation:+19085550199"
@@ -1592,7 +1570,7 @@ async def test_adversarial_quo_shared_line_send_goes_only_to_agent_supplied_phon
             operation="quo.sms.send",
             intent_kind="inquiry_reply",
             appointment_slot=None,
-            arguments={"to_phone": "+19085559999", "text": "Thanks for reaching out"},
+            arguments={"to_phone": "+19085559999", "text": "Thanks for reaching out", "from_phone": PFG_GENERAL},
         )
     )
 
@@ -2254,31 +2232,121 @@ async def test_a_qualification_send_cannot_add_recipients():
         )
 
 
-def _quo_request(to_phone="+12015756789"):
+def _quo_request(to_phone="+12015756789", **arguments):
     return request(
         operation="quo.sms.send", intent_kind="inquiry_reply", appointment_slot=None,
-        arguments={"to_phone": to_phone, "text": "Ticket #1569672 created."},
+        arguments={"to_phone": to_phone, "text": "Ticket #1569672 created.", **arguments},
+    )
+
+
+_NON_QUO_WAKES = {
+    # Wake 27269: a TenantCloud notification email (source zoho_mail).
+    "zoho_mail": dict(message_source="zoho_mail", channel_type="email_thread", participant_key="noreply@tenantcloud.com",
+                      raw_payload={}, envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}}),
+    "tenantcloud": dict(raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"}, participant_key="+19085550199",
+                        participant_type="phone", channel_type="sms",
+                        envelope={"identity": {}, "message": {"property": "16 N Main St #16", "phone": "+1 908 555 0199"}}),
+    "zoho_cliq": dict(event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_2243226981154968407",
+                      channel_type="dm", participant_type="user", participant_key="dan", raw_payload={"provider": "cliq"},
+                      envelope={"identity": {}, "message": {}}),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake", list(_NON_QUO_WAKES))
+async def test_a_text_from_a_wake_with_no_line_of_its_own_goes_out_from_the_named_line(wake):
+    """A wake with no Quo line (an email, a TenantCloud lead, a Cliq DM from
+    dpark) texts from the line the agent names -- there is no default."""
+    event = record(**_NON_QUO_WAKES[wake])
+    context = await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(from_phone=COLLECTIONS))
+    assert context.provider_account == "PNkmv4nD54"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake", ["quo", *_NON_QUO_WAKES])
+async def test_a_text_without_from_phone_is_refused_with_the_lines_it_can_send_from(wake):
+    """dpark 2026-10-07: "Dont make default. agent always need to choose. If
+    it doesnt do it. just give error message and its options." Refused at
+    derivation -- before any row (test_override proves none) -- on every
+    kind of wake, a Quo text included."""
+    values = _NON_QUO_WAKES.get(wake) or dict(
+        event_source="quo", message_source="quo", channel_type="phone_number", participant_type="phone_number",
+        participant_key="+12015756789",
+        raw_payload={"data": {"object": {"phoneNumberId": "PNvHh9Fq2k", "direction": "incoming", "from": "+12015756789"}}},
+    )
+    repository = FakeRepository(record(**values))
+    with pytest.raises(ContextDerivationError) as refused:
+        await ActionContextLoader(repository, policy()).load(_quo_request())
+    assert str(refused.value) == (
+        "from_phone is missing. Nothing was sent: quo.sms.send must name the line to send from. Lines it can "
+        "send from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
     )
 
 
 @pytest.mark.asyncio
-async def test_a_text_from_a_wake_without_its_own_line_uses_the_default_line():
-    """Wake 27269: a TenantCloud notification email (source zoho_mail) asked
-    for a text. zoho_mail has no Quo line, so the action was recorded with an
-    empty line; Quo could never send it and it parked in manual_review."""
-    event = record(message_source="zoho_mail", channel_type="email_thread",
-                   participant_key="noreply@tenantcloud.com", raw_payload={},
-                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
-    defaulted = dataclasses.replace(policy(), quo_line_by_provider={"zillow": "PNlisting"}, quo_default_line="PN8ujudrpa")
-    context = await ActionContextLoader(FakeRepository(event), defaulted).load(_quo_request())
-    assert context.provider_account == "PN8ujudrpa"
+@pytest.mark.parametrize(
+    "from_phone", [LISTING, "+16109735105", "+13018875706", "(757) 997-2130", "<our line you send from, E.164>"]
+)
+async def test_a_text_from_a_line_outside_the_map_is_refused_with_the_lines_it_can_send_from(from_phone):
+    """Listing is banned for agent sends; PFG-Dan and Laura's personal
+    number are not agent lines. None of them is in the map, so none can be
+    named. A malformed line (a copied placeholder, a US-formatted number)
+    gets the same list rather than a bare format error."""
+    event = record(**_NON_QUO_WAKES["zoho_mail"])
+    with pytest.raises(ContextDerivationError) as refused:
+        await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(from_phone=from_phone))
+    assert str(refused.value) == (
+        f"from_phone {from_phone} is not a line the gateway can send from. Nothing was sent. Lines it can send "
+        "from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_text_with_no_line_at_all_is_refused_when_asked_not_parked_later():
-    event = record(message_source="zoho_mail", channel_type="email_thread",
-                   participant_key="noreply@tenantcloud.com", raw_payload={},
-                   envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}})
-    no_line = dataclasses.replace(policy(), quo_line_by_provider={}, quo_default_line="")
-    with pytest.raises(ContextDerivationError, match="no Quo line is configured"):
-        await ActionContextLoader(FakeRepository(event), no_line).load(_quo_request())
+async def test_with_no_sending_lines_configured_every_text_is_refused_as_such():
+    event = record(**_NON_QUO_WAKES["zoho_mail"])
+    no_lines = dataclasses.replace(policy(), quo_sending_lines={})
+    with pytest.raises(ContextDerivationError) as refused:
+        await ActionContextLoader(FakeRepository(event), no_lines).load(_quo_request(from_phone=PFG_GENERAL))
+    assert str(refused.value) == (
+        "from_phone +16107095575 is not a line the gateway can send from. Nothing was sent. No Quo sending "
+        "lines are configured, so the gateway cannot text: record needs_human."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_text_recorded_before_from_phone_keeps_its_recorded_line_when_re_derived():
+    """A row recorded before from_phone existed stores {to_phone, text}. Its
+    re-derivation (resume, reconcile, an override's successor, a revise)
+    keeps the line it was recorded with, so an override of it sends instead
+    of being refused, offered again and refused forever. A new request
+    still names its line; a stored from_phone still decides."""
+    event = record(**_NON_QUO_WAKES["zoho_mail"])
+    loader = ActionContextLoader(FakeRepository(event), policy())
+    stored = _quo_request()
+    assert "from_phone" not in stored.arguments.model_dump(exclude_none=True)
+
+    context = await loader.load(stored, recorded_account="PN8ujudrpa")
+    assert context.provider_account == "PN8ujudrpa"
+    assert set(context.arguments) == {"to_phone", "text"}
+    named = await loader.load(_quo_request(from_phone=COLLECTIONS), recorded_account="PN8ujudrpa")
+    assert named.provider_account == "PNkmv4nD54"
+    with pytest.raises(ContextDerivationError, match="from_phone is missing"):
+        await loader.load(stored)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_account", ["PNtjMqMO2h", ""], ids=["listing", "none"])
+async def test_a_text_recorded_on_a_line_outside_the_map_is_never_re_derived_onto_it(recorded_account):
+    """250 stored texts were recorded on PFG Listing (PNtjMqMO2h) before the
+    2026-09-11 ban, and two with no line at all (wake 27269). Re-deriving
+    one (an override, a revise, a resume) must not reopen that line, and
+    since no override can change it the refusal sends the agent to a new
+    execute -- never "send again" into another override."""
+    event = record(**_NON_QUO_WAKES["zoho_mail"])
+    with pytest.raises(ContextDerivationError) as refused:
+        await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(), recorded_account=recorded_account)
+    assert str(refused.value) == (
+        "this text was recorded on a line the gateway does not send from, and an override cannot change its "
+        "line. Nothing was sent. Lines it can send from: +16107095575, +17579972130, +14846260220. Execute it "
+        "as a new message with one of them as from_phone."
+    )

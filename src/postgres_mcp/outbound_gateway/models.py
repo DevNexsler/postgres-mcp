@@ -353,11 +353,27 @@ class EmailArguments(StrictModel):
 class QuoSmsArguments(StrictModel):
     to_phone: str
     text: str
+    # The line to send from, by its number (context.RoutingPolicy.
+    # quo_sending_lines). Required of every new text -- context derivation
+    # refuses one without it -- but optional here so texts recorded before
+    # it existed still parse and hash as stored (LATER_OPTIONAL_ARGUMENTS).
+    # Only stripped here: the map's keys are E.164, so a malformed value is
+    # simply not a line, and its refusal lists the lines it can send from.
+    from_phone: str | None = None
 
     @field_validator("to_phone", mode="before")
     @classmethod
     def normalize_to_phone(cls, value: Any) -> str:
         return normalize_target_phone(value, field="to_phone")
+
+    @field_validator("from_phone", mode="before")
+    @classmethod
+    def normalize_from_phone(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("from_phone must be a string")
+        return value.strip() or None
 
     @field_validator("text", mode="before")
     @classmethod
@@ -671,7 +687,11 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
         "email anyone; sent from Nigel's mailbox; attachments is a list of "
         "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
     ),
-    Operation.QUO_SMS_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "text anyone (to_phone E.164)"),
+    Operation.QUO_SMS_SEND: (
+        ActionRole.PROSPECT_REPLY,
+        IntentKind.INQUIRY_REPLY,
+        "text anyone (to_phone E.164); from_phone (E.164) is the line to send from, always required",
+    ),
     Operation.CLIQ_CHAT_POST: (ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),
     Operation.CLIQ_CHANNEL_POST: (
         ActionRole.INTERNAL_NOTIFICATION,
@@ -700,6 +720,11 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
 }
 
 
+# Optional in the model only so stored actions still parse; every new
+# request must carry them (QuoSmsArguments.from_phone).
+REQUIRED_OF_NEW_REQUESTS = frozenset({"from_phone"})
+
+
 def operation_catalog() -> str:
     """One line per operation: the exact role, intent and argument names
     (optional ones marked ?), drawn from the argument models themselves."""
@@ -707,7 +732,8 @@ def operation_catalog() -> str:
     for operation, model in ARGUMENT_MODELS.items():
         role, intent, purpose = OPERATION_USAGE[operation]
         fields = ", ".join(
-            name if field.is_required() else f"{name}?" for name, field in model.model_fields.items()
+            name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?"
+            for name, field in model.model_fields.items()
         )
         lines.append(
             f'{operation.value}: action_role "{role.value}", intent_kind "{intent.value}", '

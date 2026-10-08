@@ -39,6 +39,7 @@ from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
+from .models import QuoSmsArguments
 from .models import StaleContextDecision
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
@@ -307,7 +308,7 @@ class OutboundActionService:
         return await self._execute(request, dispatch=False)
 
     async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
-        context = await self._context_loader.load(request)
+        context = await self._load(request)
         enabled = self._stale.enabled
         action = None
         existing = None
@@ -333,6 +334,21 @@ class OutboundActionService:
             return await self._execute_recorded(row, context, request, enabled=enabled, dispatch=dispatch)
 
         return await self._settled(action, recorded, agent_facing=True)
+
+    async def _load(self, request: ExecuteRequest) -> ActionContext:
+        try:
+            return await self._context_loader.load(request)
+        except ContextDerivationError:
+            # A text recorded before from_phone existed, repeated word for
+            # word, is that same action on its recorded line. Refused, the
+            # agent's resend with from_phone would be a new action: the
+            # prospect would get the text twice.
+            if request.operation is not Operation.QUO_SMS_SEND or getattr(request.arguments, "from_phone", None):
+                raise
+            recorded = await self._store.request_account(request)
+            if recorded is None:
+                raise
+            return await self._context_loader.load(request, recorded_account=recorded)
 
     async def _execute_recorded(
         self,
@@ -370,6 +386,16 @@ class OutboundActionService:
         records that it chose not to."""
         parent = await self._require_action(request.action_id)
         check_own_wake(parent, request)
+        if parent.operation is Operation.QUO_SMS_SEND and request.decision is not StaleContextDecision.NO:
+            # An answer cannot change a text's line, so one it cannot send
+            # from is refused here, before a successor exists to be refused
+            # for it and offered the override again.
+            arguments = parent.execute_request().arguments
+            assert isinstance(arguments, QuoSmsArguments)
+            try:
+                self._context_loader.sending_line(arguments, parent.provider_account)
+            except ContextDerivationError as error:
+                raise refusal(f"confirm refused for action {parent.action_id}: {error}") from error
         if parent.state is ActionState.STALE and parent.detail_code in STALE_CONTEXT_DETAILS:
             return await self._stale.confirm(request, parent, dispatch=dispatch)
         return await self._override(parent, request, dispatch=dispatch)
@@ -1014,7 +1040,7 @@ class OutboundActionService:
         record on the attempt (recovery.py) or show the agent (`detail`).
         None on any success."""
         try:
-            live = await self._context_loader.load(action.execute_request())
+            live = await self._context_loader.load(action.execute_request(), recorded_account=action.provider_account)
         except ContextDerivationError as error:
             reason = _bounded_reload_reason(error)
             logger.warning(

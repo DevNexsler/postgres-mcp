@@ -84,13 +84,14 @@ QUO_SOURCE_AT = datetime(2026, 8, 27, 18, 20, 16, tzinfo=timezone.utc)
 POLICY = RoutingPolicy(
     version="appointment-v1",
     email_account_by_provider={},
-    quo_line_by_provider={},
     calendar_by_profile={},
     cliq_target_by_intent={},
     property_aliases={},
     conversation_aliases={},
     email_default_account="nigel-zoho",
-    quo_default_line=QUO_LINE,
+    # Only to reproduce the line wake 27300 was answered on (2026-08-27); the
+    # Listing line has been banned for agent sends since 2026-09-11.
+    quo_sending_lines={QUO_LINE_PHONE: QUO_LINE},
 )
 
 
@@ -465,7 +466,7 @@ def sms_request(to_phone: str = QUO_PROSPECT) -> ExecuteRequest:
             "action_role": "prospect_reply",
             "operation": "quo.sms.send",
             "intent_kind": "inquiry_reply",
-            "arguments": {"text": "Saturday at 9 works, see you then.", "to_phone": to_phone},
+            "arguments": {"text": "Saturday at 9 works, see you then.", "to_phone": to_phone, "from_phone": QUO_LINE_PHONE},
         }
     )
     assert isinstance(parsed, ExecuteRequest)
