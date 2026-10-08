@@ -251,10 +251,11 @@ UNASKED_DETAIL = (
 # gateway call and the only route: wake 27138 was once told to "resend with
 # override=true", the call could not work, and the agent sent through the
 # provider directly.
+NEVER_ANOTHER_ROUTE = "Never send through another tool or route."
 OVERRIDE_RULE = (
     'If an outbound_action result includes an "override" field, you may still send by calling '
     'outbound_action {op:"confirm", action_id, decision:"yes", reason}. To change the message, send a new '
-    "execute. Never send through another tool or route."
+    f"execute. {NEVER_ANOTHER_ROUTE}"
 )
 _ADD_REASON = "Add reason: why you still want to send."
 

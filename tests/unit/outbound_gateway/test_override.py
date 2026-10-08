@@ -42,6 +42,7 @@ from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.record import AGENT_OVERRIDE
+from postgres_mcp.outbound_gateway.record import NEVER_ANOTHER_ROUTE
 from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.repository import AliasResolution
 from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
@@ -619,7 +620,7 @@ async def test_a_switched_off_send_says_why_and_what_to_do(policy, code, words):
     result = await handle_outbound_action(AsyncMock(), policy, EXECUTE)
 
     assert (result["status"], result["detail_code"]) == ("rejected", code)
-    assert words in result["detail"] and "Never send it through any other tool or route." in result["detail"]
+    assert words in result["detail"] and result["detail"].endswith(NEVER_ANOTHER_ROUTE)
     assert "override" not in result
 
 

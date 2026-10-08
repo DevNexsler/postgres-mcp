@@ -57,6 +57,7 @@ from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
+from .record import NEVER_ANOTHER_ROUTE
 from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
@@ -274,14 +275,14 @@ def _failure(error: Exception, op: str) -> dict[str, Any]:
         "detail": (
             f"The gateway hit an error ({error_text(error)}) before it could say what happened. The same "
             "call again is the same action, never a second send: make it again to see where it stands; if it "
-            "fails again, record needs_human. Never send through another tool or route."
+            f"fails again, record needs_human. {NEVER_ANOTHER_ROUTE}"
         ),
     }
 
 
 SENDING_PAUSED_DETAIL = (
     "Not sent: an operator has paused sending through this gateway, and nothing was recorded. Record "
-    "needs_human with what you meant to send. Never send it through any other tool or route."
+    f"needs_human with what you meant to send. {NEVER_ANOTHER_ROUTE}"
 )
 
 
@@ -289,8 +290,7 @@ def _operation_disabled_detail(operation: Operation, policy: FeaturePolicy) -> s
     enabled = ", ".join(sorted(op.value for op in policy.enabled_operations)) or "none"
     return (
         f"Not sent: {operation.value} is not enabled on this gateway, and nothing was recorded. Enabled "
-        f"operations: {enabled}. Use one of them, or record needs_human. Never send it through any other "
-        "tool or route."
+        f"operations: {enabled}. Use one of them, or record needs_human. {NEVER_ANOTHER_ROUTE}"
     )
 
 
