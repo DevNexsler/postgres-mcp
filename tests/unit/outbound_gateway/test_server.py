@@ -416,7 +416,9 @@ def test_focused_server_tool_description_names_the_override_only_as_op_confirm_a
     assert "override=true" not in lowered and '"override": true' not in lowered
     # The one override rule, word for word as Comm-Data-Store teaches it.
     assert OVERRIDE_RULE in description
-    assert 'outbound_action {op:"confirm", action_id, decision:"yes", reason}' in OVERRIDE_RULE
+    # The request is the result's own override object (it carries the
+    # wakeup_event_id confirm requires), plus the agent's reason.
+    assert 'send that object back as the outbound_action request, adding "reason"' in OVERRIDE_RULE
     never = "Never send through another tool or route."
     assert OVERRIDE_RULE.endswith(never)
     # Every mention of override comes before, and ends with, the

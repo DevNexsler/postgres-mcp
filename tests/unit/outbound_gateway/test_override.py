@@ -135,7 +135,7 @@ async def call(service, payload, *, submitter=None, routed=ROUTED):
 def assert_offers_override(result: dict[str, Any], action_id) -> None:
     # The request without a reason: there is no placeholder to echo back.
     assert result["override"] == {"op": "confirm", "wakeup_event_id": WAKE, "action_id": str(action_id), "decision": "yes"}
-    assert result["detail"].endswith(f"{OVERRIDE_RULE} Add reason: why you still want to send.")
+    assert result["detail"].endswith(OVERRIDE_RULE)
 
 
 def assert_no_override(result: dict[str, Any]) -> None:
@@ -431,7 +431,16 @@ async def test_confirm_on_a_message_that_was_sent_says_so_and_to_send_a_new_one(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "reason", [None, "   ", "<why>", "<required: why you still want to send it>", "reason", "Add reason: why you still want to send."]
+    "reason",
+    [
+        None,
+        "   ",
+        "<why>",
+        "<required: why you still want to send it>",
+        "reason",
+        "Add reason: why you still want to send.",
+        "(why you still want to send)",
+    ],
 )
 async def test_an_override_needs_a_written_reason_not_a_blank_or_a_template(reason):
     service, store, adapter = harness()

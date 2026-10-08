@@ -816,7 +816,7 @@ class SuggestRequest(StrictModel):
 
 # A reason copied from an instruction instead of written: "<why>",
 # "<required: ...>", "reason", "why", "...", or the hint's own words.
-_TEMPLATE_REASON = re.compile(r"<[^>]*>|reason|why|\.+|add reason\b.*", re.IGNORECASE)
+_TEMPLATE_REASON = re.compile(r"<[^>]*>|reason|why|\.+|add reason\b.*|\(?why you still want to send\)?\.?", re.IGNORECASE)
 
 
 class ConfirmRequest(StrictModel):

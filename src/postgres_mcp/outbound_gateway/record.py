@@ -253,11 +253,10 @@ UNASKED_DETAIL = (
 # provider directly.
 NEVER_ANOTHER_ROUTE = "Never send through another tool or route."
 OVERRIDE_RULE = (
-    'If an outbound_action result includes an "override" field, you may still send by calling '
-    'outbound_action {op:"confirm", action_id, decision:"yes", reason}. To change the message, send a new '
-    f"execute. {NEVER_ANOTHER_ROUTE}"
+    'If an outbound_action result includes an "override" object, you may still send it: send that object '
+    'back as the outbound_action request, adding "reason" (why you still want to send). '
+    f"To change the message, send a new execute. {NEVER_ANOTHER_ROUTE}"
 )
-_ADD_REASON = "Add reason: why you still want to send."
 
 # A completed duplicate that sent nothing because an earlier action or lock
 # already covered it. Not operator_positive_evidence: an operator proved
@@ -409,7 +408,7 @@ def action_result(
         why += "."
     return result.model_copy(
         update={
-            "detail": " ".join(part for part in (why, OVERRIDE_RULE, _ADD_REASON) if part),
+            "detail": " ".join(part for part in (why, OVERRIDE_RULE) if part),
             "override": OverrideRequest(wakeup_event_id=action.wakeup_event_id, action_id=action.action_id),
         }
     )
