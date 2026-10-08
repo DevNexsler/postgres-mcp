@@ -71,8 +71,15 @@ class EmailAdapter:
             "text": str(context.arguments["text"]),
             "outbound_action_uid": str(action_uid),
         }
+        # A stored cc -- the agent's, [] included, or the gateway's default
+        # (identity.with_default_cc) -- is sent exactly. The per-source copy
+        # only fills in for an action stored without one.
+        if "cc" in context.arguments:
+            requested = tuple(context.arguments["cc"] or ())
+        else:
+            requested = (self._cc_by_source.get(context.source),)
         copies: list[str] = []
-        for address in (self._cc_by_source.get(context.source), *(context.arguments.get("cc") or ())):
+        for address in requested:
             if address and address.casefold() not in {kept.casefold() for kept in copies}:
                 copies.append(address)
         if copies:

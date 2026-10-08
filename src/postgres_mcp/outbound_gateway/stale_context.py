@@ -266,6 +266,10 @@ def revised_request(parent: OutboundActionRecord, arguments: Mapping[str, Any]) 
     if not revisable:
         raise refusal(f"revise refused: {parent.operation.value} has no message content to revise; answer yes or no.")
     original = dict(strip_tenantcloud_persisted_argument_keys(parent.operation, parent.arguments))
+    if "cc" in original and "cc" not in arguments:
+        # A revise that leaves cc out keeps the refused email's cc -- the
+        # gateway's default included (identity.with_default_cc).
+        arguments = {**arguments, "cc": original["cc"]}
     try:
         base = parent.execute_request()
         revised = ExecuteRequest.model_validate({**base.model_dump(mode="python"), "arguments": dict(arguments)})
