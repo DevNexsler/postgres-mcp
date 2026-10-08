@@ -53,6 +53,7 @@ from .models import PublicStatus
 from .models import RequestRefusedError
 from .models import StatusRequest
 from .models import SuggestRequest
+from .models import normalize_target_email
 from .models import normalize_target_phone
 from .models import operation_catalog
 from .models import parse_outbound_request
@@ -471,6 +472,13 @@ def _quo_sending_lines() -> dict[str, str]:
     return normalized
 
 
+def _email_default_cc() -> str:
+    """OUTBOUND_EMAIL_DEFAULT_CC: the address a customer email that omits cc
+    is copied to (identity.with_default_cc). Unset or empty: off."""
+    raw = os.environ.get("OUTBOUND_EMAIL_DEFAULT_CC", "").strip()
+    return normalize_target_email(raw, field="OUTBOUND_EMAIL_DEFAULT_CC") if raw else ""
+
+
 def _enabled_operations() -> frozenset[Operation]:
     raw = os.environ.get("OUTBOUND_ENABLED_OPERATIONS_JSON")
     if raw is None:
@@ -842,6 +850,7 @@ async def build_runtime() -> GatewayRuntime:
         # (default): never ask, and never send stale -- an action with unshown
         # newer context ends as a `stale_context_unasked` no-send.
         stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
+        email_default_cc=_email_default_cc(),
         # Same union worker.py and tenantcloud_delivery_server.py's
         # coordinator already use (TENANTCLOUD_OPERATIONS unconditionally,
         # plus OUTBOUND_RESTATE_OPERATIONS): ActionRecovery.exhaust() needs

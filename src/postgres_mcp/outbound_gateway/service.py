@@ -27,6 +27,7 @@ from .errors import GATEWAY_INTERNAL_ERROR
 from .errors import FailureKind
 from .errors import classify
 from .errors import error_text
+from .identity import with_default_cc
 from .metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
@@ -229,6 +230,7 @@ class OutboundActionService:
         traffic_probe: Any | None = None,
         stale_confirm_enabled: bool = False,
         restate_operations: frozenset[Operation] = frozenset(),
+        email_default_cc: str = "",
     ):
         if traffic_mode not in VALID_TRAFFIC_MODES:
             raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
@@ -244,6 +246,7 @@ class OutboundActionService:
             )
         self._store = store
         self._context_loader = context_loader
+        self._email_default_cc = email_default_cc
         self._evidence_loader = evidence_loader
         self._adapters = dict(adapters)
         self._provider_client = provider_client
@@ -308,6 +311,9 @@ class OutboundActionService:
         return await self._execute(request, dispatch=False)
 
     async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
+        # Before anything reads the request: the default is part of what was
+        # asked, so the hash, the identity and the stored arguments carry it.
+        request = with_default_cc(request, self._email_default_cc)
         context = await self._load(request)
         enabled = self._stale.enabled
         action = None

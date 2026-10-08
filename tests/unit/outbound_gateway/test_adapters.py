@@ -1810,7 +1810,7 @@ async def test_email_reconcile_terminalizes_unconfigured_sender_account():
     assert client.calls == []
 
 
-def test_email_adapter_uses_the_agents_subject_and_adds_its_cc_to_the_management_copy():
+def test_email_adapter_uses_the_agents_subject_and_sends_its_cc_exactly():
     adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.io"}, cc_by_source={"zillow": "management@pfg.io"})
     request = adapter.build_request(
         context(arguments=MappingProxyType({
@@ -1821,7 +1821,8 @@ def test_email_adapter_uses_the_agents_subject_and_adds_its_cc_to_the_management
         ACTION_UID,
     )
     assert request.arguments["subject"] == "Maintenance ticket #1569606"
-    assert request.arguments["cc"] == [{"address": "management@pfg.io"}, {"address": "dan@pfg.io"}]
+    # The agent's cc replaces the per-source copy rather than adding to it.
+    assert request.arguments["cc"] == [{"address": "dan@pfg.io"}, {"address": "MANAGEMENT@pfg.io"}]
 
 
 def test_email_adapter_without_a_subject_still_replies_on_the_wakes_thread():

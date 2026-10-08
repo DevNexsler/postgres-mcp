@@ -205,9 +205,12 @@ def normalize_event_url(value: Any, *, field: str) -> str | None:
     return candidate
 
 
-def normalize_email_list(value: Any, *, field: str, maximum: int) -> tuple[str, ...] | None:
+def normalize_email_list(
+    value: Any, *, field: str, maximum: int, allow_empty: bool = False
+) -> tuple[str, ...] | None:
     """Optional list of addresses (Cc, attendees): each format-checked, order
-    kept, duplicates dropped. None means omitted."""
+    kept, duplicates dropped. None means omitted; allow_empty keeps an
+    explicit [] as () -- "none", which is not the same as omitted."""
     if value is None:
         return None
     if not isinstance(value, (list, tuple)):
@@ -217,8 +220,8 @@ def normalize_email_list(value: Any, *, field: str, maximum: int) -> tuple[str, 
         address = normalize_target_email(item, field=field)
         if address.casefold() not in {existing.casefold() for existing in addresses}:
             addresses.append(address)
-    if not 1 <= len(addresses) <= maximum:
-        raise ValueError(f"{field} must list between 1 and {maximum} addresses")
+    if not (0 if allow_empty else 1) <= len(addresses) <= maximum:
+        raise ValueError(f"{field} must list between {0 if allow_empty else 1} and {maximum} addresses")
     return tuple(addresses)
 
 
@@ -297,8 +300,9 @@ class EmailAttachment(StrictModel):
 class EmailArguments(StrictModel):
     to_address: str
     text: str
-    # Optional: the subject defaults to "Re: <the wake's subject>"; cc is
-    # added to the source's configured copy address (management@pfg.io).
+    # Optional: the subject defaults to "Re: <the wake's subject>". cc
+    # omitted (None) takes the gateway's default copy (identity.
+    # with_default_cc); cc given, [] included, is sent exactly as given.
     subject: str | None = None
     cc: tuple[str, ...] | None = None
     attachments: tuple[EmailAttachment, ...] | None = None
@@ -342,7 +346,7 @@ class EmailArguments(StrictModel):
     @field_validator("cc", mode="before")
     @classmethod
     def normalize_cc(cls, value: Any) -> tuple[str, ...] | None:
-        return normalize_email_list(value, field="cc", maximum=10)
+        return normalize_email_list(value, field="cc", maximum=10, allow_empty=True)
 
     @field_validator("text", mode="before")
     @classmethod
@@ -684,7 +688,8 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
     Operation.EMAIL_SEND: (
         ActionRole.PROSPECT_REPLY,
         IntentKind.INQUIRY_REPLY,
-        "email anyone; sent from Nigel's mailbox; attachments is a list of "
+        "email anyone; sent from Nigel's mailbox; management@pfg.io is cc'd on customer emails "
+        "unless you pass cc (use [] for none); attachments is a list of "
         "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
     ),
     Operation.QUO_SMS_SEND: (
