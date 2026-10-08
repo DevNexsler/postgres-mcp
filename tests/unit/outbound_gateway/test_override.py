@@ -958,3 +958,53 @@ async def test_an_override_of_a_text_recorded_before_from_phone_sends_from_its_r
     assert sent.status is PublicStatus.SENT
     assert adapter._current.provider_account == "PN8ujudrpa"
     assert "from_phone" not in adapter._current.arguments
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_account", ["PNtjMqMO2h", ""], ids=["listing", "none"])
+async def test_an_override_of_a_text_recorded_on_a_line_outside_the_map_is_refused_before_any_successor(recorded_account):
+    """250 stored texts sit on PFG Listing (PNtjMqMO2h, banned 2026-09-11)
+    and two on no line at all (wake 27269). Overriding one must neither send
+    from that line nor mint a successor that is refused for it and offered
+    the override again: the confirm itself is refused, with no override,
+    pointing at a new execute that names its line."""
+    service, store, adapter = quo_harness()
+    old = parse_outbound_request(quo_execute())
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    store._put(replace(
+        recorded, provider_account=recorded_account, state=ActionState.DEFINITIVE_FAILED,
+        detail_code="operator_non_acceptance_evidence", error_detail="not accepted",
+    ))
+
+    result = await call(service, confirm(recorded.action_id))
+
+    assert (result["status"], result["detail_code"]) == ("rejected", "request_refused")
+    assert result["detail"].startswith(
+        f"confirm refused for action {recorded.action_id}: this text was recorded on a line the gateway does not "
+        "send from, and an override cannot change its line. Nothing was sent. Lines it can send from: "
+        "+16107095575, +17579972130, +14846260220. Execute it as a new message with one of them as from_phone."
+    )
+    assert_no_override(result)
+    assert store.successor_of(recorded.action_id) is None
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_repeating_a_text_recorded_before_from_phone_is_that_same_action_not_a_refusal():
+    """Before from_phone, the identical call again returned the same action.
+    Refusing it for the missing from_phone would send the agent to resend
+    with from_phone: different arguments, a new action, the prospect texted
+    twice. The repeat finds its stored twin and is answered as that action."""
+    service, store, adapter = quo_harness()
+    old = parse_outbound_request(quo_execute())
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    store._put(replace(
+        recorded, state=ActionState.COMPLETED, completion_kind=CompletionKind.SENT, detail_code="provider_accepted",
+        provider_accepted_at=stale_tests.EXECUTED_AT,
+    ))
+
+    result = await call(service, quo_execute(), routed=frozenset())
+
+    assert (result["action_id"], result["status"]) == (str(recorded.action_id), "duplicate")
+    assert result["detail"].startswith("Already sent")
+    assert len(store.rows) == 1 and adapter.sent == []

@@ -2284,11 +2284,14 @@ async def test_a_text_without_from_phone_is_refused_with_the_lines_it_can_send_f
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("from_phone", [LISTING, "+16109735105", "+13018875706"])
+@pytest.mark.parametrize(
+    "from_phone", [LISTING, "+16109735105", "+13018875706", "(757) 997-2130", "<our line you send from, E.164>"]
+)
 async def test_a_text_from_a_line_outside_the_map_is_refused_with_the_lines_it_can_send_from(from_phone):
     """Listing is banned for agent sends; PFG-Dan and Laura's personal
     number are not agent lines. None of them is in the map, so none can be
-    named."""
+    named. A malformed line (a copied placeholder, a US-formatted number)
+    gets the same list rather than a bare format error."""
     event = record(**_NON_QUO_WAKES["zoho_mail"])
     with pytest.raises(ContextDerivationError) as refused:
         await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(from_phone=from_phone))
@@ -2329,3 +2332,21 @@ async def test_a_text_recorded_before_from_phone_keeps_its_recorded_line_when_re
     assert named.provider_account == "PNkmv4nD54"
     with pytest.raises(ContextDerivationError, match="from_phone is missing"):
         await loader.load(stored)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_account", ["PNtjMqMO2h", ""], ids=["listing", "none"])
+async def test_a_text_recorded_on_a_line_outside_the_map_is_never_re_derived_onto_it(recorded_account):
+    """250 stored texts were recorded on PFG Listing (PNtjMqMO2h) before the
+    2026-09-11 ban, and two with no line at all (wake 27269). Re-deriving
+    one (an override, a revise, a resume) must not reopen that line, and
+    since no override can change it the refusal sends the agent to a new
+    execute -- never "send again" into another override."""
+    event = record(**_NON_QUO_WAKES["zoho_mail"])
+    with pytest.raises(ContextDerivationError) as refused:
+        await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(), recorded_account=recorded_account)
+    assert str(refused.value) == (
+        "this text was recorded on a line the gateway does not send from, and an override cannot change its "
+        "line. Nothing was sent. Lines it can send from: +16107095575, +17579972130, +14846260220. Execute it "
+        "as a new message with one of them as from_phone."
+    )

@@ -36,6 +36,7 @@ from postgres_mcp.outbound_gateway.context import ACTION_NAMESPACE
 from postgres_mcp.outbound_gateway.context import ActionContext
 from postgres_mcp.outbound_gateway.context import DerivedTarget
 from postgres_mcp.outbound_gateway.context import canonical_payload_hash
+from postgres_mcp.outbound_gateway.identity import request_arguments
 from postgres_mcp.outbound_gateway.legacy_judgment.preflight import PreflightEvidence as WorldEvidence
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import ConfirmRequest
@@ -107,7 +108,11 @@ class FakeLoader:
             {"identity_version": "v1", "prospect_id": SUBJECT, "conversation_watermark": 750823}
         )
 
-    async def load(self, request: ExecuteRequest, *, recorded_account: str = "") -> ActionContext:
+    def sending_line(self, arguments, recorded_account: str | None = None) -> str:
+        # Every request's account is CHAT here, a text's line included.
+        return CHAT
+
+    async def load(self, request: ExecuteRequest, *, recorded_account: str | None = None) -> ActionContext:
         arguments = request.arguments.model_dump(mode="json", exclude_none=True)
         action_id = action_id_for(request.wakeup_event_id, request.action_role.value, 0)
         payload_hash = canonical_payload_hash(
@@ -335,6 +340,21 @@ class LedgerStore:
 
     async def get(self, action_id):
         return self.rows.get(action_id)
+
+    async def request_account(self, request):
+        """Migration 251's same-request match, as the gateway reads it."""
+        for row in self.rows.values():
+            if (
+                row.wakeup_event_id == request.wakeup_event_id
+                and row.action_role == request.action_role
+                and row.retry_of_action_id is None
+                and row.operation == request.operation
+                and row.intent_kind == request.intent_kind
+                and row.appointment_slot == request.appointment_slot
+                and dict(row.arguments) == request_arguments(request.arguments)
+            ):
+                return row.provider_account
+        return None
 
     async def successor(self, action_id):
         return self.successor_of(action_id)

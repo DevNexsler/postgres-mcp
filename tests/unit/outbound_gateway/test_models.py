@@ -468,9 +468,11 @@ def test_quo_to_phone_rejects_non_e164_values(bad):
         )
 
 
-def test_quo_from_phone_is_normalized_like_to_phone():
-    """Context derivation, not the model, requires from_phone: a text stored
-    before it existed must still parse (it parses to None)."""
+def test_quo_from_phone_is_only_stripped_so_context_can_answer_with_the_lines():
+    """Context derivation, not the model, requires from_phone and checks it
+    against the sending lines: a text stored before it existed must still
+    parse (to None), and a malformed line must reach the refusal that lists
+    the lines it can send from, not a bare format error."""
     def quo(**arguments):
         return parse_outbound_request(
             execute_payload(
@@ -483,11 +485,13 @@ def test_quo_from_phone_is_normalized_like_to_phone():
 
     assert quo().arguments.from_phone is None
     assert quo(from_phone=" +17579972130 ").arguments.from_phone == "+17579972130"
+    assert quo(from_phone=" (757) 997-2130 ").arguments.from_phone == "(757) 997-2130"
+    assert quo(from_phone="   ").arguments.from_phone is None
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "757-997-2130", "7579972130", "+1abc9972130", 5, True])
-def test_quo_from_phone_rejects_non_e164_values(bad):
-    with pytest.raises(ValidationError, match="from_phone must"):
+@pytest.mark.parametrize("bad", [5, True, ["+17579972130"]])
+def test_quo_from_phone_rejects_non_string_values(bad):
+    with pytest.raises(ValidationError, match="from_phone must be a string"):
         QuoSmsArguments.model_validate({"to_phone": "+19085550100", "text": "Thanks", "from_phone": bad})
 
 

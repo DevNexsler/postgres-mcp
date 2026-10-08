@@ -357,6 +357,8 @@ class QuoSmsArguments(StrictModel):
     # quo_sending_lines). Required of every new text -- context derivation
     # refuses one without it -- but optional here so texts recorded before
     # it existed still parse and hash as stored (LATER_OPTIONAL_ARGUMENTS).
+    # Only stripped here: the map's keys are E.164, so a malformed value is
+    # simply not a line, and its refusal lists the lines it can send from.
     from_phone: str | None = None
 
     @field_validator("to_phone", mode="before")
@@ -367,7 +369,11 @@ class QuoSmsArguments(StrictModel):
     @field_validator("from_phone", mode="before")
     @classmethod
     def normalize_from_phone(cls, value: Any) -> str | None:
-        return None if value is None else normalize_target_phone(value, field="from_phone")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("from_phone must be a string")
+        return value.strip() or None
 
     @field_validator("text", mode="before")
     @classmethod
