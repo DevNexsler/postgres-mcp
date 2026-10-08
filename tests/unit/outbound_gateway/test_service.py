@@ -48,10 +48,13 @@ from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.provider_client import McpProviderClient
 from postgres_mcp.outbound_gateway.provider_client import McpServerConfig
+from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_persisted_arguments
+
+from .test_stale_context_confirm import SqlError
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -304,13 +307,17 @@ class FakeStore:
         )
         return self.current
 
-    async def reject(self, action_id, detail_code, error_detail):
-        """Comm-Data-Store reject_outbound_action: received/dependency_wait
-        -> rejected with its reason; anything else comes back unchanged."""
+    async def reject(self, action_id, expected_state, detail_code, error_detail):
+        """Comm-Data-Store reject_outbound_action: a row still in
+        expected_state (received/dependency_wait) -> rejected with its
+        reason; anything else comes back unchanged."""
         self.calls.append(("reject", detail_code, error_detail))
-        if self.current.state in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
+        if self.current.state is expected_state and expected_state in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
             self.current = replace(self.current, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail)
         return self.current
+
+    async def successor(self, action_id):
+        return None
 
     async def get(self, action_id):
         return self.current if self.current and self.current.action_id == action_id else None
@@ -1504,7 +1511,7 @@ async def test_an_unrelated_tenantcloud_rejection_keeps_the_ordinary_detail():
 
     assert result.status is PublicStatus.FAILED
     assert result.detail.startswith("Not sent: tenantcloud_provider_rejected. ")
-    assert "messenger thread" not in result.detail
+    assert "messenger thread" not in (result.detail or "")
 
 
 @pytest.mark.asyncio
@@ -2319,23 +2326,23 @@ async def test_resume_swallows_post_dispatch_exception_and_returns_durable_row_s
 def _assert_not_sent(result, adapter, caplog, error_type):
     assert result.status is PublicStatus.FAILED
     assert result.detail_code == "gateway_internal_error"
-    assert result.detail.startswith("Not sent: the gateway hit an internal error before sending")
-    assert f"({error_type}: " in result.detail
+    assert result.detail.startswith("Not sent: the gateway hit an error before sending")
+    assert f"({error_type}" in result.detail
     assert "Nothing went out. Execute the same request again to retry, or record needs_human." in result.detail
     assert ("invoke",) not in adapter.calls
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
+    assert any("error before any send" in m and str(ACTION_ID) in m for m in errors)
 
 
-def _assert_refused(result, store, adapter, error_type):
+def _assert_refused(result, store, adapter, error_type, detail_code="gateway_error"):
     """An error before the row was prepared ends it rejected, with the
     error's words and the override that still sends it -- never a
     `received` row nothing picks up again."""
     assert result.status is PublicStatus.REJECTED
-    assert result.detail_code == "gateway_error"
+    assert result.detail_code == detail_code
     assert store.current.state is ActionState.REJECTED
-    assert result.detail.startswith(f"Not sent: {error_type}: ")
-    assert '"override" request' in result.detail and "Never send it through any other tool or route." in result.detail
+    assert result.detail.startswith(f"Not sent: {error_type}")
+    assert OVERRIDE_RULE in result.detail
     assert result.override is not None
     assert (result.override.op, result.override.decision, result.override.action_id) == ("confirm", "yes", ACTION_ID)
     assert ("invoke",) not in adapter.calls
@@ -2351,10 +2358,10 @@ async def test_an_evidence_loading_error_is_reported_not_sent(caplog):
     with caplog.at_level(logging.ERROR):
         result = await svc.execute(request())
 
-    _assert_refused(result, store, adapter, "TypeError")
+    _assert_refused(result, store, adapter, "TypeError: ")
     assert not any(call[0] == "schedule" for call in store.calls)
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
+    assert any("error before any send" in m and str(ACTION_ID) in m for m in errors)
 
 
 @pytest.mark.asyncio
@@ -2372,7 +2379,7 @@ async def test_a_preflight_error_is_reported_not_sent(caplog):
     ):
         result = await svc.execute(request())
 
-    _assert_refused(result, store, adapter, "AttributeError")
+    _assert_refused(result, store, adapter, "AttributeError: ")
 
 
 def _accepted(ref="req-1"):
@@ -2397,7 +2404,7 @@ async def test_an_evidence_error_then_the_same_request_again_is_the_same_refusal
 
     with caplog.at_level(logging.ERROR):
         first = await svc.execute(request())
-        _assert_refused(first, store, adapter, "TypeError")
+        _assert_refused(first, store, adapter, "TypeError: ")
         second = await svc.execute(request())
 
     assert (second.status, second.action_id, second.override) == (PublicStatus.REJECTED, first.action_id, first.override)
@@ -2434,19 +2441,47 @@ async def test_a_request_build_error_goes_back_to_retry_ready_and_the_same_reque
 
 
 @pytest.mark.asyncio
-async def test_a_worker_resume_error_before_the_provider_call_ends_the_waiting_row_rejected(caplog):
-    """A dependency_wait row that cannot be prepared is ended as a recorded
-    refusal: Restate stops on it (a rejected result is terminal) instead of
-    ending its workflow over a row nobody would advance again."""
+@pytest.mark.parametrize(
+    ("error", "words"),
+    [
+        (TypeError("boom"), "TypeError: boom"),
+        (SqlError("canceling statement due to statement timeout", "57014"), "canceling statement"),
+        (ConnectionResetError("reset"), "ConnectionResetError: reset"),
+    ],
+    ids=["fault", "statement_timeout", "connection_reset"],
+)
+async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left_for_the_worker(caplog, error, words):
+    """Nobody is waiting on a background resume: anything but a refusal
+    leaves the row as it was, for Restate's next advance (or the worker's
+    next cycle) under the same retry ceiling. Ending it would strand a send
+    that a retry seconds later would have made."""
     store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
     adapter = FakeAdapter()
     svc = service(store, adapter)
-    svc._evidence_loader.load.side_effect = TypeError("boom")
+    svc._evidence_loader.load.side_effect = error
 
     with caplog.at_level(logging.ERROR):
         result = await svc.resume(ACTION_ID)
 
-    _assert_refused(result, store, adapter, "TypeError")
+    _assert_not_sent(result, adapter, caplog, words)
+    # Claimed (one attempt spent), still listed by the worker.
+    assert store.current.state is ActionState.DEPENDENCY_WAIT
+    assert [call[0] for call in store.calls] == ["claim"]
+
+
+@pytest.mark.asyncio
+async def test_a_worker_resume_refusal_before_the_provider_call_ends_the_waiting_row_rejected(caplog):
+    """A refusal fails the same way every time: the waiting row is ended as
+    a recorded refusal, and Restate stops on it (rejected is terminal)."""
+    store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
+    adapter = FakeAdapter()
+    svc = service(store, adapter)
+    store.prepare = AsyncMock(side_effect=SqlError("canonical outbound-action key resolves to multiple durable actions", "22023"))
+
+    with caplog.at_level(logging.ERROR):
+        result = await svc.resume(ACTION_ID)
+
+    _assert_refused(result, store, adapter, "canonical outbound-action key resolves", detail_code="gateway_refused")
     assert [call[0] for call in store.calls] == ["claim", "reject"]
 
 

@@ -306,13 +306,16 @@ class ActionContextLoader:
             prospect_id = f"internal:{channel_or_chat_id}"
             aliases = ()
         elif aliases:
-            # Aliases that span several subjects are one person first seen
-            # apart: the database merges them when it takes the intent lock
-            # (Comm-Data-Store migration 251). Until then the preferred alias
-            # names the person.
+            # Never named by a hub alias (our own or a shared address). Aliases
+            # that span several subjects are one person first seen apart: the
+            # database merges them when it takes the intent lock
+            # (Comm-Data-Store migration 251); until then the preferred
+            # personal alias names the person.
             resolved = await self._repository.resolve_canonical_subject(aliases, property_scope)
-            canonical = None if resolved.ambiguous else resolved.canonical_subject
-            prospect_id = canonical or f"prospect:{self._preferred_alias(aliases)}"
+            personal = resolved.personal_aliases
+            prospect_id = resolved.canonical_subject or (
+                f"prospect:{self._preferred_alias(personal)}" if personal else f"prospect:{target.target_id}"
+            )
         elif request.operation in _TENANTCLOUD_OPERATIONS:
             if record.tenantcloud_claim_id is not None:
                 prospect_id = f"tenantcloud:claim:{record.tenantcloud_claim_id}"

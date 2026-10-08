@@ -814,6 +814,11 @@ class SuggestRequest(StrictModel):
     wakeup_event_id: PositiveBigInt
 
 
+# A reason copied from an instruction instead of written: "<why>",
+# "<required: ...>", "reason", "why", "...", or the hint's own words.
+_TEMPLATE_REASON = re.compile(r"<[^>]*>|reason|why|\.+|add reason\b.*", re.IGNORECASE)
+
+
 class ConfirmRequest(StrictModel):
     """Answer to a needs_confirmation (stale_context) result, or the agent's
     override of an action that was not sent.
@@ -829,8 +834,10 @@ class ConfirmRequest(StrictModel):
 
     On a result that carries `override` (rejected, failed, a no-send
     duplicate, ...), `yes` with a `reason` sends the same message anyway
-    through a successor action (Comm-Data-Store override_outbound_action);
-    the first reason is recorded on the refused action."""
+    through a successor action (Comm-Data-Store override_outbound_action),
+    and `no` records that the agent chose not to send it; the first answer
+    and reason are recorded on the refused action. A blank or template
+    reason ("<why>", "reason") is no reason."""
 
     op: Literal["confirm"]
     wakeup_event_id: PositiveBigInt
@@ -850,7 +857,8 @@ class ConfirmRequest(StrictModel):
     @classmethod
     def normalize_reason(cls, value: Any) -> Any:
         if isinstance(value, str):
-            return value.strip() or None
+            value = value.strip()
+            return None if not value or _TEMPLATE_REASON.fullmatch(value) else value
         return value
 
     @model_validator(mode="after")
@@ -964,15 +972,14 @@ class RequestRefusedError(ValueError):
 
 
 class OverrideRequest(StrictModel):
-    """The exact outbound_action request that still sends a message that was
-    not sent: confirm yes on the refused action, with the agent's reason in
-    place of the placeholder. Never another tool or route."""
+    """The outbound_action request that still sends a message that was not
+    sent: confirm yes on the refused action. The agent adds its own
+    `reason`; there is deliberately no placeholder to echo back."""
 
     op: Literal["confirm"] = "confirm"
     wakeup_event_id: PositiveBigInt
     action_id: UUID
     decision: Literal["yes"] = "yes"
-    reason: str = "<required: why you still want to send it>"
 
 
 class PublicResult(StrictModel):

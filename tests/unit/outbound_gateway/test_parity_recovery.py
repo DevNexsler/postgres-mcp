@@ -152,6 +152,11 @@ class CasLedger:
         self.row = replace(self.row, state=ActionState.PREPARED, action_uid=ACTION_UID)
         return self.row
 
+    async def reject(self, action_id, expected_state, detail_code, error_detail):
+        self._write(expected_state)
+        self.row = replace(self.row, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail)
+        return self.row
+
     async def create_or_load(self, ctx):
         return self.row
 

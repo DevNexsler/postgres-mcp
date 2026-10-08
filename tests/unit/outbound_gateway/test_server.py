@@ -18,6 +18,7 @@ from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
+from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
 from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
@@ -413,14 +414,14 @@ def test_focused_server_tool_description_names_the_override_only_as_op_confirm_a
 
     lowered = description.casefold()
     assert "override=true" not in lowered and '"override": true' not in lowered
-    teaching = '{"op": "confirm", "wakeup_event_id", "action_id", "decision": "yes", "reason": "<why>"}'
-    never = "Never send through any other tool or route."
-    assert teaching in description and never in description
-    # Every mention of override sits in the one paragraph that ends with the
+    # The one override rule, word for word as Comm-Data-Store teaches it.
+    assert OVERRIDE_RULE in description
+    assert 'outbound_action {op:"confirm", action_id, decision:"yes", reason}' in OVERRIDE_RULE
+    never = "Never send through another tool or route."
+    assert OVERRIDE_RULE.endswith(never)
+    # Every mention of override comes before, and ends with, the
     # never-another-route rule.
-    first_override, last_override = description.index('"override"'), description.rindex("override")
-    assert description.index(teaching) > first_override
-    assert first_override < last_override < description.index(never)
+    assert description.rindex("override") < description.index(never)
 
 
 @pytest.mark.asyncio

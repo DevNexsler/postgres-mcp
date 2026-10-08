@@ -67,8 +67,13 @@ class ConversationSnapshot:
 
 @dataclass(frozen=True)
 class AliasResolution:
+    """The wake's personal aliases (hub aliases left out: Comm-Data-Store
+    outbound_alias_is_hub, the one hub rule) and the one outbound-action
+    subject they name, if they name exactly one. Several subjects are
+    merged by the database when it takes the intent lock (migration 251)."""
+
     canonical_subject: str | None
-    ambiguous: bool = False
+    personal_aliases: tuple[str, ...] = ()
 
 
 class ContextRepository(Protocol):
@@ -174,21 +179,26 @@ class OutboundGatewayRepository:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
+            WITH personal AS (
+                SELECT DISTINCT alias
+                FROM unnest({}::text[]) AS given(alias)
+                WHERE NOT outbound_alias_is_hub(alias)
+            ), subjects AS (
+                SELECT DISTINCT bound.canonical_subject
+                FROM outbound_action_subject_aliases AS bound
+                JOIN personal ON personal.alias = bound.alias_key
+                WHERE bound.scope_key IN ('', {})
+            )
             SELECT
-                count(DISTINCT canonical_subject)::integer AS subject_count,
-                min(canonical_subject) AS canonical_subject
-            FROM outbound_action_subject_aliases
-            WHERE alias_key = ANY({})
-              AND scope_key IN ('', {})
+                (SELECT coalesce(array_agg(alias ORDER BY alias), ARRAY[]::text[]) FROM personal) AS personal_aliases,
+                (SELECT min(canonical_subject) FROM subjects HAVING count(*) = 1) AS canonical_subject
             """,
             [list(aliases), property_scope],
         )
-        if not rows:
-            return AliasResolution(canonical_subject=None)
-        cells = rows[0].cells
+        cells = rows[0].cells if rows else {}
         return AliasResolution(
             canonical_subject=cells.get("canonical_subject"),
-            ambiguous=int(cells.get("subject_count") or 0) > 1,
+            personal_aliases=tuple(cells.get("personal_aliases") or ()),
         )
 
     async def newer_context(

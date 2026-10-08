@@ -25,10 +25,13 @@ ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 
 
 class FakeRepository:
-    def __init__(self, record, *, canonical_subject="prospect:canonical", ambiguous=False):
+    def __init__(self, record, *, canonical_subject="prospect:canonical", ambiguous=False, hubs=()):
         self.record = record
         self.canonical_subject = canonical_subject
         self.ambiguous = ambiguous
+        # Aliases Comm-Data-Store outbound_alias_is_hub calls hubs: the SQL
+        # query leaves them out of both the subject and the personal aliases.
+        self.hubs = frozenset(hubs)
         self.alias_calls = []
 
     async def load_wake_event(self, wakeup_event_id):
@@ -43,9 +46,10 @@ class FakeRepository:
 
     async def resolve_canonical_subject(self, aliases, property_scope):
         self.alias_calls.append((aliases, property_scope))
+        personal = tuple(alias for alias in aliases if alias not in self.hubs)
         return AliasResolution(
-            canonical_subject=self.canonical_subject,
-            ambiguous=self.ambiguous,
+            canonical_subject=None if self.ambiguous or not personal else self.canonical_subject,
+            personal_aliases=personal,
         )
 
 

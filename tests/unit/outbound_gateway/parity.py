@@ -62,6 +62,7 @@ STORE_METHODS = (
     "confirm_stale_context",
     "reject",
     "override",
+    "successor",
     "get",
     "schedule_next_attempt",
 )
@@ -404,21 +405,59 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # dependency_wait) now ends it rejected, with the error's words and the
     # override that still sends it: a `received` row is one nothing picks up
     # again.
-    if (_call(current, "store.reject") or (current_result or {}).get("detail_code") == "gateway_error") and "gateway_error" not in old:
+    # exhaust() on a row still `received` -- Restate could not prepare it
+    # within the retry ceiling -- ends it rejected (nothing was sent); the
+    # legacy left it `received`, where nothing picks it up again.
+    if _call(current, "store.reject") and "prepare_retry_exhausted" in new:
+        return "exhaust_ends_an_unprepared_row_rejected"
+    rejected_codes = {"gateway_error", "gateway_refused", "gateway_transient_error"}
+    if (_call(current, "store.reject") or (current_result or {}).get("detail_code") in rejected_codes) and "gateway_error" not in old:
         return "pre_send_error_ends_the_action_rejected"
     # op confirm on an action holding no stale_context question is now the
-    # agent's override (send what was not sent, with a reason), refused with
-    # its own words where there is nothing to override. The legacy refused
-    # every such confirm ("not awaiting", or "confirmation is not enabled"
-    # when the question was switched off).
+    # agent's answer to a refusal (yes sends what was not sent, with a
+    # reason; no is recorded on it), refused with its own words where there
+    # is nothing to answer. The legacy refused every such confirm ("not
+    # awaiting", or "confirmation is not enabled" when the question was
+    # switched off).
     if (
         legacy is not None
         and legacy[:2] == ("service_raise", "confirm")
         and ("is not awaiting a stale_context confirmation" in old or "<confirmation disabled refusal>" in old)
         and current is not None
-        and current[1] == "confirm"
+        and (current[1] == "confirm" or _call(current, "store.override") or _call(current, "store.reject"))
     ):
         return "confirm_without_a_question_is_the_override"
+    # A write of the agent's answer that fails for a reason that is not a
+    # refusal (a lost connection, a fault) is raised as what it is -- the
+    # tool answers it failed / gateway_error, "the same call again" -- not
+    # dressed as a refusal of the answer the agent must not retry.
+    if (
+        legacy is not None
+        and current is not None
+        and legacy[:2] == current[:2] == ("service_raise", "confirm")
+        and "confirm refused for action" in old
+        and "confirm refused" not in new
+    ):
+        return "a_failed_answer_write_is_not_a_refusal"
+    # A yes that comes after the wake ended sends as an agent_override
+    # (Comm-Data-Store 251's one answer body: the ledger's wake_terminal),
+    # which is not asked the stale question again; the legacy asked it of
+    # the successor. A yes during the wake is asked again on both sides.
+    answered = next((event for event in reversed(prefix) if event[0] == "service"), None)
+    if (
+        _call(legacy, "store.block_stale_context")
+        and _call(current, "store.prepare")
+        and answered is not None
+        and answered[1] == "confirm"
+        and "('decision', 'yes')" in repr(answered)
+    ):
+        return "late_yes_is_an_override_not_asked_again"
+    # An action the agent already answered yes or revise (an override, or a
+    # stale_context answer) reports the successor carrying its send --
+    # status, and the identical request again -- looked up by its parent.
+    # The legacy re-answered the question, or reported the parent "not sent".
+    if _call(current, "store.successor"):
+        return "answered_action_reports_its_successor"
     # FIX 3: a TenantCloud auth rejection proven pre-dispatch
     # (tenantcloud_auth_rejected_before_dispatch / category=provider_authentication)
     # now waits out the outage -- schedule_next_attempt with no claim() --

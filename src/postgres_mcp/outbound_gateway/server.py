@@ -37,6 +37,9 @@ from .context import ActionContextLoader
 from .context import RoutingPolicy
 from .delivery_workflow import RestateWorkflowSubmitter
 from .delivery_workflow import SecretAuthGate
+from .errors import FailureKind
+from .errors import classify
+from .errors import error_text
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
@@ -44,6 +47,7 @@ from .models import ActionRole
 from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
+from .models import OutboundRequest
 from .models import PublicResult
 from .models import PublicStatus
 from .models import RequestRefusedError
@@ -53,10 +57,9 @@ from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
+from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
-from .service import GATEWAY_ERROR_DETAIL
 from .service import OutboundActionService
-from .service import error_text
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
@@ -148,97 +151,17 @@ async def handle_outbound_action(
             ),
         }
     try:
-        if isinstance(parsed, SuggestRequest):
-            return {
-                "wakeup_event_id": parsed.wakeup_event_id,
-                "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
-            }
-        if isinstance(parsed, StatusRequest):
-            result = await service.status(parsed.action_id)
-        elif isinstance(parsed, ConfirmRequest):
-            result = await _confirm(
-                service,
-                policy,
-                parsed,
-                tenantcloud_submitter=tenantcloud_submitter,
-                restate_operations=restate_operations,
-            )
-        else:
-            assert isinstance(parsed, ExecuteRequest)
-            if not policy.writes_enabled or policy.kill_switch:
-                detail = "kill_switch_open" if policy.kill_switch else "writes_disabled"
-                action_id = uuid5(
-                    ACTION_NAMESPACE,
-                    f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
-                )
-                result = PublicResult(
-                    status=PublicStatus.REJECTED,
-                    action_id=action_id,
-                    action_uid=None,
-                    provider_request_ref=None,
-                    retryable=False,
-                    detail_code=detail,
-                    detail=SENDING_PAUSED_DETAIL,
-                )
-            elif parsed.operation not in policy.enabled_operations:
-                action_id = uuid5(
-                    ACTION_NAMESPACE,
-                    f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
-                )
-                result = PublicResult(
-                    status=PublicStatus.REJECTED,
-                    action_id=action_id,
-                    action_uid=None,
-                    provider_request_ref=None,
-                    retryable=False,
-                    detail_code="operation_disabled",
-                    detail=_operation_disabled_detail(parsed.operation, policy),
-                )
-            else:
-                routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
-                if parsed.operation in routed_operations and tenantcloud_submitter is not None:
-                    # Stays fast: persist + preflight only (no provider I/O), then
-                    # fire-and-forget the durable Restate submission. Execute
-                    # returns "accepted, delivering" immediately either way -- the
-                    # 1h retry ceiling runs entirely in the background workflow, a
-                    # wake session never waits on it.
-                    result = await service.enqueue(parsed)
-                    if result.status is PublicStatus.PENDING:
-                        try:
-                            await tenantcloud_submitter.submit(result.action_id)
-                        except Exception:
-                            logger.exception(
-                                "Restate delivery submission failed for action %s; CDS sweeper will retry",
-                                result.action_id,
-                            )
-                else:
-                    result = await service.execute(parsed)
-    except RequestRefusedError as refused:
-        # Refused as asked: the caller's to correct, answered as an ordinary
-        # result so it does not count toward hermes-agent's breaker (#3463).
-        # The refusal's own words say what happened and what to do next.
-        return {
-            "status": PublicStatus.REJECTED.value,
-            "retryable": False,
-            "detail_code": "request_refused",
-            "detail": str(refused),
-        }
+        result = await _route(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
     except Exception as error:
-        # Any other failure is the gateway's, and still an ordinary result:
-        # an MCP tool error counts toward hermes-agent's breaker, and its raw
-        # text reads to the agent as an outage to route around. A row this
-        # call committed is ended rejected (and overridable) by the service
-        # wherever that can still be written; reaching here, nothing was.
-        logger.exception("outbound_action %s failed", parsed.op)
-        return {
-            "status": PublicStatus.FAILED.value,
-            "retryable": False,
-            "detail_code": GATEWAY_ERROR_DETAIL,
-            "detail": (
-                f"The gateway hit an error ({error_text(error)}); nothing was sent by this call. Make the same "
-                "call again; if it fails again, record needs_human. Never send it through any other tool or route."
-            ),
-        }
+        return _failure(error, parsed.op)
+    if isinstance(result, dict):
+        return result
     payload = result.model_dump(mode="json")
     # A plain send leaves detail unset, and every result except
     # needs_confirmation leaves new_context/question unset (override is set
@@ -248,6 +171,112 @@ async def handle_outbound_action(
         if payload.get(optional) is None:
             payload.pop(optional, None)
     return payload
+
+
+async def _route(
+    service: OutboundActionService,
+    policy: FeaturePolicy,
+    parsed: OutboundRequest,
+    *,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None,
+    restate_operations: frozenset[Operation] | None,
+) -> PublicResult | dict[str, Any]:
+    """The answer to one parsed request: suggestions, or an action's result."""
+    if isinstance(parsed, SuggestRequest):
+        return {
+            "wakeup_event_id": parsed.wakeup_event_id,
+            "suggestions": await service.suggest_targets(parsed.wakeup_event_id),
+        }
+    if isinstance(parsed, StatusRequest):
+        result = await service.status(parsed.action_id)
+    elif isinstance(parsed, ConfirmRequest):
+        result = await _confirm(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
+    else:
+        assert isinstance(parsed, ExecuteRequest)
+        if not policy.writes_enabled or policy.kill_switch:
+            detail = "kill_switch_open" if policy.kill_switch else "writes_disabled"
+            action_id = uuid5(
+                ACTION_NAMESPACE,
+                f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
+            )
+            result = PublicResult(
+                status=PublicStatus.REJECTED,
+                action_id=action_id,
+                action_uid=None,
+                provider_request_ref=None,
+                retryable=False,
+                detail_code=detail,
+                detail=SENDING_PAUSED_DETAIL,
+            )
+        elif parsed.operation not in policy.enabled_operations:
+            action_id = uuid5(
+                ACTION_NAMESPACE,
+                f"v1:wakeup:{parsed.wakeup_event_id}:role:{parsed.action_role}:ordinal:0",
+            )
+            result = PublicResult(
+                status=PublicStatus.REJECTED,
+                action_id=action_id,
+                action_uid=None,
+                provider_request_ref=None,
+                retryable=False,
+                detail_code="operation_disabled",
+                detail=_operation_disabled_detail(parsed.operation, policy),
+            )
+        else:
+            routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
+            if parsed.operation in routed_operations and tenantcloud_submitter is not None:
+                # Stays fast: persist + preflight only (no provider I/O), then
+                # fire-and-forget the durable Restate submission. Execute
+                # returns "accepted, delivering" immediately either way -- the
+                # 1h retry ceiling runs entirely in the background workflow, a
+                # wake session never waits on it.
+                result = await service.enqueue(parsed)
+                if result.status is PublicStatus.PENDING:
+                    try:
+                        await tenantcloud_submitter.submit(result.action_id)
+                    except Exception:
+                        logger.exception(
+                            "Restate delivery submission failed for action %s; CDS sweeper will retry",
+                            result.action_id,
+                        )
+            else:
+                result = await service.execute(parsed)
+    return result
+
+
+def _failure(error: Exception, op: str) -> dict[str, Any]:
+    """Every failure is an ordinary result, never an MCP tool error:
+    hermes-agent counts tool errors toward a breaker that parks the gateway
+    for every caller (#3463), and raw error text reads to the agent as an
+    outage to route around. A refusal (errors.classify) is the caller's to
+    correct, in its own words; anything else is the gateway's. A row the
+    call recorded is answered by the service itself (its action_id, and the
+    override where nothing was sent), so reaching here the call may have
+    failed before or after recording one."""
+    if classify(error) is FailureKind.REFUSAL:
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "request_refused",
+            "detail": str(error) if isinstance(error, RequestRefusedError) else error_text(error),
+        }
+    logger.exception("outbound_action %s failed", op)
+    return {
+        "status": PublicStatus.FAILED.value,
+        "retryable": False,
+        "detail_code": "gateway_error",
+        "detail": (
+            f"The gateway hit an error ({error_text(error)}) before it could say what happened. The same "
+            "call again is the same action, never a second send: make it again to see where it stands; if it "
+            "fails again, record needs_human. Never send through another tool or route."
+        ),
+    }
 
 
 SENDING_PAUSED_DETAIL = (
@@ -348,12 +377,10 @@ def create_server(
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
             "message content changed). Any other result that did not send (status rejected, "
-            "failed, duplicate, manual_review or stale) says why in detail. When it also carries "
-            "\"override\", you may still send it unchanged: call this tool with that request, your "
-            "reason filled in -- {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", "
-            "\"decision\": \"yes\", \"reason\": \"<why>\"}; decision \"no\" drops it; different content "
-            "is a new execute. A malformed request (detail_code invalid_request) recorded nothing: "
-            "fix the field its detail names. Never send through any other tool or route. "
+            "failed, duplicate, manual_review or stale) says why in detail, and may carry "
+            "\"override\": that confirm request with the wake and action filled in (decision \"no\" "
+            "instead records that you chose not to send it). " + OVERRIDE_RULE + " A malformed request "
+            "(detail_code invalid_request) recorded nothing: fix the field its detail names. "
             "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "

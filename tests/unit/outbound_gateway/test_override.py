@@ -18,14 +18,17 @@ ledger, and an intent lock that refuses until an override skips it.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from postgres_mcp.outbound_gateway.context import ActionContextLoader
+from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.delivery_workflow import AuthResult
 from postgres_mcp.outbound_gateway.delivery_workflow import AuthState
 from postgres_mcp.outbound_gateway.delivery_workflow import DeliveryPhase
@@ -39,6 +42,11 @@ from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.record import AGENT_OVERRIDE
+from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
+from postgres_mcp.outbound_gateway.repository import AliasResolution
+from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
+from postgres_mcp.outbound_gateway.retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
+from postgres_mcp.outbound_gateway.retry_policy import RETRY_CEILING_SECONDS
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
@@ -57,13 +65,7 @@ POLICY = FeaturePolicy(writes_enabled=True, kill_switch=False, enabled_operation
 REASON = "Dan asked for this reply; the refusal was a duplicate-subject glitch, not a reason to stay silent."
 
 
-class SqlError(Exception):
-    """A psycopg error as the gateway sees it: the database's words and SQLSTATE."""
-
-    def __init__(self, message: str, sqlstate: str) -> None:
-        super().__init__(message)
-        self.sqlstate = sqlstate
-
+SqlError = stale_tests.SqlError
 
 AMBIGUOUS = SqlError(
     "ambiguous aliases resolve to multiple outbound-action subjects\n"
@@ -73,14 +75,12 @@ AMBIGUOUS = SqlError(
 
 
 class OverrideLedger(stale_tests.LedgerStore):
-    """Migration 192's ledger plus migration 251: reject_outbound_action,
-    override_outbound_action, and an intent lock that refuses (`prepare_error`)
-    -- which an agent_override successor never takes."""
+    """The migration 192/251 ledger, plus an intent lock that refuses
+    (`prepare_error`) -- which an agent_override successor never takes."""
 
     def __init__(self) -> None:
         super().__init__()
         self.prepare_error: Exception | None = None
-        self.override_limit = 5
 
     async def prepare(self, ctx, expected_state):
         current = self.rows[ctx.action_id]
@@ -88,52 +88,6 @@ class OverrideLedger(stale_tests.LedgerStore):
             self.calls.append(("prepare_refused", ctx.action_id))
             raise self.prepare_error
         return await super().prepare(ctx, expected_state)
-
-    async def reject(self, action_id, detail_code, error_detail):
-        self.calls.append(("reject", action_id, detail_code))
-        current = self.rows[action_id]
-        if current.state not in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
-            return current
-        return self._put(replace(current, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail))
-
-    async def override(self, action_id, *, wakeup_event_id, actor, reason):
-        self.calls.append(("override", action_id, reason))
-        parent = self.rows[action_id]
-        if parent.wakeup_event_id != wakeup_event_id:
-            raise SqlError("override must come from the action's own wake", "42501")
-        if parent.state is ActionState.COMPLETED and parent.completion_kind is CompletionKind.SENT:
-            raise SqlError(f"outbound action {action_id} already sent; send a new message instead", "55000")
-        existing = self.successor_of(action_id)
-        if existing is not None:
-            return existing
-        overrides = [
-            row
-            for row in self.rows.values()
-            if row.wakeup_event_id == parent.wakeup_event_id and row.action_role is parent.action_role and row.remediation_reason == AGENT_OVERRIDE
-        ]
-        if len(overrides) >= self.override_limit:
-            raise SqlError(
-                f"override limit reached: wake {parent.wakeup_event_id} already re-sent {parent.action_role.value} "
-                f"{len(overrides)} times; record needs_human with the message you meant to send",
-                "55000",
-            )
-        ordinal = 1 + sum(1 for row in self.rows.values() if row.wakeup_event_id == parent.wakeup_event_id and row.retry_of_action_id)
-        return self._put(
-            replace(
-                parent,
-                action_id=stale_tests.action_id_for(parent.wakeup_event_id, parent.action_role.value, ordinal),
-                state=ActionState.RECEIVED,
-                detail_code="received",
-                completion_kind=None,
-                provider_request_ref=None,
-                action_uid=None,
-                error_detail=None,
-                retry_of_action_id=parent.action_id,
-                remediation_reason=AGENT_OVERRIDE,
-                stale_context_shown_refs=(),
-                stale_context_decision=None,
-            )
-        )
 
 
 def harness(*activity):
@@ -178,15 +132,21 @@ async def call(service, payload, *, submitter=None, routed=ROUTED):
 
 
 def assert_offers_override(result: dict[str, Any], action_id) -> None:
-    assert result["override"] == {
-        "op": "confirm",
-        "wakeup_event_id": WAKE,
-        "action_id": str(action_id),
-        "decision": "yes",
-        "reason": "<required: why you still want to send it>",
-    }
-    assert '"override" request' in result["detail"]
-    assert result["detail"].endswith("Never send it through any other tool or route.")
+    # The request without a reason: there is no placeholder to echo back.
+    assert result["override"] == {"op": "confirm", "wakeup_event_id": WAKE, "action_id": str(action_id), "decision": "yes"}
+    assert result["detail"].endswith(f"{OVERRIDE_RULE} Add reason: why you still want to send.")
+
+
+def assert_no_override(result: dict[str, Any]) -> None:
+    assert "override" not in result
+    assert OVERRIDE_RULE not in result.get("detail", "")
+
+
+async def recorded_parent(store, **fields):
+    """The wake's first internal_reply, recorded, then set to `fields`."""
+    ctx = await stale_tests.FakeLoader().load(stale_tests.execute_request())
+    await store.create_or_load(ctx)
+    return store._put(replace(store.rows[BLOCKED], **fields))
 
 
 # ----------------------------------------------------------------------------
@@ -195,62 +155,122 @@ def assert_offers_override(result: dict[str, Any], action_id) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wake_27865_ambiguous_aliases_end_the_recorded_row_rejected_with_the_override():
+async def test_wake_27865_a_refused_prepare_ends_the_recorded_row_rejected_with_the_override():
     service, store, adapter = harness()
     store.prepare_error = AMBIGUOUS
     submitter = AsyncMock()
 
     result = await call(service, EXECUTE, submitter=submitter)
 
-    assert (result["status"], result["action_id"], result["detail_code"]) == ("rejected", str(BLOCKED), "gateway_error")
+    assert (result["status"], result["action_id"], result["detail_code"]) == ("rejected", str(BLOCKED), "gateway_refused")
     assert result["detail"].startswith("Not sent: ambiguous aliases resolve to multiple outbound-action subjects. ")
     assert "CONTEXT" not in result["detail"]
     assert_offers_override(result, BLOCKED)
     assert store.rows[BLOCKED].state is ActionState.REJECTED
+    # A refusal fails the same way every time: tried once, never again.
+    assert [call for call in store.calls if call[0] == "prepare_refused"] == [("prepare_refused", BLOCKED)]
     submitter.submit.assert_not_called()
     assert adapter.sent == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error",
+    ("error", "code", "tries"),
     [
-        SqlError("gateway action 9f0e retains outbound lock 41", "55000"),
-        SqlError("canonical outbound-action key resolves to multiple durable actions", "22023"),
-        ConnectionResetError("connection reset by peer"),
-        RuntimeError("anything at all"),
+        (SqlError("gateway action 9f0e retains outbound lock 41", "55000"), "gateway_refused", 1),
+        (SqlError("canonical outbound-action key resolves to multiple durable actions", "22023"), "gateway_refused", 1),
+        (SqlError("could not serialize access due to concurrent update", "40001"), "gateway_transient_error", 2),
+        (ConnectionResetError("connection reset by peer"), "gateway_transient_error", 2),
+        (RuntimeError("anything at all"), "gateway_error", 1),
     ],
+    ids=["refusal_55000", "refusal_22023", "serialization", "connection_reset", "fault"],
 )
-async def test_any_error_between_record_and_prepare_never_leaves_the_row_received(error):
+async def test_any_error_between_record_and_prepare_never_leaves_the_row_received(error, code, tries):
     service, store, _adapter = harness()
     store.prepare_error = error
 
     result = await call(service, EXECUTE)
 
-    assert result["status"] == "rejected"
+    assert (result["status"], result["detail_code"]) == ("rejected", code)
     assert store.rows[BLOCKED].state is ActionState.REJECTED
     assert str(error).splitlines()[0] in result["detail"]
     assert_offers_override(result, BLOCKED)
+    # A passing error is tried once more before the row is ended; the
+    # result says so.
+    assert len([call for call in store.calls if call[0] == "prepare_refused"]) == tries
+    assert ("an override retries it" in result["detail"]) is (code == "gateway_transient_error")
     # The identical request is the same action: the same refusal, no send.
     again = await call(service, EXECUTE)
     assert (again["status"], again["action_id"]) == ("rejected", str(BLOCKED))
 
 
 @pytest.mark.asyncio
-async def test_a_refusal_that_cannot_be_recorded_is_still_an_ordinary_result():
+async def test_a_passing_error_tried_once_more_that_succeeds_just_sends():
+    service, store, adapter = harness()
+    errors = [SqlError("deadlock detected", "40P01")]
+    original = store.prepare
+
+    async def deadlock_once(ctx, expected_state):
+        if errors:
+            raise errors.pop()
+        return await original(ctx, expected_state)
+
+    store.prepare = deadlock_once
+
+    result = await call(service, EXECUTE, routed=frozenset())
+
+    assert (result["status"], result["action_id"]) == ("sent", str(BLOCKED))
+    assert not any(call[0] == "reject" for call in store.calls)
+    assert adapter.sent == ["pong"]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_cannot_be_recorded_names_the_action_and_an_override_still_sends_it():
     """The database is gone: the row cannot be ended either. The agent still
-    gets a result (no MCP tool error), and the identical request re-drives
-    the same row once it is back."""
-    service, store, _adapter = harness()
+    gets an ordinary result naming the action. The identical request
+    re-drives it, and so does an override: the `received` row is ended
+    first, so it can never be left where nothing picks it up."""
+    service, store, adapter = harness()
     store.prepare_error = ConnectionResetError("server closed the connection unexpectedly")
+    reject = store.reject
     store.reject = AsyncMock(side_effect=ConnectionResetError("server closed the connection unexpectedly"))
 
     result = await call(service, EXECUTE)
 
-    assert (result["status"], result["detail_code"]) == ("failed", "gateway_error")
-    assert "nothing was sent by this call. Make the same call again" in result["detail"]
-    assert "action_id" not in result
+    assert (result["status"], result["detail_code"], result["action_id"]) == ("failed", "gateway_internal_error", str(BLOCKED))
+    assert "Execute the same request again to retry" in result["detail"]
     assert store.rows[BLOCKED].state is ActionState.RECEIVED
+
+    store.prepare_error = None
+    store.reject = reject
+    sent = await call(service, confirm(BLOCKED), routed=frozenset())
+
+    assert (sent["status"], sent["action_id"]) == ("sent", str(SUCCESSOR))
+    assert (store.rows[BLOCKED].state, store.rows[BLOCKED].detail_code) == (ActionState.REJECTED, "superseded_by_override")
+    assert adapter.sent == ["pong"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_readback_after_the_provider_call_never_says_not_sent():
+    """The provider may have the message: if even the row cannot be read
+    back, the result says "not yet confirmed", never "not sent"."""
+    service, store, adapter = harness()
+    get = store.get
+    adapter.invoke = AsyncMock(side_effect=TimeoutError("provider read timed out"))
+
+    async def flaky_get(action_id):
+        if store.rows.get(action_id) is not None and store.rows[action_id].state is ActionState.DISPATCHING:
+            raise ConnectionResetError("reset")
+        return await get(action_id)
+
+    store.get = flaky_get
+
+    result = await call(service, EXECUTE, routed=frozenset())
+
+    assert (result["status"], result["action_id"]) == ("pending", str(BLOCKED))
+    assert "not yet confirmed sent" in result["detail"]
+    assert "Not sent" not in result["detail"]
+    assert_no_override(result)
 
 
 # ----------------------------------------------------------------------------
@@ -268,7 +288,7 @@ async def test_override_of_the_refused_row_submits_its_successor_to_restate():
     result = await call(service, confirm(BLOCKED), submitter=submitter)
 
     assert (result["status"], result["action_id"]) == ("pending", str(SUCCESSOR))
-    assert "override" not in result
+    assert_no_override(result)
     submitter.submit.assert_awaited_once_with(SUCCESSOR)
     successor = store.rows[SUCCESSOR]
     assert (successor.state, successor.retry_of_action_id, successor.remediation_reason) == (
@@ -276,7 +296,7 @@ async def test_override_of_the_refused_row_submits_its_successor_to_restate():
         BLOCKED,
         AGENT_OVERRIDE,
     )
-    assert ("override", BLOCKED, REASON) in store.calls
+    assert ("override", BLOCKED, "yes", REASON) in store.calls
     assert adapter.sent == []  # Restate sends it
 
 
@@ -285,9 +305,9 @@ async def test_override_of_the_refused_row_submits_its_successor_to_restate():
     "parent",
     [
         {"state": ActionState.REJECTED, "detail_code": "wake_terminal", "error_detail": "wake 27164 is already closed"},
+        {"state": ActionState.REJECTED, "detail_code": "gateway_refused", "error_detail": "ambiguous aliases"},
         {"state": ActionState.DEFINITIVE_FAILED, "detail_code": "provider_permanent_upstream_error"},
-        {"state": ActionState.DEFINITIVE_FAILED, "detail_code": "retry_budget_exhausted"},
-        {"state": ActionState.MANUAL_REVIEW, "detail_code": "retry_budget_exhausted_manual_review"},
+        {"state": ActionState.MANUAL_REVIEW, "detail_code": "persisted_context_unavailable"},
         {"state": ActionState.DEAD_LETTER, "detail_code": "calendar_dependency_failed"},
         {"state": ActionState.STALE, "detail_code": "stale_context_unasked"},
         {
@@ -301,21 +321,72 @@ async def test_override_of_the_refused_row_submits_its_successor_to_restate():
 )
 async def test_every_not_sent_outcome_offers_the_override_and_the_override_sends_once(parent):
     service, store, adapter = harness()
-    ctx = await stale_tests.FakeLoader().load(stale_tests.execute_request())
-    await store.create_or_load(ctx)
-    store._put(replace(store.rows[BLOCKED], **parent))
+    await recorded_parent(store, **parent)
 
     status = await call(service, {"op": "status", "action_id": str(BLOCKED)})
-    assert status["detail"]
+    assert status["detail"].startswith("Not sent")
     assert_offers_override(status, BLOCKED)
 
-    sent = await service.confirm(stale_tests.confirm(BLOCKED, "yes").model_copy(update={"reason": REASON}))
-    again = await service.confirm(stale_tests.confirm(BLOCKED, "yes").model_copy(update={"reason": "asked twice"}))
+    sent = await call(service, confirm(BLOCKED), routed=frozenset())
+    again = await call(service, confirm(BLOCKED, reason="asked twice"), routed=frozenset())
 
-    assert (sent.status, sent.action_id) == (PublicStatus.SENT, SUCCESSOR)
-    assert (again.status, again.action_id) == (PublicStatus.DUPLICATE, SUCCESSOR)
+    assert (sent["status"], sent["action_id"]) == ("sent", str(SUCCESSOR))
+    assert (again["status"], again["action_id"]) == ("duplicate", str(SUCCESSOR))
     assert adapter.sent == ["pong"]
     assert store.rows[BLOCKED].state is parent["state"]
+    assert (store.rows[BLOCKED].override_decision, store.rows[SUCCESSOR].remediation_reason) == ("yes", AGENT_OVERRIDE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parent",
+    [
+        {"state": ActionState.COMPLETED, "detail_code": "provider_receipt_verified", "completion_kind": CompletionKind.SENT},
+        {"state": ActionState.COMPLETED, "detail_code": "operator_positive_evidence", "completion_kind": CompletionKind.DUPLICATE},
+        {"state": ActionState.DEFINITIVE_FAILED, "detail_code": "retry_budget_exhausted"},
+        {"state": ActionState.MANUAL_REVIEW, "detail_code": "retry_budget_exhausted_manual_review", "dispatch_started_at": stale_tests.EXECUTED_AT},
+        {"state": ActionState.DEAD_LETTER, "detail_code": "prior_dispatch_ambiguous", "dispatch_started_at": stale_tests.EXECUTED_AT},
+    ],
+    ids=lambda parent: f"{parent['state'].value}/{parent['detail_code']}",
+)
+async def test_a_message_that_may_have_reached_the_recipient_is_never_offered_again(parent):
+    """A real send, an operator-proven delivery, and anything that reached
+    the provider are not overridable (Comm-Data-Store answer_outbound_action
+    refuses them): no override is offered, and confirm says what to do
+    instead."""
+    service, store, adapter = harness()
+    await recorded_parent(store, **{"provider_request_ref": "cliq-1", **parent})
+
+    status = await call(service, {"op": "status", "action_id": str(BLOCKED)})
+    refused = await call(service, confirm(BLOCKED), routed=frozenset())
+
+    assert_no_override(status)
+    assert (refused["status"], refused["detail_code"]) == ("rejected", "request_refused")
+    assert ("already sent" in refused["detail"]) or ("may already have been delivered" in refused["detail"])
+    assert not any(call[0] == "override" for call in store.calls)
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_after_an_override_the_parent_reports_its_successor_and_never_offers_it_again():
+    """T4: status on the refused action, and the identical request again,
+    answer with the send the override made -- never "not sent" plus another
+    override, which invites a second message."""
+    service, store, adapter = harness()
+    store.prepare_error = AMBIGUOUS
+    await call(service, EXECUTE)
+    await call(service, confirm(BLOCKED), routed=frozenset())
+    assert adapter.sent == ["pong"]
+
+    status = await call(service, {"op": "status", "action_id": str(BLOCKED)})
+    again = await call(service, EXECUTE, routed=frozenset())
+
+    for result in (status, again):
+        assert result["action_id"] == str(SUCCESSOR)
+        assert result["status"] in {"sent", "duplicate"}
+        assert result["detail"].startswith(f"Action {BLOCKED} was not sent itself; your answer sent it as action {SUCCESSOR}.")
+        assert_no_override(result)
+    assert adapter.sent == ["pong"]
 
 
 @pytest.mark.asyncio
@@ -335,7 +406,7 @@ async def test_a_failed_override_can_itself_be_overridden_until_the_cap_says_so_
     assert (capped["status"], capped["detail_code"]) == ("rejected", "request_refused")
     assert capped["detail"].startswith(
         f"confirm refused for action {SUCCESSOR}: override limit reached: wake {WAKE} already re-sent internal_reply 1 times; "
-        "record needs_human with the message you meant to send. Nothing was sent by this answer."
+        "record needs_human with the message you meant to send."
     )
     assert "any other route around the outbound gateway" in capped["detail"]
 
@@ -358,48 +429,103 @@ async def test_confirm_on_a_message_that_was_sent_says_so_and_to_send_a_new_one(
 
 
 @pytest.mark.asyncio
-async def test_override_needs_a_reason_its_own_wake_and_yes_and_no_drops_it():
+@pytest.mark.parametrize(
+    "reason", [None, "   ", "<why>", "<required: why you still want to send it>", "reason", "Add reason: why you still want to send."]
+)
+async def test_an_override_needs_a_written_reason_not_a_blank_or_a_template(reason):
+    service, store, adapter = harness()
+    store.prepare_error = AMBIGUOUS
+    result = await call(service, EXECUTE)
+    # The hint, echoed back with whatever stands in for a reason.
+    echoed = {**result["override"], **({} if reason is None else {"reason": reason})}
+
+    refused = await call(service, echoed)
+
+    assert refused["status"] == "rejected" and 'needs a reason -- say in "reason"' in refused["detail"]
+    assert not any(call[0] == "override" for call in store.calls)
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_an_override_comes_from_its_own_wake_and_never_revises():
     service, store, adapter = harness()
     store.prepare_error = AMBIGUOUS
     await call(service, EXECUTE)
 
-    no_reason = await call(service, confirm(BLOCKED, reason="   "))
     other_wake = await call(service, confirm(BLOCKED, wake=WAKE + 1))
     revise = await call(
         service,
         {"op": "confirm", "wakeup_event_id": WAKE, "action_id": str(BLOCKED), "decision": "revise", "arguments": {"text": "x"}},
     )
-    dropped = await call(service, confirm(BLOCKED, "no", reason=None))
 
-    assert no_reason["status"] == "rejected" and 'needs a reason -- say in "reason"' in no_reason["detail"]
     assert "never crosses wakes" in other_wake["detail"]
     assert "execute it as a new message" in revise["detail"]
-    assert (dropped["status"], dropped["action_id"]) == ("rejected", str(BLOCKED))
-    assert dropped["detail"].startswith("Not sent, as you decided")
-    assert "override" not in dropped
     assert not any(call[0] == "override" for call in store.calls)
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_no_is_recorded_on_the_refused_action_as_a_deliberate_no_send():
+    """T7: the agent's no is durable (override_decision), so the receipt
+    barrier and the outcome readers see a decision, not an abandoned
+    failure; the action is never offered again, and a later yes is refused."""
+    service, store, adapter = harness()
+    store.prepare_error = AMBIGUOUS
+    await call(service, EXECUTE)
+
+    dropped = await call(service, confirm(BLOCKED, "no", reason=None))
+    status = await call(service, {"op": "status", "action_id": str(BLOCKED)})
+    again = await call(service, confirm(BLOCKED, "no", reason=None))
+    late_yes = await call(service, confirm(BLOCKED))
+
+    assert ("override", BLOCKED, "no", None) in store.calls
+    assert store.rows[BLOCKED].override_decision == "no"
+    for result in (dropped, status, again):
+        assert (result["status"], result["action_id"]) == ("rejected", str(BLOCKED))
+        assert result["detail"].startswith("Declined: nothing was sent for this action.")
+        assert_no_override(result)
+    assert late_yes["status"] == "rejected" and "you already answered no" in late_yes["detail"]
     assert adapter.sent == []
 
 
 @pytest.mark.asyncio
 async def test_an_override_is_not_asked_the_stale_question_it_already_answered():
     """The agent saw the message refused and chose to send it: newer
-    activity is not asked about again, and the calendar dependency is not
-    waited on (the override is the agent's call on both)."""
+    activity is not asked about again."""
     service, store, adapter = harness(stale_tests.CRON_ALERT)
-    ctx = await stale_tests.FakeLoader().load(stale_tests.execute_request())
-    await store.create_or_load(ctx)
-    store._put(replace(store.rows[BLOCKED], state=ActionState.REJECTED, detail_code="gateway_error"))
+    await recorded_parent(store, state=ActionState.REJECTED, detail_code="gateway_error")
 
-    result = await service.confirm(stale_tests.confirm(BLOCKED, "yes").model_copy(update={"reason": REASON}))
+    result = await call(service, confirm(BLOCKED), routed=frozenset())
 
-    assert result.status is PublicStatus.SENT
+    assert result["status"] == "sent"
     assert not any(call[0] == "block_stale" for call in store.calls)
     assert adapter.sent == ["pong"]
 
 
 @pytest.mark.asyncio
-async def test_an_override_successor_skips_the_calendar_dependency():
+async def test_a_stale_question_answered_yes_after_the_wake_ended_still_sends():
+    """T6: the wake was closed (the reconciler, a slow turn) while its
+    stale_context question was open. Comm-Data-Store's one answer body sends
+    a late yes as an agent_override, so the gateway answers it like any
+    other yes -- no special case, no dead end."""
+    service, store, adapter = harness(stale_tests.CRON_ALERT)
+    blocked = await call(service, EXECUTE, routed=frozenset())
+    assert blocked["status"] == "needs_confirmation"
+    store.wake_terminal = True
+
+    result = await call(service, stale_tests.confirm(BLOCKED, "yes").model_dump(mode="json"), routed=frozenset())
+
+    assert (result["status"], result["action_id"]) == ("sent", str(SUCCESSOR))
+    assert store.rows[SUCCESSOR].remediation_reason == AGENT_OVERRIDE
+    assert adapter.sent == ["pong"]
+
+
+@pytest.mark.asyncio
+async def test_an_override_successor_still_waits_on_the_calendar_dependency():
+    """T2: the override waives only the stale_context question and the
+    intent-lock dedupe. A showing confirmation still waits for its calendar
+    event: the agent never saw that dependency, and overriding a refusal
+    about something else must not confirm a showing with no event."""
     store = service_tests.FakeStore(
         service_tests.row(
             ActionState.RECEIVED,
@@ -409,13 +535,14 @@ async def test_an_override_successor_skips_the_calendar_dependency():
         )
     )
     svc = service_tests.service(store, service_tests.FakeAdapter())
+    svc._context_loader.load.return_value = replace(service_tests.context(), intent_kind=IntentKind.SHOWING_CONFIRMATION)
     svc._evidence_loader.load.return_value = service_tests.evidence(calendar_dependency=CalendarDependencyState.PENDING)
 
     result = await svc.prepare(service_tests.ACTION_ID)
 
-    assert result.status is PublicStatus.PENDING
-    assert store.current.state is ActionState.PREPARED
-    svc._evidence_loader.load.assert_not_called()
+    assert (result.status, result.detail_code) == (PublicStatus.PENDING, "calendar_dependency_pending")
+    assert store.current.state is ActionState.DEPENDENCY_WAIT
+    assert not any(call[0] == "prepare" for call in store.calls)
 
 
 # ----------------------------------------------------------------------------
@@ -426,21 +553,32 @@ async def test_an_override_successor_skips_the_calendar_dependency():
 @pytest.mark.asyncio
 async def test_status_of_a_provider_rejection_carries_the_providers_words():
     service, store, _adapter = harness()
-    ctx = await stale_tests.FakeLoader().load(stale_tests.execute_request())
-    await store.create_or_load(ctx)
-    store._put(
-        replace(
-            store.rows[BLOCKED],
-            state=ActionState.DEFINITIVE_FAILED,
-            detail_code="provider_permanent_upstream_error",
-            error_detail="channel not found or bot is not a member",
-        )
+    await recorded_parent(
+        store,
+        state=ActionState.DEFINITIVE_FAILED,
+        detail_code="provider_permanent_upstream_error",
+        error_detail="channel not found or bot is not a member",
     )
 
     result = await call(service, {"op": "status", "action_id": str(BLOCKED)})
 
     assert result["status"] == "failed"
-    assert result["detail"].startswith("Not sent: channel not found or bot is not a member. To still send it")
+    assert result["detail"].startswith(f"Not sent: channel not found or bot is not a member. {OVERRIDE_RULE}")
+    assert_offers_override(result, BLOCKED)
+
+
+@pytest.mark.asyncio
+async def test_a_parked_row_that_never_dispatched_says_it_was_not_sent():
+    """T12: manual_review / dead_letter before any dispatch never reached a
+    provider -- not "may already have reached the recipient"."""
+    service, store, _adapter = harness()
+    await recorded_parent(store, state=ActionState.MANUAL_REVIEW, detail_code="persisted_context_unavailable")
+
+    result = await call(service, {"op": "status", "action_id": str(BLOCKED)})
+
+    assert result["status"] == "manual_review"
+    assert result["detail"].startswith("Not sent: persisted_context_unavailable.")
+    assert "may already have reached" not in result["detail"]
     assert_offers_override(result, BLOCKED)
 
 
@@ -460,7 +598,7 @@ async def test_a_message_for_a_closed_wake_is_recorded_rejected_and_overridable(
     result = await call(service, EXECUTE)
 
     assert (result["status"], result["detail_code"]) == ("rejected", "wake_terminal")
-    assert result["detail"].startswith(f"Not sent: wake {WAKE} is already closed. To still send it")
+    assert result["detail"].startswith(f"Not sent: wake {WAKE} is already closed. {OVERRIDE_RULE}")
     assert_offers_override(result, BLOCKED)
 
 
@@ -503,35 +641,106 @@ async def test_three_failures_in_a_row_are_three_ordinary_results():
 
 
 # ----------------------------------------------------------------------------
-# Restate never retries what can only fail the same way, and never ends over
-# a live row
+# Restate: a refusal ends the row once; anything else waits under the
+# ceiling, and never ends the workflow over a live row
 # ----------------------------------------------------------------------------
+
+
+def coordinator_for(store, service, *, clock=lambda: stale_tests.EXECUTED_AT, warning=None):
+    auth = AsyncMock()
+    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
+    return OutboundDeliveryCoordinator(
+        store=store,
+        service=service,
+        auth=auth,
+        operations=frozenset({Operation.CLIQ_CHAT_POST}),
+        staff_warning=warning or AsyncMock(),
+        clock=clock,
+    )
 
 
 @pytest.mark.asyncio
 async def test_restate_prepare_of_a_refused_row_terminalizes_it_once():
     service, store, _adapter = harness()
-    ctx = await stale_tests.FakeLoader().load(stale_tests.execute_request())
-    await store.create_or_load(ctx)
+    await recorded_parent(store)
     store.prepare_error = AMBIGUOUS
     warning = AsyncMock()
-    coordinator = OutboundDeliveryCoordinator(
-        store=store,
-        service=service,
-        auth=AsyncMock(),
-        operations=frozenset({Operation.CLIQ_CHAT_POST}),
-        staff_warning=warning,
-        clock=lambda: stale_tests.EXECUTED_AT,
-    )
+    coordinator = coordinator_for(store, service, warning=warning)
 
     first = await coordinator.advance(BLOCKED)
     second = await coordinator.advance(BLOCKED)
 
-    assert (first.phase, first.detail_code) == (DeliveryPhase.TERMINAL, "gateway_error")
+    assert (first.phase, first.detail_code) == (DeliveryPhase.TERMINAL, "gateway_refused")
     assert (second.phase, second.detail_code) == (DeliveryPhase.TERMINAL, "rejected")
     assert store.rows[BLOCKED].state is ActionState.REJECTED
     assert [call for call in store.calls if call[0] == "prepare_refused"] == [("prepare_refused", BLOCKED)]
     warning.warn_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [SqlError("canceling statement due to statement timeout", "57014"), ConnectionResetError("reset"), RuntimeError("bug")],
+    ids=["statement_timeout", "connection_reset", "fault"],
+)
+async def test_restate_prepare_that_fails_for_any_other_reason_waits_and_leaves_the_row(error):
+    """Nobody is waiting on Restate's prepare: a passing error (or a fault)
+    is retried on the next advance under the elapsed ceiling, never written
+    as a refusal no agent will see (findings: dependency_wait/received rows
+    ended rejected on a DB blip)."""
+    service, store, _adapter = harness()
+    await recorded_parent(store)
+    store.prepare_error = error
+    warning = AsyncMock()
+
+    result = await coordinator_for(store, service, warning=warning).advance(BLOCKED)
+
+    assert (result.phase, result.detail_code) == (DeliveryPhase.WAIT, "gateway_internal_error")
+    assert result.retry_after_seconds >= 1
+    assert store.rows[BLOCKED].state is ActionState.RECEIVED
+    assert not any(call[0] == "reject" for call in store.calls)
+    warning.warn_once.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restate_waits_on_a_context_reload_of_a_received_row_and_ends_it_at_the_ceiling():
+    """The reload's own words are the result's detail; the wait keys on its
+    detail_code (persisted_context_unavailable), so it is a 5-minute wait,
+    not a 1-second spin, and the elapsed ceiling ends the row rejected."""
+    service, store, _adapter = harness()
+    await recorded_parent(store, created_at=stale_tests.EXECUTED_AT)
+    service._context_loader.load = AsyncMock(side_effect=ContextDerivationError("verified target could not be derived"))
+
+    waiting = await coordinator_for(store, service).advance(BLOCKED)
+    late = coordinator_for(store, service, clock=lambda: stale_tests.EXECUTED_AT + timedelta(seconds=RETRY_CEILING_SECONDS + 1))
+    ended = await late.advance(BLOCKED)
+
+    assert (waiting.phase, waiting.detail_code, waiting.retry_after_seconds) == (
+        DeliveryPhase.WAIT,
+        "persisted_context_unavailable",
+        CONTEXT_RELOAD_WAIT_SECONDS,
+    )
+    assert ended.phase is DeliveryPhase.TERMINAL
+    assert (store.rows[BLOCKED].state, store.rows[BLOCKED].detail_code) == (ActionState.REJECTED, "prepare_retry_exhausted")
+
+
+@pytest.mark.asyncio
+async def test_a_confirm_successor_whose_context_will_not_reload_is_refused_to_the_agent_not_left_waiting():
+    """With the agent waiting, a successor whose saved context cannot be
+    reloaded ends rejected in the reload's words (overridable), instead of a
+    `pending` Restate would spin on."""
+    service, store, adapter = harness()
+    await recorded_parent(store, state=ActionState.REJECTED, detail_code="gateway_refused")
+    service._context_loader.load = AsyncMock(side_effect=ContextDerivationError("verified target could not be derived"))
+    submitter = AsyncMock()
+
+    result = await call(service, confirm(BLOCKED), submitter=submitter)
+
+    assert (result["status"], result["action_id"], result["detail_code"]) == ("rejected", str(SUCCESSOR), "gateway_refused")
+    assert result["detail"].startswith("Not sent: verified target could not be derived.")
+    assert_offers_override(result, SUCCESSOR)
+    submitter.submit.assert_not_called()
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -549,19 +758,9 @@ async def test_restate_waits_on_a_live_row_after_a_pre_send_error_instead_of_end
     store.get.return_value = row
     service = AsyncMock()
     service.resume.return_value = SimpleNamespace(status=PublicStatus.FAILED, detail_code="gateway_internal_error", detail="Not sent")
-    auth = AsyncMock()
-    auth.ensure_ready.return_value = AuthResult(AuthState.READY)
     warning = AsyncMock()
-    coordinator = OutboundDeliveryCoordinator(
-        store=store,
-        service=service,
-        auth=auth,
-        operations=frozenset({Operation.CLIQ_CHAT_POST}),
-        staff_warning=warning,
-        clock=lambda: stale_tests.EXECUTED_AT,
-    )
 
-    result = await coordinator.advance(BLOCKED)
+    result = await coordinator_for(store, service, warning=warning).advance(BLOCKED)
 
     assert (result.phase, result.detail_code) == (DeliveryPhase.WAIT, "gateway_internal_error")
     assert result.retry_after_seconds >= 1
@@ -569,7 +768,8 @@ async def test_restate_waits_on_a_live_row_after_a_pre_send_error_instead_of_end
 
 
 # ----------------------------------------------------------------------------
-# Staff posts are keyed on their recipient, never the prospect's aliases
+# Staff posts are keyed on their recipient; a prospect is never named by a
+# hub alias
 # ----------------------------------------------------------------------------
 
 
@@ -619,9 +819,46 @@ async def test_a_prospect_reply_on_a_split_prospects_wake_passes_every_alias_to_
     assert len(repository.alias_calls) == 1
 
 
-def test_override_request_is_the_confirm_contract():
+@pytest.mark.asyncio
+async def test_a_prospect_is_never_named_by_a_hub_alias():
+    """T10: our own and shared addresses (the one rule: Comm-Data-Store
+    outbound_alias_is_hub, applied by the resolver's query) never name the
+    prospect -- not as its subject, not as its fallback alias."""
+    wake = context_tests.record(
+        envelope={"identity": {}, "message": {"prospect_name": "x", "property": "138 Bullman St #144-A", "direct_email": "noreply@tenantcloud.com"}},
+        participant_type="email_address",
+        participant_key="noreply@tenantcloud.com",
+    )
+    hubs = ("email:noreply@tenantcloud.com",)
+    only_hubs = await ActionContextLoader(context_tests.FakeRepository(wake, hubs=hubs), context_tests.policy()).load(context_tests.request())
+    mixed = await ActionContextLoader(
+        context_tests.FakeRepository(context_tests.record(), hubs=("email:amandasnyder@live.com",), ambiguous=True),
+        context_tests.policy(),
+    ).load(context_tests.request())
+
+    assert only_hubs.prospect_id == f"prospect:{only_hubs.target.target_id}"
+    assert "noreply" not in only_hubs.prospect_id
+    assert mixed.prospect_id == "prospect:factbook:aa1a1515-7929-4f17-a632-ec89c32f5895"
+
+
+@pytest.mark.asyncio
+async def test_the_subject_resolver_leaves_hub_aliases_to_the_database_rule():
+    """One hub rule: the resolver's query applies outbound_alias_is_hub; the
+    gateway has no copy of it."""
+    driver = object()
+    rows = [SimpleNamespace(cells={"personal_aliases": ["phone:+19085550100"], "canonical_subject": None})]
+    with patch("postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query", AsyncMock(return_value=rows)) as query:
+        resolved = await OutboundGatewayRepository(driver).resolve_canonical_subject(("email:dan@pfg.io", "phone:+19085550100"), "")
+
+    assert "NOT outbound_alias_is_hub(alias)" in query.await_args.args[1]
+    assert resolved == AliasResolution(canonical_subject=None, personal_aliases=("phone:+19085550100",))
+
+
+def test_override_request_is_the_confirm_contract_without_a_reason_to_echo():
     hint = OverrideRequest(wakeup_event_id=WAKE, action_id=BLOCKED).model_dump(mode="json")
     parsed = parse_outbound_request({**hint, "reason": REASON})
 
+    assert "reason" not in hint
     assert (parsed.op, parsed.decision.value, parsed.reason) == ("confirm", "yes", REASON)
     assert parse_outbound_request({**hint, "reason": "  "}).reason is None
+    assert parse_outbound_request({**hint, "reason": "<why you still want to send>"}).reason is None

@@ -63,12 +63,6 @@ def _verified_readback_evidence(value: ProviderObservation) -> Mapping[str, Any]
 # what happened and what to do next.
 _DATABASE_REFUSAL_NEXT_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"ordinary outbound action cannot attach to terminal wake \S+"),
-        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
-        "the gateway), so no new action can be recorded on it. Do not retry this request. Record "
-        "needs_human with what you meant to send, or send it from a new wake.",
-    ),
-    (
         re.compile(r"outbound action immutable context mismatch for \S+"),
         "Nothing was sent by this request: that action is already recorded with different content, "
         "and a recorded action never changes. Do not retry this request. Sending new content is a new "
@@ -79,17 +73,6 @@ _DATABASE_REFUSAL_NEXT_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"outbound action limit reached: wake \S+ already has \d+ actions"),
         "Nothing was sent: a wake records at most 10 actions. Record needs_human with what is still "
         "to send.",
-    ),
-    (
-        re.compile(r"stale context confirmation cannot send for terminal wake \S+"),
-        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
-        "the gateway). Do not retry this answer. Record needs_human with what you meant to send, or "
-        "send it from a new wake.",
-    ),
-    (
-        re.compile(r"stale context already answered[^\n]*"),
-        'Nothing new was sent: the first answer stands. Check the action with op "status" to see '
-        "what it did.",
     ),
 )
 
@@ -485,13 +468,21 @@ class PostgresActionStore:
             ],
         )
 
-    async def reject(self, action_id: UUID, detail_code: str, error_detail: str) -> OutboundActionRecord:
-        """End an action nothing started on (received or dependency_wait) as
-        a recorded refusal, with its reason; an already terminal action is
-        returned unchanged. Comm-Data-Store migration 251."""
+    async def reject(
+        self,
+        action_id: UUID,
+        expected_state: ActionState,
+        detail_code: str,
+        error_detail: str,
+    ) -> OutboundActionRecord:
+        """End an action nothing started on as a recorded refusal, with its
+        reason. The database moves it only while it is still in
+        expected_state with nothing started (received, or dependency_wait),
+        and otherwise returns it unchanged -- a row another caller advanced
+        is never rejected. Comm-Data-Store migration 251."""
         return await self._one(
-            "SELECT * FROM reject_outbound_action({}, {}, {})",
-            [action_id, detail_code, error_detail],
+            "SELECT * FROM reject_outbound_action({}, {}, {}, {})",
+            [action_id, expected_state.value, detail_code, error_detail],
         )
 
     async def override(
@@ -500,17 +491,31 @@ class PostgresActionStore:
         *,
         wakeup_event_id: int,
         actor: str,
-        reason: str,
+        reason: str | None,
+        decision: str,
     ) -> OutboundActionRecord:
-        """The agent still sends an action that was not sent: the successor
-        (same request, fresh action_uid, retry_of_action_id = action_id,
-        remediation_reason agent_override), minted once -- repeating it
-        returns the same successor. The database owns every guard (own wake,
-        nothing sent, the per-wake cap). Comm-Data-Store migration 251."""
+        """The agent's answer to an action that was not sent, recorded on it
+        (override_reason / override_actor / override_decided_at /
+        override_decision). yes: the successor that sends it (same request,
+        fresh action_uid, retry_of_action_id = action_id, remediation_reason
+        agent_override), minted once -- repeating it returns the same
+        successor. no: the action itself, dropped on purpose. The database
+        owns every guard (own wake, nothing sent, the per-wake cap).
+        Comm-Data-Store migration 251."""
         return await self._one(
-            "SELECT * FROM override_outbound_action({}, {}, {}, {})",
-            [action_id, wakeup_event_id, actor, reason],
+            "SELECT * FROM override_outbound_action({}, {}, {}, {}, {})",
+            [action_id, wakeup_event_id, actor, reason, decision],
         )
+
+    async def successor(self, action_id: UUID) -> OutboundActionRecord | None:
+        """The action that carries this one's send after the agent's yes
+        (retry_of_action_id is unique), if any."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "SELECT * FROM outbound_actions WHERE retry_of_action_id = {}",
+            [action_id],
+        )
+        return await self._hydrated_record(rows[0].cells) if rows else None
 
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         rows = await SafeSqlDriver.execute_param_query(
@@ -616,6 +621,8 @@ class PostgresActionStore:
                 else None
             ),
             remediation_reason=cells.get("remediation_reason"),
+            override_decision=cells.get("override_decision"),
+            dispatch_started_at=cells.get("dispatch_started_at"),
             error_detail=cells.get("error_detail"),
             stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
