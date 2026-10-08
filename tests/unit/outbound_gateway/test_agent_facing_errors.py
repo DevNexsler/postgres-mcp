@@ -13,13 +13,16 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from postgres_mcp.outbound_gateway.context import ActionContextLoader
 from postgres_mcp.outbound_gateway.context import ContextDerivationError
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.record import require_action
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
+from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
+from postgres_mcp.outbound_gateway.stale_context import refusal
 from postgres_mcp.outbound_gateway.state_machine import InvalidTransitionError
 from postgres_mcp.outbound_gateway.state_machine import validate_transition
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
@@ -36,6 +39,10 @@ ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 class DatabaseError(Exception):
     """Stands in for the psycopg error a CDS stored function raises."""
 
+    def __init__(self, message: str, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
 
 async def _create_raising(message: str) -> Exception:
     store = PostgresActionStore(object())
@@ -48,27 +55,15 @@ async def _create_raising(message: str) -> Exception:
     return raised.value
 
 
-async def _confirm_raising(message: str) -> Exception:
+async def _confirm_raising(message: str, sqlstate: str | None = None) -> Exception:
     store = PostgresActionStore(object())
     with patch(
         "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
-        AsyncMock(side_effect=DatabaseError(message)),
+        AsyncMock(side_effect=DatabaseError(message, sqlstate)),
     ):
         with pytest.raises(Exception) as raised:
             await store.confirm_stale_context(ACTION_ID, wakeup_event_id=27250, decision="yes", actor="agent")
     return raised.value
-
-
-@pytest.mark.asyncio
-async def test_terminal_wake_says_the_wake_is_closed_nothing_was_sent_and_not_to_retry():
-    error = await _create_raising("ordinary outbound action cannot attach to terminal wake 27250")
-    text = str(error)
-    assert text.startswith("ordinary outbound action cannot attach to terminal wake 27250")
-    assert "already closed" in text
-    assert "finalized" in text and "outside the gateway" in text
-    assert "Nothing was sent" in text
-    assert "needs_human" in text and "new wake" in text
-    assert "Do not retry" in text
 
 
 @pytest.mark.asyncio
@@ -90,21 +85,6 @@ async def test_action_limit_says_nothing_was_sent_and_to_record_needs_human():
 
 
 @pytest.mark.asyncio
-async def test_confirming_on_a_closed_wake_says_nothing_was_sent_and_what_to_do():
-    text = str(await _confirm_raising("stale context confirmation cannot send for terminal wake 27250"))
-    assert text.startswith("stale context confirmation cannot send for terminal wake 27250")
-    assert "already closed" in text and "Nothing was sent" in text
-    assert "needs_human" in text and "new wake" in text
-
-
-@pytest.mark.asyncio
-async def test_an_already_answered_question_says_the_first_answer_stands():
-    text = str(await _confirm_raising("stale context already answered no"))
-    assert text.startswith("stale context already answered no")
-    assert "first answer stands" in text and '"status"' in text
-
-
-@pytest.mark.asyncio
 async def test_any_other_database_error_passes_through_unchanged():
     error = await _create_raising("connection reset by peer")
     assert isinstance(error, DatabaseError)
@@ -123,17 +103,9 @@ async def test_a_missing_wake_names_the_id_and_what_to_pass():
 
 @pytest.mark.asyncio
 async def test_a_wrong_cliq_reply_target_says_where_a_reply_goes_and_the_alternative():
-    inbound = record(
-        event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_1",
-        channel_type="dm", subject=None, envelope={"identity": {}, "message": {}}, raw_payload={},
-    )
-    outbound = request(
-        action_role="internal_reply", operation="cliq.chat.post", intent_kind="internal_reply",
-        appointment_slot=None, arguments={"channel_or_chat_id": "CT_2", "text": "pong"},
-    )
-    with pytest.raises(ContextDerivationError) as raised:
-        await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
-    text = str(raised.value)
+    error = await _cliq_reply_target_refusal()
+    assert isinstance(error, ContextDerivationError)
+    text = str(error)
     assert text.startswith("Cliq reply target must match the inbound chat")
     assert "Nothing was sent" in text and "cliq.channel.post" in text
 
@@ -165,13 +137,13 @@ async def test_an_unknown_action_id_says_where_to_get_the_right_one():
 
 @pytest.mark.asyncio
 async def test_an_invalid_request_says_nothing_was_sent_and_where_the_shapes_are():
-    with pytest.raises(ValueError) as raised:
-        await handle_outbound_action(
-            AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False),
-            {"op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply", "operation": "email.send",
-             "intent_kind": "inquiry_reply", "arguments": {"to": "dan@pfg.io", "text": "hi"}},
-        )
-    text = str(raised.value)
+    result = await handle_outbound_action(
+        AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False),
+        {"op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply", "operation": "email.send",
+         "intent_kind": "inquiry_reply", "arguments": {"to": "dan@pfg.io", "text": "hi"}},
+    )
+    assert (result["status"], result["detail_code"]) == ("rejected", "invalid_request")
+    text = result["detail"]
     assert text.startswith("invalid outbound action request: ")
     assert "Nothing was sent" in text and "tool description" in text
 
@@ -181,19 +153,106 @@ async def test_a_tenantcloud_message_over_1000_characters_says_the_limit_and_not
     """Wake 27426 (2026-09-30) sent 1031 characters; TenantCloud answered 422
     and the agent guessed a CAPTCHA. The refusal now names the limit."""
     service = AsyncMock()
-    with pytest.raises(ValueError) as raised:
-        await handle_outbound_action(
-            service, FeaturePolicy(writes_enabled=True, kill_switch=False),
-            {"op": "execute", "wakeup_event_id": 27426, "action_role": "prospect_reply",
-             "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
-             "arguments": {"thread_id": 2076062, "text": "x" * 1031}},
-        )
-    text = str(raised.value)
+    result = await handle_outbound_action(
+        service, FeaturePolicy(writes_enabled=True, kill_switch=False),
+        {"op": "execute", "wakeup_event_id": 27426, "action_role": "prospect_reply",
+         "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
+         "arguments": {"thread_id": 2076062, "text": "x" * 1031}},
+    )
+    assert (result["status"], result["detail_code"]) == ("rejected", "invalid_request")
+    text = result["detail"]
     assert text.startswith("invalid outbound action request: ")
     assert "text is 1031 characters" in text
     assert "a TenantCloud message can be at most 1000 characters" in text
     assert "Nothing was sent" in text
     service.execute.assert_not_called()
+
+
+async def _cliq_reply_target_refusal() -> Exception:
+    inbound = record(
+        event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_1",
+        channel_type="dm", subject=None, envelope={"identity": {}, "message": {}}, raw_payload={},
+    )
+    outbound = request(
+        action_role="internal_reply", operation="cliq.chat.post", intent_kind="internal_reply",
+        appointment_slot=None, arguments={"channel_or_chat_id": "CT_2", "text": "pong"},
+    )
+    with pytest.raises(Exception) as raised:
+        await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
+    return raised.value
+
+
+async def _unknown_action_refusal() -> Exception:
+    store = AsyncMock()
+    store.get.return_value = None
+    with pytest.raises(Exception) as raised:
+        await require_action(store, ACTION_ID)
+    return raised.value
+
+
+EXECUTE = {
+    "op": "execute", "wakeup_event_id": 27250, "action_role": "prospect_reply", "operation": "email.send",
+    "intent_kind": "inquiry_reply", "arguments": {"to_address": "dan@pfg.io", "text": "hi"},
+}
+CONFIRM = {"op": "confirm", "wakeup_event_id": 27250, "action_id": str(ACTION_ID), "decision": "yes"}
+STATUS = {"op": "status", "action_id": str(ACTION_ID)}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_request_is_a_rejected_result_not_an_mcp_tool_error():
+    """hermes-agent counts every MCP tool error toward a 3-strike breaker
+    that parks outbound-gateway for every caller (#3463). A request the
+    gateway refuses as asked -- a closed wake, an action already recorded
+    with other content, a target the wake does not allow, a stale_context
+    answer that changes the recipient, an unknown action_id -- is the
+    caller's to correct, not a gateway fault: the tool answers it as an
+    ordinary rejected result carrying the refusal's own words -- a raw
+    database refusal (its SQLSTATE says so) as much as the gateway's own."""
+    refused = [
+        ("execute", EXECUTE, await _create_raising(f"outbound action immutable context mismatch for {ACTION_ID}")),
+        ("execute", EXECUTE, await _cliq_reply_target_refusal()),
+        ("confirm", CONFIRM, refusal("revise refused: only the message content (text) may change; "
+                                     "channel_or_chat_id must stay exactly as refused (same operation, recipient and target).")),
+        ("confirm", CONFIRM, await _confirm_raising(f"action {ACTION_ID} was already answered no", "55000")),
+        ("status", STATUS, await _unknown_action_refusal()),
+    ]
+    results = []
+    for method, payload, error in refused:
+        service = AsyncMock()
+        service.action_operation.return_value = None
+        getattr(service, method).side_effect = error
+        mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+        async with create_connected_server_and_client_session(mcp) as client:
+            results.append((error, await client.call_tool("outbound_action", {"request": payload})))
+
+    assert [result.isError for _error, result in results] == [False] * len(refused)
+    for error, result in results:
+        body = result.structuredContent or {}
+        assert (body["status"], body["detail_code"], body["retryable"]) == ("rejected", "request_refused", False)
+        assert body["detail"] == str(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method,payload", [("execute", EXECUTE), ("confirm", CONFIRM), ("status", STATUS)])
+async def test_a_gateway_fault_is_a_failed_result_not_an_mcp_tool_error(method, payload):
+    """A gateway fault is not the caller's mistake, but a raw MCP tool error
+    still counts toward hermes-agent's breaker and reads as an outage to
+    route around. Every op answers it as an ordinary failed result. It
+    cannot know whether the call recorded an action, so it never claims
+    "nothing was sent": the same call again shows where it stands."""
+    service = AsyncMock()
+    service.action_operation.return_value = None
+    getattr(service, method).side_effect = await _create_raising("connection reset by peer")
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+    async with create_connected_server_and_client_session(mcp) as client:
+        result = await client.call_tool("outbound_action", {"request": payload})
+    assert not result.isError
+    body = result.structuredContent or {}
+    assert (body["status"], body["detail_code"], body["retryable"]) == ("failed", "gateway_error", False)
+    assert "connection reset by peer" in body["detail"]
+    assert "nothing was sent" not in body["detail"].casefold()
+    assert "The same call again is the same action, never a second send" in body["detail"]
+    assert "Never send through another tool or route." in body["detail"]
 
 
 def test_an_invalid_transition_says_to_check_status_first():

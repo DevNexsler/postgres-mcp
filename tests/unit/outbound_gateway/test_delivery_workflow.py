@@ -161,8 +161,8 @@ async def test_unavailable_persisted_context_waits_without_hot_loop() -> None:
     service = AsyncMock()
     service.prepare.return_value = SimpleNamespace(
         status=PublicStatus.PENDING,
-        detail_code="operator_remediation_created",
-        detail="persisted_context_unavailable",
+        detail_code="persisted_context_unavailable",
+        detail="wakeup event does not exist",
     )
     auth = AsyncMock()
     auth.ensure_ready.return_value = AuthResult(AuthState.READY)

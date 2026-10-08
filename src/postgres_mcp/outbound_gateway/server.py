@@ -37,6 +37,9 @@ from .context import ActionContextLoader
 from .context import RoutingPolicy
 from .delivery_workflow import RestateWorkflowSubmitter
 from .delivery_workflow import SecretAuthGate
+from .errors import FailureKind
+from .errors import classify
+from .errors import error_text
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
@@ -44,14 +47,18 @@ from .models import ActionRole
 from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
+from .models import OutboundRequest
 from .models import PublicResult
 from .models import PublicStatus
+from .models import RequestRefusedError
 from .models import StatusRequest
 from .models import SuggestRequest
 from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
+from .record import NEVER_ANOTHER_ROUTE
+from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
 from .service import OutboundActionService
 from .store import PostgresActionStore
@@ -131,10 +138,51 @@ async def handle_outbound_action(
             hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
         elif location.endswith("operation"):
             hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
-        raise ValueError(
-            f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
-            "that field and send again; the tool description lists each operation's exact arguments."
-        ) from exc
+        # A malformed request is the caller's mistake, answered as an ordinary
+        # result rather than an MCP tool error: hermes-agent counts tool errors
+        # toward a breaker that parks the whole server for every caller
+        # (#3264). No action exists yet, so there is no action_id to return.
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "invalid_request",
+            "detail": (
+                f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
+                "that field and send again; the tool description lists each operation's exact arguments."
+            ),
+        }
+    try:
+        result = await _route(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
+    except Exception as error:
+        return _failure(error, parsed.op)
+    if isinstance(result, dict):
+        return result
+    payload = result.model_dump(mode="json")
+    # A plain send leaves detail unset, and every result except
+    # needs_confirmation leaves new_context/question unset (override is set
+    # only when nothing was sent) -- omit unset keys entirely so consumers
+    # see no `null` field on the wire.
+    for optional in ("detail", "new_context", "question", "override"):
+        if payload.get(optional) is None:
+            payload.pop(optional, None)
+    return payload
+
+
+async def _route(
+    service: OutboundActionService,
+    policy: FeaturePolicy,
+    parsed: OutboundRequest,
+    *,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None,
+    restate_operations: frozenset[Operation] | None,
+) -> PublicResult | dict[str, Any]:
+    """The answer to one parsed request: suggestions, or an action's result."""
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
@@ -165,6 +213,7 @@ async def handle_outbound_action(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code=detail,
+                detail=SENDING_PAUSED_DETAIL,
             )
         elif parsed.operation not in policy.enabled_operations:
             action_id = uuid5(
@@ -178,6 +227,7 @@ async def handle_outbound_action(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code="operation_disabled",
+                detail=_operation_disabled_detail(parsed.operation, policy),
             )
         else:
             routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
@@ -198,16 +248,50 @@ async def handle_outbound_action(
                         )
             else:
                 result = await service.execute(parsed)
-    payload = result.model_dump(mode="json")
-    # Every result except a traffic-control block leaves detail unset, and
-    # every result except needs_confirmation leaves new_context/question
-    # unset -- omit those keys entirely so existing consumers see no new
-    # field on the wire, instead of a `null` that would still be a shape
-    # change for strict clients.
-    for optional in ("detail", "new_context", "question"):
-        if payload.get(optional) is None:
-            payload.pop(optional, None)
-    return payload
+    return result
+
+
+def _failure(error: Exception, op: str) -> dict[str, Any]:
+    """Every failure is an ordinary result, never an MCP tool error:
+    hermes-agent counts tool errors toward a breaker that parks the gateway
+    for every caller (#3463), and raw error text reads to the agent as an
+    outage to route around. A refusal (errors.classify) is the caller's to
+    correct, in its own words; anything else is the gateway's. A row the
+    call recorded is answered by the service itself (its action_id, and the
+    override where nothing was sent), so reaching here the call may have
+    failed before or after recording one."""
+    if classify(error) is FailureKind.REFUSAL:
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "request_refused",
+            "detail": str(error) if isinstance(error, RequestRefusedError) else error_text(error),
+        }
+    logger.exception("outbound_action %s failed", op)
+    return {
+        "status": PublicStatus.FAILED.value,
+        "retryable": False,
+        "detail_code": "gateway_error",
+        "detail": (
+            f"The gateway hit an error ({error_text(error)}) before it could say what happened. The same "
+            "call again is the same action, never a second send: make it again to see where it stands; if it "
+            f"fails again, record needs_human. {NEVER_ANOTHER_ROUTE}"
+        ),
+    }
+
+
+SENDING_PAUSED_DETAIL = (
+    "Not sent: an operator has paused sending through this gateway, and nothing was recorded. Record "
+    f"needs_human with what you meant to send. {NEVER_ANOTHER_ROUTE}"
+)
+
+
+def _operation_disabled_detail(operation: Operation, policy: FeaturePolicy) -> str:
+    enabled = ", ".join(sorted(op.value for op in policy.enabled_operations)) or "none"
+    return (
+        f"Not sent: {operation.value} is not enabled on this gateway, and nothing was recorded. Enabled "
+        f"operations: {enabled}. Use one of them, or record needs_human. {NEVER_ANOTHER_ROUTE}"
+    )
 
 
 async def _confirm(
@@ -218,10 +302,10 @@ async def _confirm(
     tenantcloud_submitter: RestateWorkflowSubmitter | None,
     restate_operations: frozenset[Operation] | None = None,
 ) -> PublicResult:
-    """Route a stale_context answer. A decline is a ledger write only and is
-    always accepted; a yes is a send and obeys the same write switches as
-    execute. TenantCloud sends are prepared here and handed to Restate, like
-    enqueue()."""
+    """Route a stale_context answer or an override. A decline is a ledger
+    write only and is always accepted; a yes is a send and obeys the same
+    write switches as execute. A Restate-routed successor is prepared here
+    and handed to Restate, like enqueue()."""
     sends = request.decision.value != "no"
     if sends:
         if not policy.writes_enabled or policy.kill_switch:
@@ -232,6 +316,7 @@ async def _confirm(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code="kill_switch_open" if policy.kill_switch else "writes_disabled",
+                detail=SENDING_PAUSED_DETAIL,
             )
     parent_operation = await service.action_operation(request.action_id)
     if sends and parent_operation is not None and parent_operation not in policy.enabled_operations:
@@ -242,6 +327,7 @@ async def _confirm(
             provider_request_ref=None,
             retryable=False,
             detail_code="operation_disabled",
+            detail=_operation_disabled_detail(parent_operation, policy),
         )
     routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
     routed = parent_operation in routed_operations and tenantcloud_submitter is not None
@@ -290,7 +376,12 @@ def create_server(
             "messages, including any we already sent to that recipient (direction \"sent by us\") -- and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
-            "message content changed). Every send, from any wake, goes through this tool: "
+            "message content changed). Any other result that did not send (status rejected, "
+            "failed, duplicate, manual_review or stale) says why in detail, and may carry "
+            "\"override\": that confirm request with the wake and action filled in (decision \"no\" "
+            "instead records that you chose not to send it). " + OVERRIDE_RULE + " A malformed request "
+            "(detail_code invalid_request) recorded nothing: fix the field its detail names. "
+            "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "

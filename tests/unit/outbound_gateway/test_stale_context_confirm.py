@@ -158,13 +158,23 @@ class FakeLoader:
         return {}
 
 
+class SqlError(Exception):
+    """A psycopg error as the gateway sees it: the database's words and SQLSTATE."""
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
 class LedgerStore:
-    """An outbound_actions ledger with migration 192's stale-context guards."""
+    """An outbound_actions ledger with migration 192's stale-context guards
+    and migration 251's reject_outbound_action / override_outbound_action."""
 
     def __init__(self) -> None:
         self.rows: dict[UUID, OutboundActionRecord] = {}
         self.calls: list[tuple[Any, ...]] = []
         self.wake_terminal = False
+        self.override_limit = 5
 
     def _put(self, record: OutboundActionRecord) -> OutboundActionRecord:
         self.rows[record.action_id] = record
@@ -228,36 +238,41 @@ class LedgerStore:
         )
 
     async def confirm_stale_context(self, action_id, *, wakeup_event_id, decision, actor, revision=None):
+        """Migration 192's answer, through 251's shared body: the first
+        answer stands, and a yes after the wake ended sends as an
+        agent_override (no question asked again)."""
         self.calls.append(("confirm_stale", action_id, decision))
         parent = self.rows[action_id]
         if parent.wakeup_event_id != wakeup_event_id:
-            raise PermissionError("stale context confirmation must come from the blocked action's own wake")
+            raise SqlError(f"an answer must come from the action's own wake {parent.wakeup_event_id}", "42501")
         if parent.state is not ActionState.STALE or not parent.detail_code.startswith("stale_context"):
-            raise ValueError("action is not awaiting a stale context confirmation")
+            raise SqlError("action is not awaiting a stale context confirmation", "22023")
         payload_hash = revision.payload_hash if revision is not None else parent.payload_hash
         if parent.stale_context_decision is not None:
             if parent.stale_context_decision != decision:
-                raise ValueError(f"stale context already answered {parent.stale_context_decision}")
+                raise SqlError(f"action {action_id} was already answered {parent.stale_context_decision}", "55000")
             if decision == "no":
                 return parent
             successor = self.successor_of(parent.action_id)
             assert successor is not None
             if successor.payload_hash != payload_hash:
-                raise ValueError("stale context already answered with a different revision")
+                raise SqlError(f"action {action_id} was already answered with a different revision", "55000")
             return successor
         if decision == "no":
-            return self._put(replace(parent, stale_context_decision="no", detail_code="stale_context_declined"))
-        if self.wake_terminal:
-            raise ValueError("wake is terminal")
+            return self._put(
+                replace(parent, stale_context_decision="no", override_decision="no", detail_code="stale_context_declined")
+            )
+        kind = "agent_override" if self.wake_terminal and decision == "yes" else None
         ordinal = 1 + sum(1 for row in self.rows.values() if row.wakeup_event_id == parent.wakeup_event_id and row.retry_of_action_id)
         successor_id = action_id_for(parent.wakeup_event_id, parent.action_role.value, ordinal)
+        kind = kind or ("stale_context_confirmed" if decision == "yes" else "stale_context_revised")
         successor = replace(
             parent,
             action_id=successor_id,
             state=ActionState.RECEIVED,
-            detail_code="stale_context_confirmed" if decision == "yes" else "stale_context_revised",
+            detail_code=kind,
             retry_of_action_id=parent.action_id,
-            remediation_reason="stale_context_confirmed" if decision == "yes" else "stale_context_revised",
+            remediation_reason=kind,
             stale_context_shown_refs=(),
             stale_context_decision=None,
             arguments=dict(revision.arguments) if revision is not None else dict(parent.arguments),
@@ -267,6 +282,7 @@ class LedgerStore:
             replace(
                 parent,
                 stale_context_decision=decision,
+                override_decision=decision,
                 detail_code="stale_context_confirmed" if decision == "yes" else "stale_context_revised",
             )
         )
@@ -319,6 +335,73 @@ class LedgerStore:
 
     async def get(self, action_id):
         return self.rows.get(action_id)
+
+    async def successor(self, action_id):
+        return self.successor_of(action_id)
+
+    async def reject(self, action_id, expected_state, detail_code, error_detail):
+        """Only a row still in expected_state with nothing started on
+        (received, dependency_wait) moves; any other comes back unchanged."""
+        self.calls.append(("reject", action_id, detail_code))
+        current = self.rows[action_id]
+        if current.state is not expected_state or current.state not in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
+            return current
+        return self._put(replace(current, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail))
+
+    async def override(self, action_id, *, wakeup_event_id, actor, reason, decision):
+        """The agent's answer to a refusal: no stamps the row, yes mints one
+        successor (an open stale_context question is answered yes)."""
+        self.calls.append(("override", action_id, decision, reason))
+        parent = self.rows[action_id]
+        if parent.wakeup_event_id != wakeup_event_id:
+            raise SqlError(f"an override must come from the action's own wake {parent.wakeup_event_id}", "42501")
+        if parent.override_decision is not None:
+            if parent.override_decision != decision:
+                raise SqlError(f"action {action_id} was already answered {parent.override_decision}; the first answer stands", "55000")
+            return parent if decision == "no" else self.successor_of(action_id)
+        if parent.state is ActionState.COMPLETED and parent.detail_code in {"provider_receipt_verified", "operator_positive_evidence"}:
+            raise SqlError(f"action {action_id} was already sent; to say more, send a new message (op execute)", "55000")
+        if decision == "no":
+            return self._put(replace(parent, override_decision="no"))
+        answered = [
+            row
+            for row in self.rows.values()
+            if row.wakeup_event_id == parent.wakeup_event_id
+            and row.action_role is parent.action_role
+            and row.remediation_reason in {"agent_override", "stale_context_confirmed", "stale_context_revised"}
+        ]
+        if len(answered) >= self.override_limit:
+            raise SqlError(
+                f"override limit reached: wake {parent.wakeup_event_id} already re-sent {parent.action_role.value} "
+                f"{len(answered)} times; record needs_human with the message you meant to send",
+                "55000",
+            )
+        ordinal = 1 + sum(1 for row in self.rows.values() if row.wakeup_event_id == parent.wakeup_event_id and row.retry_of_action_id)
+        open_question = parent.state is ActionState.STALE and parent.detail_code == "stale_context" and parent.stale_context_decision is None
+        self._put(
+            replace(
+                parent,
+                override_decision="yes",
+                **({"stale_context_decision": "yes", "detail_code": "stale_context_confirmed"} if open_question else {}),
+            )
+        )
+        return self._put(
+            replace(
+                parent,
+                action_id=action_id_for(parent.wakeup_event_id, parent.action_role.value, ordinal),
+                state=ActionState.RECEIVED,
+                detail_code="received",
+                completion_kind=None,
+                provider_request_ref=None,
+                action_uid=None,
+                error_detail=None,
+                retry_of_action_id=parent.action_id,
+                remediation_reason="agent_override",
+                override_decision=None,
+                stale_context_shown_refs=(),
+                stale_context_decision=None,
+            )
+        )
 
 
 class LedgerProbe:
@@ -702,7 +785,9 @@ async def test_confirm_is_refused_for_another_wake_and_for_a_non_stale_action():
     sent = await service.execute(execute_request())
     assert sent.status is PublicStatus.SENT
 
-    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+    # A confirm on an action with no question is an override, and a sent
+    # message has nothing to override: send a new one instead.
+    with pytest.raises(ValueError, match="was already sent; send a new message instead"):
         await service.confirm(confirm(BLOCKED, "yes"))
 
     service, store, _probe, adapter = harness(CRON_ALERT)
@@ -836,8 +921,8 @@ async def test_worker_resume_over_newer_context_is_a_deliberate_no_send_never_a_
     assert adapter.sent == []
     logged = [record.getMessage() for record in caplog.records]
     assert any("nobody to ask (worker)" in line and "message:750824" in line for line in logged), logged
-    # And it is not a question: confirm refuses it.
-    with pytest.raises(ValueError, match="not awaiting a stale_context confirmation"):
+    # And it is not a question: confirm is the override, which needs a reason.
+    with pytest.raises(ValueError, match='needs a reason -- say in "reason" why you still want to send it'):
         await service.confirm(confirm(BLOCKED, "yes"))
 
 
@@ -1166,22 +1251,25 @@ async def test_the_same_message_again_after_context_drift_asks_again_and_is_not_
 
 
 @pytest.mark.asyncio
-async def test_a_question_that_cannot_be_recorded_sends_nothing_and_raises():
+async def test_a_question_that_cannot_be_recorded_sends_nothing_and_ends_rejected_in_its_words():
     """No stale situation ends definitive_failed: if the question itself
-    cannot be written (a concurrent writer, a missing migration), nothing is
-    sent, the row is left as it was, and the MCP error means "nothing was
-    sent" -- the same execute asks again."""
+    cannot be written (a missing migration; a passing error is tried once
+    more first), nothing is sent and the row is ended rejected -- never left
+    `received` -- saying newer messages arrived. The agent may still
+    override it, knowing that."""
     service, store, _probe, adapter = harness(CRON_ALERT)
 
     async def unrecordable(*_args, **_kwargs):
         raise RuntimeError("function block_outbound_stale_context does not exist")
 
     store.block_stale_context = unrecordable
-    with pytest.raises(RuntimeError, match=r"could not be recorded .* nothing was sent"):
-        await service.execute(execute_request())
+    result = await service.execute(execute_request())
 
+    assert (result.status, result.detail_code) == (PublicStatus.REJECTED, "gateway_error")
+    assert result.detail.startswith("Not sent: RuntimeError: stale_context: newer messages reached this recipient")
+    assert result.override is not None
     assert adapter.sent == []
-    assert store.rows[BLOCKED].state is ActionState.RECEIVED
+    assert store.rows[BLOCKED].state is ActionState.REJECTED
     assert not [call for call in store.calls if call[0] == "definitive_fail"]
 
 

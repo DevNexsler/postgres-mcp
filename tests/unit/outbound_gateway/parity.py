@@ -60,6 +60,9 @@ STORE_METHODS = (
     "remediate_traffic_block",
     "block_stale_context",
     "confirm_stale_context",
+    "reject",
+    "override",
+    "successor",
     "get",
     "schedule_next_attempt",
 )
@@ -398,6 +401,63 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # to retry_ready, where a re-execute dispatches it).
     if "gateway_internal_error" in new and "gateway_internal_error" not in old:
         return "pre_send_error_is_reported_not_sent"
+    # The same error on a row nothing had started on (received,
+    # dependency_wait) now ends it rejected, with the error's words and the
+    # override that still sends it: a `received` row is one nothing picks up
+    # again.
+    # exhaust() on a row still `received` -- Restate could not prepare it
+    # within the retry ceiling -- ends it rejected (nothing was sent); the
+    # legacy left it `received`, where nothing picks it up again.
+    if _call(current, "store.reject") and "prepare_retry_exhausted" in new:
+        return "exhaust_ends_an_unprepared_row_rejected"
+    rejected_codes = {"gateway_error", "gateway_refused", "gateway_transient_error"}
+    if (_call(current, "store.reject") or (current_result or {}).get("detail_code") in rejected_codes) and "gateway_error" not in old:
+        return "pre_send_error_ends_the_action_rejected"
+    # op confirm on an action holding no stale_context question is now the
+    # agent's answer to a refusal (yes sends what was not sent, with a
+    # reason; no is recorded on it), refused with its own words where there
+    # is nothing to answer. The legacy refused every such confirm ("not
+    # awaiting", or "confirmation is not enabled" when the question was
+    # switched off).
+    if (
+        legacy is not None
+        and legacy[:2] == ("service_raise", "confirm")
+        and ("is not awaiting a stale_context confirmation" in old or "<confirmation disabled refusal>" in old)
+        and current is not None
+        and (current[1] == "confirm" or _call(current, "store.override") or _call(current, "store.reject"))
+    ):
+        return "confirm_without_a_question_is_the_override"
+    # A write of the agent's answer that fails for a reason that is not a
+    # refusal (a lost connection, a fault) is raised as what it is -- the
+    # tool answers it failed / gateway_error, "the same call again" -- not
+    # dressed as a refusal of the answer the agent must not retry.
+    if (
+        legacy is not None
+        and current is not None
+        and legacy[:2] == current[:2] == ("service_raise", "confirm")
+        and "confirm refused for action" in old
+        and "confirm refused" not in new
+    ):
+        return "a_failed_answer_write_is_not_a_refusal"
+    # A yes that comes after the wake ended sends as an agent_override
+    # (Comm-Data-Store 251's one answer body: the ledger's wake_terminal),
+    # which is not asked the stale question again; the legacy asked it of
+    # the successor. A yes during the wake is asked again on both sides.
+    answered = next((event for event in reversed(prefix) if event[0] == "service"), None)
+    if (
+        _call(legacy, "store.block_stale_context")
+        and _call(current, "store.prepare")
+        and answered is not None
+        and answered[1] == "confirm"
+        and "('decision', 'yes')" in repr(answered)
+    ):
+        return "late_yes_is_an_override_not_asked_again"
+    # An action the agent already answered yes or revise (an override, or a
+    # stale_context answer) reports the successor carrying its send --
+    # status, and the identical request again -- looked up by its parent.
+    # The legacy re-answered the question, or reported the parent "not sent".
+    if _call(current, "store.successor"):
+        return "answered_action_reports_its_successor"
     # FIX 3: a TenantCloud auth rejection proven pre-dispatch
     # (tenantcloud_auth_rejected_before_dispatch / category=provider_authentication)
     # now waits out the outage -- schedule_next_attempt with no claim() --
@@ -503,12 +563,28 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     return None
 
 
+def _legacy_refusal_type(value: Any) -> Any:
+    """A refused stale_context answer is raised as RequestRefusedError, with
+    the legacy's exact words: the type server.handle_outbound_action answers
+    as a rejected result instead of an MCP tool error (#3463). The legacy
+    raised a plain ValueError. Read it as the legacy's type, so every event
+    after it is still compared."""
+    if isinstance(value, list | tuple):
+        if len(value) == 3 and value[0] == "raised" and value[1] == "RequestRefusedError":
+            return ("raised", "ValueError", value[2])
+        return type(value)(_legacy_refusal_type(item) for item in value)
+    return value
+
+
 def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
     """(name, where): IDENTICAL, SAME_OUTCOME, WORDING, a declared difference,
     or raises AssertionError naming the first unexplained divergence."""
     if legacy.events == current.events:
         return IDENTICAL, ""
-    plain_old, plain_new = observable(legacy.events), observable(current.events)
+    current_events = _legacy_refusal_type(current.events)
+    if legacy.events == current_events:
+        return "refusal_is_a_request_refused_error", ""
+    plain_old, plain_new = observable(legacy.events), observable(current_events)
     if plain_old == plain_new:
         return SAME_OUTCOME, ""
     old, new = _mask_wording(tuple(plain_old)), _mask_wording(tuple(plain_new))
@@ -519,8 +595,8 @@ def compare(legacy: Trace, current: Trace) -> tuple[str, str]:
         # The legacy stopped (a replayed test's assertion on the words failed)
         # after an identical course that differed only in wording.
         return WORDING, ""
-    logs = " | ".join(str(event[1][3]) for event in current.events if event[1][0] == "log")
-    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current.events)
+    logs = " | ".join(str(event[1][3]) for event in current_events if event[1][0] == "log")
+    queried = any(event[1][0] == "call" and event[1][1] == "probe.newer_context" for event in current_events)
     name = _declared(old[index:], new[index:], prefix=old[:index], current_logs=logs, current_queried=queried)
     before = old[index] if index < len(old) else None
     after = new[index] if index < len(new) else None

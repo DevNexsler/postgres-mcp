@@ -37,6 +37,7 @@ from urllib.request import Request
 from urllib.request import build_opener
 from uuid import UUID
 
+from .errors import GATEWAY_INTERNAL_ERROR
 from .idempotency_policy import reinvoke_safety
 from .models import ActionState
 from .models import Operation
@@ -47,6 +48,7 @@ from .retry_policy import RETRY_CEILING_SECONDS
 from .retry_policy import NoopStaffWarningPort
 from .retry_policy import StaffWarningPort
 from .retry_policy import ceiling_exceeded
+from .retry_policy import elapsed_step_backoff_seconds
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
@@ -259,48 +261,48 @@ class OutboundDeliveryCoordinator:
                 max(1, auth.retry_after_seconds or default_delay),
             )
 
+        # retry_policy.py owns every retry/backoff/ceiling decision for every
+        # action this coordinator advances (by construction, only operations
+        # in ``self._operations`` -- Restate-routed ones). attempt_count is
+        # never read here: the legacy worker's 5/12 attempt caps
+        # (``self._max_attempts`` / ``self._max_ambiguous_attempts``, kept
+        # only for the non-Restate path in worker.py/service.py) do not apply
+        # once an operation is on Restate -- a send that answers slowly a
+        # handful of times must not get a smaller effective budget than one
+        # that answers instantly every time (see retry_policy.py's module
+        # docstring). The one ceiling is elapsed wall-clock time since the
+        # action's own created_at, bounded at
+        # ``self._context_wait_ceiling_seconds`` (RETRY_CEILING_SECONDS, one
+        # hour, by default). None (a hand-built record, or a store that
+        # predates created_at) is treated as "just created" -- same
+        # convention as service.py's TenantCloud auth-wait ceiling anchor.
+        action_created_at = getattr(action, "created_at", None)
+        elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
+        exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
         if action.state is ActionState.RECEIVED:
-            result = await self._service.prepare(action_id)
-            if (
-                result.status is PublicStatus.PENDING
-                and getattr(result, "detail", None) in _CONTEXT_WAIT_DETAILS
-            ):
-                return DeliveryResult(
-                    DeliveryPhase.WAIT,
-                    result.detail,
-                    300,
-                )
+            # A received row past the ceiling was never prepared: exhaust()
+            # ends it rejected (nothing was sent) instead of preparing again.
+            result = await self._service.exhaust(action_id) if exhausted else await self._service.prepare(action_id)
+            if result.status is PublicStatus.PENDING and result.detail_code in _CONTEXT_WAIT_DETAILS:
+                return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, CONTEXT_RELOAD_WAIT_SECONDS)
+        elif action.state in _AMBIGUOUS_STATES:
+            result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
+        elif exhausted:
+            result = await self._service.exhaust(action_id)
         else:
-            # retry_policy.py owns every retry/backoff/ceiling decision for
-            # every action this coordinator advances (by construction, only
-            # operations in ``self._operations`` -- Restate-routed ones).
-            # attempt_count is never read here: the legacy worker's 5/12
-            # attempt caps (``self._max_attempts`` / ``self._max_ambiguous_attempts``,
-            # kept only for the non-Restate path in worker.py/service.py) do
-            # not apply once an operation is on Restate -- a send that answers
-            # slowly a handful of times must not get a smaller effective
-            # budget than one that answers instantly every time (see
-            # retry_policy.py's module docstring). The one ceiling is
-            # elapsed wall-clock time since the action's own created_at,
-            # bounded at ``self._context_wait_ceiling_seconds``
-            # (RETRY_CEILING_SECONDS, one hour, by default).
-            action_created_at = getattr(action, "created_at", None)
-            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
-            exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
-            if action.state in _AMBIGUOUS_STATES:
-                result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
-            elif exhausted:
-                result = await self._service.exhaust(action_id)
-            else:
-                result = await self._service.resume(action_id)
+            result = await self._service.resume(action_id)
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
+        if result.status is PublicStatus.FAILED and result.detail_code == GATEWAY_INTERNAL_ERROR:
+            # A step failed before any send and left the row as it was
+            # (service._settled ends a row in the background only for a
+            # refusal): a passing database error, most often. Ending the
+            # workflow here would leave that row with nobody to advance it
+            # -- every resubmission answers 409 for the retention window.
+            # Wait and try again under the same elapsed ceiling, which ends
+            # it (definitive_failed, or rejected if it was never prepared).
+            return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, elapsed_step_backoff_seconds(elapsed))
         if result.status is PublicStatus.MANUAL_REVIEW:
-            # None (a hand-built record, or a store that predates
-            # created_at) is treated as "just created" -- same convention
-            # as service.py's TenantCloud auth-wait ceiling anchor.
-            action_created_at = getattr(action, "created_at", None)
-            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
             wait_detail = result.detail_code if result.detail_code in _CONTEXT_WAIT_DETAILS else getattr(result, "detail", None)
             if wait_detail in _CONTEXT_WAIT_DETAILS and should_wait_for_context_reload(
                 wait_detail,
