@@ -232,7 +232,7 @@ class Loader:
     def __init__(self, context, *, derivable: bool) -> None:
         self._context, self._derivable = context, derivable
 
-    async def load(self, request):
+    async def load(self, request, *, recorded_account=""):
         if not self._derivable:
             raise ContextDerivationError("the wake's source message is gone")
         return self._context

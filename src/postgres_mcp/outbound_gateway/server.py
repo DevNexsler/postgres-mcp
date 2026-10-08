@@ -53,6 +53,7 @@ from .models import PublicStatus
 from .models import RequestRefusedError
 from .models import StatusRequest
 from .models import SuggestRequest
+from .models import normalize_target_phone
 from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
@@ -455,6 +456,21 @@ def _json_mapping(name: str, default: dict[str, str]) -> dict[str, str]:
     return value
 
 
+def _quo_sending_lines() -> dict[str, str]:
+    """OUTBOUND_QUO_SENDING_LINES_JSON: the only lines quo.sms.send can
+    text from (its from_phone), E.164 number -> Quo phone_number_id. Keys
+    are normalized the way from_phone is, so the lookup matches what the
+    agent sent."""
+    lines = _json_mapping("OUTBOUND_QUO_SENDING_LINES_JSON", {})
+    try:
+        normalized = {normalize_target_phone(phone, field="phone"): line.strip() for phone, line in lines.items()}
+    except ValueError as exc:
+        raise ValueError("OUTBOUND_QUO_SENDING_LINES_JSON keys must be E.164 phone numbers") from exc
+    if not all(normalized.values()):
+        raise ValueError("OUTBOUND_QUO_SENDING_LINES_JSON values must be Quo phone_number_ids")
+    return normalized
+
+
 def _enabled_operations() -> frozenset[Operation]:
     raw = os.environ.get("OUTBOUND_ENABLED_OPERATIONS_JSON")
     if raw is None:
@@ -730,12 +746,8 @@ async def build_runtime() -> GatewayRuntime:
             # application notifications) replies from that same mailbox.
             {"zillow": "nigel-zoho", "hotpads": "nigel-zoho", "tenantcloud": "nigel-zoho", "zoho_mail": "nigel-zoho"},
         ),
-        quo_line_by_provider=_json_mapping(
-            "OUTBOUND_QUO_LINES_JSON",
-            {provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "") for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")},
-        ),
         email_default_account=os.environ.get("OUTBOUND_EMAIL_DEFAULT_ACCOUNT", "nigel-zoho"),
-        quo_default_line=os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", ""),
+        quo_sending_lines=_quo_sending_lines(),
         calendar_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_NAME", "nigel")},
         calendar_account_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_ACCOUNT", "nigel-zoho")},
         cliq_target_by_intent=_json_mapping(

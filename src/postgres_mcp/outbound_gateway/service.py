@@ -1014,7 +1014,7 @@ class OutboundActionService:
         record on the attempt (recovery.py) or show the agent (`detail`).
         None on any success."""
         try:
-            live = await self._context_loader.load(action.execute_request())
+            live = await self._context_loader.load(action.execute_request(), recorded_account=action.provider_account)
         except ContextDerivationError as error:
             reason = _bounded_reload_reason(error)
             logger.warning(

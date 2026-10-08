@@ -872,3 +872,89 @@ def test_override_request_is_the_confirm_contract_without_a_reason_to_echo():
     assert (parsed.op, parsed.decision.value, parsed.reason) == ("confirm", "yes", REASON)
     assert parse_outbound_request({**hint, "reason": "  "}).reason is None
     assert parse_outbound_request({**hint, "reason": "<why you still want to send>"}).reason is None
+
+
+# ----------------------------------------------------------------------------
+# quo.sms.send names its line (from_phone): no default line, no override
+# ----------------------------------------------------------------------------
+
+# Wake 27269's shape: a TenantCloud notification email, no Quo line of its own.
+QUO_WAKE = context_tests.record(
+    wakeup_event_id=WAKE, message_source="zoho_mail", channel_type="email_thread", participant_key="noreply@tenantcloud.com",
+    raw_payload={}, envelope={"identity": {}, "message": {"prospect_name": "Dan", "property": "gateway test"}},
+)
+
+
+def quo_harness():
+    service, store, adapter = harness()
+    service._context_loader = ActionContextLoader(context_tests.FakeRepository(QUO_WAKE), context_tests.policy())
+    return service, store, adapter
+
+
+def quo_execute(**arguments) -> dict[str, Any]:
+    return {
+        "op": "execute", "wakeup_event_id": WAKE, "action_role": "prospect_reply", "operation": "quo.sms.send",
+        "intent_kind": "inquiry_reply", "arguments": {"to_phone": "+12015756789", "text": "Notice to Quit attached.", **arguments},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "why"),
+    [
+        ({}, "from_phone is missing. Nothing was sent: quo.sms.send must name the line to send from."),
+        ({"from_phone": "+17623726083"}, "from_phone +17623726083 is not a line the gateway can send from. Nothing was sent."),
+    ],
+    ids=["missing", "listing"],
+)
+async def test_a_text_without_a_line_it_can_send_from_is_a_refused_result_with_its_options(arguments, why):
+    """dpark 2026-10-07: "If it doesnt do it. just give error message and its
+    options." An ordinary result, never an MCP tool error, recorded nowhere
+    and with no override: an override cannot invent a line."""
+    service, store, adapter = quo_harness()
+    mcp = create_server(service, POLICY, tenantcloud_submitter=AsyncMock(), restate_operations=ROUTED)
+    async with create_connected_server_and_client_session(mcp) as client:
+        result = await client.call_tool("outbound_action", {"request": quo_execute(**arguments)})
+
+    assert result.isError is False
+    body = result.structuredContent or {}
+    assert (body["status"], body["detail_code"]) == ("rejected", "request_refused")
+    assert body["detail"] == (
+        f"{why} Lines it can send from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
+    )
+    assert_no_override(body)
+    assert store.rows == {} and adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_text_naming_its_line_sends_from_that_line():
+    service, store, adapter = quo_harness()
+
+    result = await call(service, quo_execute(from_phone=" +17579972130 "), routed=frozenset())
+
+    assert result["status"] == "sent"
+    assert adapter._current.provider_account == "PNkmv4nD54"
+    assert adapter._current.arguments["from_phone"] == "+17579972130"
+
+
+@pytest.mark.asyncio
+async def test_an_override_of_a_text_recorded_before_from_phone_sends_from_its_recorded_line():
+    """A row recorded before from_phone existed stores only {to_phone, text}.
+    Its successor (prepared here, sent by Restate's resume) keeps the line it
+    was recorded with -- never refused for the missing from_phone, offered
+    the override again, and refused again."""
+    service, store, adapter = quo_harness()
+    old = parse_outbound_request(quo_execute())
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    store._put(replace(recorded, state=ActionState.REJECTED, detail_code="gateway_refused", error_detail="ambiguous aliases"))
+    assert "from_phone" not in recorded.arguments
+
+    result = await call(service, confirm(recorded.action_id))
+
+    assert result["status"] == "pending"
+    successor = store.successor_of(recorded.action_id)
+    assert (successor.state, successor.provider_account) == (ActionState.PREPARED, "PN8ujudrpa")
+    sent = await service.resume(successor.action_id)
+    assert sent.status is PublicStatus.SENT
+    assert adapter._current.provider_account == "PN8ujudrpa"
+    assert "from_phone" not in adapter._current.arguments

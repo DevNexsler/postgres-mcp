@@ -25,6 +25,7 @@ from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import TENANTCLOUD_ORIGIN
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
+from postgres_mcp.outbound_gateway.server import _quo_sending_lines
 from postgres_mcp.outbound_gateway.server import _reject_tenantcloud_origin_overrides
 from postgres_mcp.outbound_gateway.server import _tenantcloud_adapters
 from postgres_mcp.outbound_gateway.server import _tenantcloud_enabled
@@ -52,6 +53,34 @@ def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
     assert _bearer_headers("QUO_MCP_TOKEN") == {}
     monkeypatch.setenv("QUO_MCP_TOKEN", "provider-secret")
     assert _bearer_headers("QUO_MCP_TOKEN") == {"Authorization": "Bearer provider-secret"}
+
+
+def test_quo_sending_lines_are_config_keyed_on_the_number_from_phone_names(monkeypatch):
+    """OUTBOUND_QUO_SENDING_LINES_JSON is the only source of a sending line;
+    unset, there are none (CDS's compose sets PFG-General, Collections and
+    Maintenance)."""
+    monkeypatch.delenv("OUTBOUND_QUO_SENDING_LINES_JSON", raising=False)
+    assert _quo_sending_lines() == {}
+    monkeypatch.setenv(
+        "OUTBOUND_QUO_SENDING_LINES_JSON",
+        '{" +16107095575 ": "PN8ujudrpa", "+17579972130": " PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}',
+    )
+    assert _quo_sending_lines() == {"+16107095575": "PN8ujudrpa", "+17579972130": "PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "words"),
+    [
+        ("{not json", "Expecting property name"),
+        ('["+16107095575"]', "must be a JSON string-to-string object"),
+        ('{"6107095575": "PN8ujudrpa"}', "keys must be E.164 phone numbers"),
+        ('{"+16107095575": "  "}', "values must be Quo phone_number_ids"),
+    ],
+)
+def test_malformed_quo_sending_lines_stop_the_gateway_at_start(monkeypatch, raw, words):
+    monkeypatch.setenv("OUTBOUND_QUO_SENDING_LINES_JSON", raw)
+    with pytest.raises(ValueError, match=words):
+        _quo_sending_lines()
 
 
 def public(status=PublicStatus.SENT, detail="provider_receipt_verified"):

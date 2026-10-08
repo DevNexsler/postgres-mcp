@@ -580,7 +580,9 @@ class StaleContextQuestions:
     ) -> OutboundActionRecord:
         revision = None
         if decision is StaleContextDecision.REVISE:
-            revision = await self._context_loader.load(revised_request(parent, arguments or {}))
+            revision = await self._context_loader.load(
+                revised_request(parent, arguments or {}), recorded_account=parent.provider_account
+            )
         try:
             return await self._store.confirm_stale_context(
                 parent.action_id,

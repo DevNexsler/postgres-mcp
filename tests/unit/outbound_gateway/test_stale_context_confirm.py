@@ -107,7 +107,7 @@ class FakeLoader:
             {"identity_version": "v1", "prospect_id": SUBJECT, "conversation_watermark": 750823}
         )
 
-    async def load(self, request: ExecuteRequest) -> ActionContext:
+    async def load(self, request: ExecuteRequest, *, recorded_account: str = "") -> ActionContext:
         arguments = request.arguments.model_dump(mode="json", exclude_none=True)
         action_id = action_id_for(request.wakeup_event_id, request.action_role.value, 0)
         payload_hash = canonical_payload_hash(
