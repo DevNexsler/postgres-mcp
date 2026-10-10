@@ -50,12 +50,14 @@ async def test_poll_names_account_mismatch_and_preserves_non_acceptance(include_
 
 
 def test_status_from_persisted_code_explains_correction_without_raw_provider_text():
-    result = action_result(row(
-        ActionState.DEFINITIVE_FAILED,
-        operation=Operation.CLIQ_CHANNEL_POST,
-        detail_code="cliq_chat_account_mismatch",
-        error_detail="cliq_chat_account_mismatch",
-    ))
+    result = action_result(
+        row(
+            ActionState.DEFINITIVE_FAILED,
+            operation=Operation.CLIQ_CHANNEL_POST,
+            detail_code="cliq_chat_account_mismatch",
+            error_detail="cliq_chat_account_mismatch",
+        )
+    )
     assert "provider was not called" in result.detail
     assert "Do not retry" in result.detail
     assert "unique name" in result.detail
@@ -64,20 +66,29 @@ def test_status_from_persisted_code_explains_correction_without_raw_provider_tex
 
 
 def test_unrelated_permanent_failure_keeps_existing_classification():
-    result = CliqAdapter._parse(McpCallResult(structured_content={
-        "status": "failed", "category": "permanent_upstream_error",
-        "message": "Cliq rejected the message: chat is archived",
-    }))
+    result = CliqAdapter._parse(
+        McpCallResult(
+            structured_content={
+                "status": "failed",
+                "category": "permanent_upstream_error",
+                "message": "Cliq rejected the message: chat is archived",
+            }
+        )
+    )
     assert result.detail_code == "provider_permanent_upstream_error"
     assert result.category == "permanent_upstream_error"
 
 
 @pytest.mark.asyncio
 async def test_execute_and_later_status_keep_recovery_guidance():
-    failed = McpCallResult(structured_content={
-        "status": "failed", "category": "permanent_upstream_error",
-        "message": REFUSAL, "request_id": "job-28166",
-    })
+    failed = McpCallResult(
+        structured_content={
+            "status": "failed",
+            "category": "permanent_upstream_error",
+            "message": REFUSAL,
+            "request_id": "job-28166",
+        }
+    )
     chat_id = "CT_1424657680898345423_721156495"
     ctx = context(Operation.CLIQ_CHANNEL_POST, target=DerivedTarget("cliq_chat", chat_id, True))
     store = FakeStore(row(operation=ctx.operation, action_role=ctx.action_role))
@@ -87,15 +98,28 @@ async def test_execute_and_later_status_keep_recovery_guidance():
     proof.load.return_value = evidence()
     client = FakeClient(McpCallResult(structured_content={"status": "pending", "request_id": "job-28166"}), failed)
     gateway = OutboundActionService(
-        store=store, context_loader=loader, evidence_loader=proof,
-        adapters={ctx.operation: CliqAdapter(ctx.operation)}, provider_client=client,
-        clock=lambda: NOW, lease_owner="gateway-test", sleep=AsyncMock(), traffic_mode="off",
+        store=store,
+        context_loader=loader,
+        evidence_loader=proof,
+        adapters={ctx.operation: CliqAdapter(ctx.operation)},
+        provider_client=client,
+        clock=lambda: NOW,
+        lease_owner="gateway-test",
+        sleep=AsyncMock(),
+        traffic_mode="off",
     )
-    first = await gateway.execute(parse_outbound_request({
-        "op": "execute", "wakeup_event_id": 7, "action_role": "internal_notification",
-        "operation": "cliq.channel.post", "intent_kind": "lead_alert",
-        "arguments": {"channel_or_chat_id": chat_id, "text": "Internal status"},
-    }))
+    first = await gateway.execute(
+        parse_outbound_request(
+            {
+                "op": "execute",
+                "wakeup_event_id": 7,
+                "action_role": "internal_notification",
+                "operation": "cliq.channel.post",
+                "intent_kind": "lead_alert",
+                "arguments": {"channel_or_chat_id": chat_id, "text": "Internal status"},
+            }
+        )
+    )
     # FakeStore mirrors SQL: persists detail_code, not raw provider text.
     later = await gateway.status(store.current.action_id)
     assert first.detail_code == later.detail_code == "cliq_chat_account_mismatch"
