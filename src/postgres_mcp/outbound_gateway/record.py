@@ -14,6 +14,8 @@ from uuid import UUID
 
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
+from .cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH
+from .cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH_DETAIL
 from .context import ActionContext
 from .models import STALE_CONTEXT_DETAIL
 from .models import STALE_CONTEXT_DETAILS
@@ -343,6 +345,8 @@ def _row_detail(action: OutboundActionRecord, *, repeated: bool) -> str | None:
             return UNASKED_DETAIL
         return f"Not sent: {not_sent_reason(action)}."
     if state in {ActionState.REJECTED, ActionState.DEFINITIVE_FAILED} or (state in _PARKED_STATES and _not_sent(action)):
+        if action.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST} and action.detail_code == CLIQ_CHAT_ACCOUNT_MISMATCH:
+            return CLIQ_CHAT_ACCOUNT_MISMATCH_DETAIL
         maybe = "" if _not_sent(action) else " It may already have reached the recipient: read the thread first."
         return f"Not sent: {not_sent_reason(action)}.{maybe}"
     return None
@@ -410,7 +414,9 @@ def action_result(
         why += "."
     return result.model_copy(
         update={
-            "detail": " ".join(part for part in (why, OVERRIDE_RULE) if part),
+            "detail": " ".join(
+                part for part in (why, NEVER_ANOTHER_ROUTE if action.detail_code == CLIQ_CHAT_ACCOUNT_MISMATCH else OVERRIDE_RULE) if part
+            ),
             "override": OverrideRequest(wakeup_event_id=action.wakeup_event_id, action_id=action.action_id),
         }
     )

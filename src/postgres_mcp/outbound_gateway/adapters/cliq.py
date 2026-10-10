@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import UUID
 
+from ..cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH
+from ..cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH_DETAIL
 from ..cliq_target import CliqTargetKind
 from ..cliq_target import cliq_tool_for_kind
 from ..context import ActionContext
@@ -102,8 +105,23 @@ class CliqAdapter:
     def _parse(result: McpCallResult, *, prior_ref: str | None = None, effect_call: bool = False) -> ProviderObservation:
         common = initial_observation(result, effect_call=effect_call)
         if common is not None:
+            message = (common.evidence or {}).get("provider_message")
+            # AES's local participation guard proves no Zoho call occurred.
+            # Other permanent failures retain their provider classification.
+            if (
+                common.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
+                and isinstance(message, str)
+                and "A conversation id from another account is not a post target." in message
+                and "The provider was not called." in message
+            ):
+                common = replace(
+                    common,
+                    detail_code=CLIQ_CHAT_ACCOUNT_MISMATCH,
+                    category="provider_validation",
+                    evidence={**(common.evidence or {}), "provider_message": f"{message} {CLIQ_CHAT_ACCOUNT_MISMATCH_DETAIL}"},
+                )
             if prior_ref and common.provider_request_ref is None:
-                return ProviderObservation(common.disposition, common.detail_code, provider_request_ref=prior_ref)
+                return replace(common, provider_request_ref=prior_ref)
             return common
         payload = terminal_content(result.structured_content)
         ref = request_ref(result.structured_content) or prior_ref
