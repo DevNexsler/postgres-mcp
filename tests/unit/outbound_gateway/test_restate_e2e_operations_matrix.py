@@ -148,6 +148,9 @@ async def drive(coordinator: OutboundDeliveryCoordinator, action_id: UUID, clock
     for _ in range(max_steps):
         result = await coordinator.advance(action_id)
         if result.phase in (DeliveryPhase.COMPLETE, DeliveryPhase.TERMINAL):
+            if result.staff_warning:
+                clock.advance(coordinator.staff_warning_grace_seconds)
+                await coordinator.warn_unless_recovered(action_id, result.detail_code)
             return result
         clock.advance(result.retry_after_seconds)
     raise AssertionError("workflow did not terminate within max_steps")

@@ -45,6 +45,9 @@ from .models import parse_outbound_request
 logger = logging.getLogger(__name__)
 
 DEFAULT_STAFF_WARNING_CHANNEL = "tenantleads"
+# store.later_sent_sibling() reads this prefix to keep a warning from counting
+# as the agent's own recovery send.
+STAFF_WARNING_TEXT_PREFIX = "Outbound delivery failed:"
 _NOT_POSTED = frozenset({PublicStatus.REJECTED, PublicStatus.FAILED, PublicStatus.STALE, PublicStatus.MANUAL_REVIEW})
 
 
@@ -81,7 +84,7 @@ class CliqStaffWarningPort:
             return
         self._warned.add(action_id)
         text = (
-            f"Outbound delivery failed: operation={operation.value} "
+            f"{STAFF_WARNING_TEXT_PREFIX} operation={operation.value} "
             f"recipient={recipient} wakeup_event_id={wakeup_event_id} "
             f"action_id={action_id} reason={reason}"
         )

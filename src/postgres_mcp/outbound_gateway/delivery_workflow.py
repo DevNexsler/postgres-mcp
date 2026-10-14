@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
@@ -51,6 +52,8 @@ from .retry_policy import ceiling_exceeded
 from .retry_policy import elapsed_step_backoff_seconds
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+
+logger = logging.getLogger(__name__)
 
 _RECIPIENT_ARGUMENT_KEYS = (
     "to_address",
@@ -96,17 +99,33 @@ class DeliveryResult:
     phase: DeliveryPhase
     detail_code: str
     retry_after_seconds: int = 0
+    # Set on a TERMINAL failure that owes staff a warning: the workflow waits
+    # STAFF_WARNING_GRACE_SECONDS, then calls warn_unless_recovered().
+    staff_warning: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        outcome: dict[str, object] = {
             "phase": self.phase.value,
             "detail_code": self.detail_code,
             "retry_after_seconds": self.retry_after_seconds,
         }
+        if self.staff_warning:
+            outcome["staff_warning"] = True
+        return outcome
+
+
+# How long a failed action waits before its staff warning. The agent gets the
+# failure in its own tool result and usually fixes it within the same turn
+# (wake 28410, 2026-10-14: a wrong Cliq chat id, resent to the right one 90 s
+# later). A warning posted at the moment of failure reported a problem that
+# was already solved.
+STAFF_WARNING_GRACE_SECONDS = 300
 
 
 class DeliveryStore(Protocol):
     async def get(self, action_id: UUID) -> Any: ...
+
+    async def later_sent_sibling(self, action_id: UUID) -> UUID | None: ...
 
 
 class DeliveryService(Protocol):
@@ -179,6 +198,7 @@ class OutboundDeliveryCoordinator:
         operations: frozenset[Operation] | None = None,
         context_wait_ceiling_seconds: int = RETRY_CEILING_SECONDS,
         staff_warning: StaffWarningPort | None = None,
+        staff_warning_grace_seconds: int = STAFF_WARNING_GRACE_SECONDS,
     ) -> None:
         self._store = store
         self._service = service
@@ -198,6 +218,7 @@ class OutboundDeliveryCoordinator:
         # staff_warning.CliqStaffWarningPort(service). See retry_policy.py's
         # StaffWarningPort docstring for the exactly-one-per-action contract.
         self._staff_warning = staff_warning or NoopStaffWarningPort()
+        self.staff_warning_grace_seconds = max(1, staff_warning_grace_seconds)
         # NOT read by advance() (see its body): retry_policy.py's elapsed-time
         # ceiling (context_wait_ceiling_seconds, above) is the one budget for
         # every operation this coordinator serves, including the ambiguous-
@@ -323,25 +344,45 @@ class OutboundDeliveryCoordinator:
             PublicStatus.STALE,
             PublicStatus.MANUAL_REVIEW,
         }:
-            if result.status is not PublicStatus.STALE:
-                # STALE is a deliberate no-send (freshness preflight), never a
-                # failure -- see PublicStatus's own docstring -- so it never
-                # warns. Everything else here is the workflow giving up for
-                # good: a definitive provider rejection, or retry_policy's
-                # ceiling. Exactly one warning per action (warn_once is keyed
-                # on action_id; see StaffWarningPort's docstring for the
-                # coarser wake-scoped grain the current action-id derivation
-                # actually gives it).
-                await self._staff_warning.warn_once(
-                    action_id,
-                    getattr(action, "action_uid", None),
-                    result.detail_code,
-                    wakeup_event_id=getattr(action, "wakeup_event_id", 0),
-                    operation=action.operation,
-                    recipient=_best_effort_recipient(getattr(action, "arguments", None)),
-                )
-            return DeliveryResult(DeliveryPhase.TERMINAL, result.detail_code)
+            # STALE is a deliberate no-send (freshness preflight), never a
+            # failure -- see PublicStatus's own docstring -- so it never
+            # warns. Everything else here is the workflow giving up for good:
+            # a definitive provider rejection, or retry_policy's ceiling. The
+            # warning itself is not sent here: the workflow waits out the
+            # grace period first (warn_unless_recovered).
+            return DeliveryResult(
+                DeliveryPhase.TERMINAL,
+                result.detail_code,
+                staff_warning=result.status is not PublicStatus.STALE,
+            )
         return await self.status(action_id)
+
+    async def warn_unless_recovered(self, action_id: UUID, reason: str) -> None:
+        """Warn staff about a failed action unless a later send of the same
+        role on the same wake has gone out since. The agent sees every failure
+        in its tool result and resends; staff only need to hear about the
+        failures it did not fix. Exactly one warning per action (warn_once is
+        keyed on action_id)."""
+        action = await self._store.get(action_id)
+        if action is None:
+            return
+        try:
+            recovered_by = await self._store.later_sent_sibling(action_id)
+        except Exception:
+            # Unknown is not recovered: warn.
+            logger.exception("could not check whether action %s was recovered; warning staff", action_id)
+            recovered_by = None
+        if recovered_by is not None:
+            logger.info("action %s failed (%s) but later action %s on the same wake was sent; no staff warning", action_id, reason, recovered_by)
+            return
+        await self._staff_warning.warn_once(
+            action_id,
+            getattr(action, "action_uid", None),
+            reason,
+            wakeup_event_id=getattr(action, "wakeup_event_id", 0),
+            operation=action.operation,
+            recipient=_best_effort_recipient(getattr(action, "arguments", None)),
+        )
 
 
 class SecretAuthGate:
@@ -517,11 +558,24 @@ def build_restate_app(coordinator: OutboundDeliveryCoordinator, *, workflow_name
                 retry,
             )
             if outcome["phase"] in {DeliveryPhase.COMPLETE.value, DeliveryPhase.TERMINAL.value}:
-                return outcome
+                break
             delay = outcome.get("retry_after_seconds")
             if type(delay) is not int or delay < 1:
                 raise restate.TerminalError("invalid delivery retry delay", status_code=500)
             await ctx.sleep(timedelta(seconds=min(delay, 3600)), name=f"wait {step}")
             step += 1
+        if outcome.get("staff_warning"):
+            await ctx.sleep(
+                timedelta(seconds=coordinator.staff_warning_grace_seconds),
+                name="staff warning grace",
+            )
+            reason = str(outcome["detail_code"])
+
+            async def warn_step() -> dict[str, object]:
+                await coordinator.warn_unless_recovered(action_id, reason)
+                return {}
+
+            await ctx.run_typed("staff warning", warn_step, retry)
+        return outcome
 
     return restate.app([workflow])

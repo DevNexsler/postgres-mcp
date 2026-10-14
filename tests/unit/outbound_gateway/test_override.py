@@ -684,6 +684,8 @@ async def test_restate_prepare_of_a_refused_row_terminalizes_it_once():
     assert (second.phase, second.detail_code) == (DeliveryPhase.TERMINAL, "rejected")
     assert store.rows[BLOCKED].state is ActionState.REJECTED
     assert [call for call in store.calls if call[0] == "prepare_refused"] == [("prepare_refused", BLOCKED)]
+    assert (first.staff_warning, second.staff_warning) == (True, False)
+    await coordinator.warn_unless_recovered(BLOCKED, first.detail_code)
     warning.warn_once.assert_awaited_once()
 
 

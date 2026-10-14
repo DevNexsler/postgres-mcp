@@ -336,6 +336,52 @@ async def test_restate_workflow_returns_serializable_terminal_outcome(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_restate_workflow_warns_staff_only_after_the_grace_period(monkeypatch) -> None:
+    """A failure is the agent's to fix first: the workflow sleeps the grace
+    period, then runs the warning as its own journaled step."""
+
+    class Workflow:
+        def __init__(self, name, **_kwargs):
+            self.handler = None
+
+        def main(self, **_kwargs):
+            def decorate(handler):
+                self.handler = handler
+                return handler
+
+            return decorate
+
+    monkeypatch.setitem(
+        sys.modules,
+        "restate",
+        SimpleNamespace(Workflow=Workflow, RunOptions=lambda **kwargs: kwargs, TerminalError=RuntimeError, app=lambda services: services[0]),
+    )
+    coordinator = AsyncMock()
+    coordinator.staff_warning_grace_seconds = 300
+    coordinator.advance.return_value = DeliveryResult(DeliveryPhase.TERMINAL, "provider_permanent_upstream_error", staff_warning=True)
+    workflow = build_restate_app(coordinator)
+    steps: list[str] = []
+
+    class Context:
+        def key(self):
+            return str(ACTION_ID)
+
+        async def run_typed(self, name, call, _options):
+            steps.append(name)
+            return await call()
+
+        async def sleep(self, delay, name):
+            steps.append(f"{name} {int(delay.total_seconds())}s")
+            coordinator.warn_unless_recovered.assert_not_called()
+
+    result = await workflow.handler(Context(), {"action_id": str(ACTION_ID)})
+
+    assert steps == ["advance 0", "staff warning grace 300s", "staff warning"]
+    coordinator.warn_unless_recovered.assert_awaited_once_with(ACTION_ID, "provider_permanent_upstream_error")
+    assert result["phase"] == "terminal"
+
+
+@pytest.mark.asyncio
 async def test_an_ambiguous_action_that_never_verifies_is_parked_for_a_person() -> None:
     """Action c3df14e3 (2026-09-25): TenantCloud stored a truncated text, the
     readback could never match, and the send stayed `unknown` -- holding every
@@ -604,11 +650,17 @@ async def test_a_definitive_failure_warns_staff_exactly_once() -> None:
     auth = AsyncMock()
     auth.ensure_ready.return_value = AuthResult(AuthState.READY)
     staff_warning = AsyncMock()
+    store.later_sent_sibling.return_value = None
     coordinator = OutboundDeliveryCoordinator(store=store, service=service, auth=auth, staff_warning=staff_warning)
 
     result = await coordinator.advance(ACTION_ID)
 
-    assert result.phase is DeliveryPhase.TERMINAL
+    # advance() only flags the warning; the workflow sends it after the grace.
+    assert (result.phase, result.staff_warning) == (DeliveryPhase.TERMINAL, True)
+    staff_warning.warn_once.assert_not_called()
+
+    await coordinator.warn_unless_recovered(ACTION_ID, result.detail_code)
+
     staff_warning.warn_once.assert_awaited_once_with(
         ACTION_ID,
         None,
@@ -617,6 +669,39 @@ async def test_a_definitive_failure_warns_staff_exactly_once() -> None:
         operation=Operation.TENANTCLOUD_MESSAGE_SEND,
         recipient="lead@example.com",
     )
+
+
+@pytest.mark.asyncio
+async def test_a_failure_the_agent_fixed_with_a_later_send_never_warns_staff() -> None:
+    """Wake 28410 (2026-10-14): a Cliq DM to a chat Nigel is not in failed
+    for good, and the agent resent it to the right chat 90 s later. Staff
+    were warned anyway, about a problem already solved."""
+    row = action(ActionState.RETRY_READY, attempts=1)
+    store = AsyncMock()
+    store.get.return_value = row
+    store.later_sent_sibling.return_value = UUID("f1c05be4-3a24-577a-b586-a87783bed875")
+    staff_warning = AsyncMock()
+    coordinator = OutboundDeliveryCoordinator(store=store, service=AsyncMock(), auth=AsyncMock(), staff_warning=staff_warning)
+
+    await coordinator.warn_unless_recovered(ACTION_ID, "provider_permanent_upstream_error")
+
+    store.later_sent_sibling.assert_awaited_once_with(ACTION_ID)
+    staff_warning.warn_once.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_check_that_errors_still_warns_staff() -> None:
+    """Not knowing whether the agent recovered is not a recovery."""
+    row = action(ActionState.RETRY_READY, attempts=1)
+    store = AsyncMock()
+    store.get.return_value = row
+    store.later_sent_sibling.side_effect = RuntimeError("database unavailable")
+    staff_warning = AsyncMock()
+    coordinator = OutboundDeliveryCoordinator(store=store, service=AsyncMock(), auth=AsyncMock(), staff_warning=staff_warning)
+
+    await coordinator.warn_unless_recovered(ACTION_ID, "provider_permanent_upstream_error")
+
+    staff_warning.warn_once.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -635,7 +720,7 @@ async def test_a_stale_no_send_never_warns_staff() -> None:
 
     result = await coordinator.advance(ACTION_ID)
 
-    assert result.phase is DeliveryPhase.TERMINAL
+    assert (result.phase, result.staff_warning) == (DeliveryPhase.TERMINAL, False)
     staff_warning.warn_once.assert_not_called()
 
 
