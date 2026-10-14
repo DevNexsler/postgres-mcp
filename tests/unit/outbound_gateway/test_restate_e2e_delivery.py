@@ -123,9 +123,14 @@ class FakeStore:
 
     def __init__(self, initial: OutboundActionRecord) -> None:
         self.current = initial
+        # The agent's own resend, when a test plays one (see later_sent_sibling).
+        self.recovered_by: UUID | None = None
 
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         return self.current if self.current and self.current.action_id == action_id else None
+
+    async def later_sent_sibling(self, action_id: UUID) -> UUID | None:
+        return self.recovered_by
 
     async def create_or_load(self, ctx: ActionContext) -> OutboundActionRecord:
         return self.current
@@ -332,10 +337,14 @@ async def drive(coordinator: OutboundDeliveryCoordinator, clock: FakeClock, *, m
     """The Restate workflow's own while loop (delivery_workflow.build_restate_app's
     `deliver()`), minus the durable execution wrapper: advance(), then
     ctx.sleep(retry_after_seconds) -- here, bump the fake clock instead of
-    actually waiting."""
+    actually waiting. A failure that owes staff a warning waits out the grace
+    period, then warn_unless_recovered()."""
     for _ in range(max_steps):
         result = await coordinator.advance(ACTION_ID)
         if result.phase in (DeliveryPhase.COMPLETE, DeliveryPhase.TERMINAL):
+            if result.staff_warning:
+                clock.advance(coordinator.staff_warning_grace_seconds)
+                await coordinator.warn_unless_recovered(ACTION_ID, result.detail_code)
             return result
         clock.advance(result.retry_after_seconds)
     raise AssertionError("workflow did not terminate within max_steps")
@@ -414,6 +423,24 @@ async def test_a_definitive_provider_rejection_ends_definitive_failed_with_one_w
 
     # Tools used: invoke (cliq_channel_bot_post) + one poll (request_status).
     assert [call[1] for call in client.calls] == ["cliq_channel_bot_post", "request_status"]
+
+
+@pytest.mark.asyncio
+async def test_a_definitive_rejection_the_agent_resent_correctly_never_warns_staff():
+    """Wake 28410 (2026-10-14): the same permanent rejection, but the agent
+    read it and resent to the right chat within the grace period."""
+    created_at = datetime(2026, 10, 14, 13, 40, 24, tzinfo=timezone.utc)
+    store = FakeStore(make_row(created_at=created_at))
+    store.recovered_by = UUID("f1c05be4-3a24-577a-b586-a87783bed875")
+    clock = FakeClock(created_at)
+    service = build_service(store, FakeMcpClient(pending(), permanent_upstream_failure()), clock)
+    staff_warning = RecordingStaffWarningPort()
+
+    result = await drive(build_coordinator(store, service, clock, staff_warning), clock)
+
+    assert (result.phase, result.detail_code) == (DeliveryPhase.TERMINAL, "provider_permanent_upstream_error")
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert staff_warning.calls == []
 
 
 @pytest.mark.asyncio

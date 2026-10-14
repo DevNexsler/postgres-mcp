@@ -23,6 +23,7 @@ from .models import ExecuteRequest
 from .models import Operation
 from .models import RequestRefusedError
 from .service import OutboundActionRecord
+from .staff_warning import STAFF_WARNING_TEXT_PREFIX
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -526,6 +527,31 @@ class PostgresActionStore:
             [action_id],
         )
         return await self._hydrated_record(rows[0].cells) if rows else None
+
+    async def later_sent_sibling(self, action_id: UUID) -> UUID | None:
+        """A completed send of the same role on the same wake, created after
+        this action failed, or None. "After it failed" (terminal_at, not
+        created_at) keeps an unrelated send queued alongside it from counting:
+        only a send the agent made once it could see the failure is a
+        recovery. Staff warnings themselves never count."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT later.action_id
+            FROM outbound_actions failed
+            JOIN outbound_actions later
+              ON later.wakeup_event_id = failed.wakeup_event_id
+             AND later.action_role = failed.action_role
+             AND later.created_at > coalesce(failed.terminal_at, failed.updated_at)
+             AND later.state = 'completed'
+             AND coalesce(later.arguments->>'text', '') NOT LIKE {}
+            WHERE failed.action_id = {}
+            ORDER BY later.created_at
+            LIMIT 1
+            """,
+            [STAFF_WARNING_TEXT_PREFIX + "%", action_id],
+        )
+        return UUID(str(rows[0].cells["action_id"])) if rows else None
 
     async def request_account(self, request: ExecuteRequest) -> str | None:
         """provider_account of the stored action `request` repeats word for
