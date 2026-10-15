@@ -76,6 +76,16 @@ class AliasResolution:
     personal_aliases: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class StaffDm:
+    """A person Nigel can DM in Cliq and the chat to post in
+    (Comm-Data-Store resolve_cliq_staff_dm, migration 260)."""
+
+    person_key: str
+    person_name: str | None
+    chat_id: str
+
+
 class ContextRepository(Protocol):
     async def load_wake_event(self, wakeup_event_id: int) -> WakeEventRecord | None: ...
 
@@ -95,6 +105,8 @@ class ContextRepository(Protocol):
         waive_shown: bool,
         as_of: datetime | None = None,
     ) -> list[NewerActivity]: ...
+
+    async def resolve_cliq_staff_dm(self, person: str | None) -> list[StaffDm]: ...
 
 
 class OutboundGatewayRepository:
@@ -200,6 +212,20 @@ class OutboundGatewayRepository:
             canonical_subject=cells.get("canonical_subject"),
             personal_aliases=tuple(cells.get("personal_aliases") or ()),
         )
+
+    async def resolve_cliq_staff_dm(self, person: str | None) -> list[StaffDm]:
+        """One row per staff member `person` names, with the DM chat Nigel is
+        in; None lists everyone Nigel can DM."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT person_key, person_name, chat_id
+            FROM resolve_cliq_staff_dm({}::text)
+            ORDER BY person_name, person_key
+            """,
+            [person],
+        )
+        return [StaffDm(**row.cells) for row in rows or ()]
 
     async def newer_context(
         self,

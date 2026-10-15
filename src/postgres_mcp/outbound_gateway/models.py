@@ -386,13 +386,29 @@ class QuoSmsArguments(StrictModel):
 
 
 class CliqArguments(StrictModel):
-    channel_or_chat_id: str
+    # Exactly one names the target. to_staff is a person ("gunther"); the
+    # gateway replaces it with the DM chat Nigel is in before anything is
+    # stored (ActionContextLoader.resolve_staff_dm), so a stored action
+    # always carries channel_or_chat_id.
+    channel_or_chat_id: str | None = None
+    to_staff: str | None = None
     text: str
+
+    @model_validator(mode="after")
+    def require_one_target(self) -> CliqArguments:
+        if (self.channel_or_chat_id is None) == (self.to_staff is None):
+            raise ValueError("pass exactly one of channel_or_chat_id or to_staff")
+        return self
 
     @field_validator("channel_or_chat_id", mode="before")
     @classmethod
-    def normalize_channel_or_chat_id(cls, value: Any) -> str:
-        return normalize_target_id(value, field="channel_or_chat_id")
+    def normalize_channel_or_chat_id(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="channel_or_chat_id")
+
+    @field_validator("to_staff", mode="before")
+    @classmethod
+    def normalize_to_staff(cls, value: Any) -> str | None:
+        return normalize_optional_target_id(value, field="to_staff")
 
     @field_validator("text", mode="before")
     @classmethod
@@ -701,7 +717,8 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
     Operation.CLIQ_CHANNEL_POST: (
         ActionRole.INTERNAL_NOTIFICATION,
         IntentKind.MANUAL_REVIEW_ALERT,
-        "post to a Cliq channel (lead_alert for a new lead)",
+        "post to a Cliq channel (lead_alert for a new lead); to DM a staff member pass to_staff "
+        '(e.g. "gunther") instead of channel_or_chat_id and the gateway finds the chat Nigel is in',
     ),
     Operation.CALENDAR_CREATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),
     Operation.CALENDAR_UPDATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),

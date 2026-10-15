@@ -34,6 +34,7 @@ from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
 from .models import STALE_CONTEXT_DETAILS
 from .models import ActionState
+from .models import CliqArguments
 from .models import CompletionKind
 from .models import ConfirmRequest
 from .models import ExecuteRequest
@@ -314,6 +315,9 @@ class OutboundActionService:
         # Before anything reads the request: the default is part of what was
         # asked, so the hash, the identity and the stored arguments carry it.
         request = with_default_cc(request, self._email_default_cc)
+        # Likewise a staff DM addressed by person is its chat from here on.
+        if isinstance(request.arguments, CliqArguments) and request.arguments.to_staff is not None:
+            request = await self._context_loader.resolve_staff_dm(request)
         context = await self._load(request)
         enabled = self._stale.enabled
         action = None
