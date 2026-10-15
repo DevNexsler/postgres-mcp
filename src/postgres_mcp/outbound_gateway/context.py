@@ -36,6 +36,7 @@ from .models import QuoSmsArguments
 from .models import RequestRefusedError
 from .models import TenantCloudMessageArguments
 from .repository import ContextRepository
+from .repository import StaffDm
 from .repository import WakeEventRecord
 
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
@@ -237,10 +238,43 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
     return sha256(encoded).hexdigest()
 
 
+def _staff_names(matches: list[StaffDm]) -> str:
+    return ", ".join(match.person_name or match.person_key for match in matches)
+
+
 class ActionContextLoader:
     def __init__(self, repository: ContextRepository, policy: RoutingPolicy):
         self._repository = repository
         self._policy = policy
+
+    async def resolve_staff_dm(self, request: ExecuteRequest) -> ExecuteRequest:
+        """`request` with its to_staff replaced by the Cliq DM chat Nigel is
+        in with that person (Comm-Data-Store resolve_cliq_staff_dm), so the
+        identity, payload hash and stored arguments name the chat it is sent
+        to. Exactly one person must match: none or several refuse with the
+        people Nigel can DM, never a guess."""
+        arguments = request.arguments
+        assert isinstance(arguments, CliqArguments) and arguments.to_staff is not None
+        person = arguments.to_staff
+        matches = await self._repository.resolve_cliq_staff_dm(person)
+        if len(matches) == 1:
+            resolved = arguments.model_copy(update={"channel_or_chat_id": matches[0].chat_id, "to_staff": None})
+            return request.model_copy(update={"arguments": resolved})
+        if matches:
+            raise ContextDerivationError(
+                f"to_staff {person!r} matches several people Nigel can DM: {_staff_names(matches)}. Nothing was "
+                "sent: send again with one of them as to_staff."
+            )
+        everyone = _staff_names(await self._repository.resolve_cliq_staff_dm(None))
+        if not everyone:
+            raise ContextDerivationError(
+                f"no Cliq DM with {person!r} that Nigel is in, and Nigel is in no staff DM. Nothing was sent: "
+                "pass the chat id as channel_or_chat_id, or record needs_human."
+            )
+        raise ContextDerivationError(
+            f"no Cliq DM with {person!r} that Nigel is in. Nothing was sent: people Nigel can DM: {everyone}. "
+            "Send again with one of them as to_staff."
+        )
 
     async def load(self, request: ExecuteRequest, *, recorded_account: str | None = None) -> ActionContext:
         """The context for `request`. recorded_account is the provider_account
@@ -905,6 +939,8 @@ class ActionContextLoader:
             requested_kind = (
                 CliqTargetKind.CHANNEL if request.operation is Operation.CLIQ_CHANNEL_POST else CliqTargetKind.CHAT
             )
+            # A to_staff request reaches here already resolved (resolve_staff_dm).
+            assert request.arguments.channel_or_chat_id is not None
             try:
                 kind, target_value = resolve_cliq_target(
                     request.arguments.channel_or_chat_id,
