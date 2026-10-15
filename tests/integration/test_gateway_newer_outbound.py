@@ -8,18 +8,22 @@ management@pfg.io on cc. The pre-fix preflight took the cron post for "we
 already replied" and completed the email as duplicate/already_handled.
 
 Everything the gateway reads runs as SQL here -- the wake/context load, the
-calendar evidence query, the stale-context query. Only the outbound_actions ledger
-writes (CDS stored functions) are the migration-192 fake of the unit tests, and
-the provider is a recorder.
+calendar evidence query, the stale-context query -- and the Comm-Data-Store
+functions those queries call are CDS's own definitions, read from its
+migrations. Only the outbound_actions ledger writes (CDS stored functions) are
+the migration-192 fake of the unit tests, and the provider is a recorder.
 
 Run: uv run pytest tests/integration/test_gateway_newer_outbound.py -q
 Docker required. Uses a disposable PostgreSQL container (removed on exit),
-never an application DB.
+never an application DB. Needs a Comm-Data-Store checkout
+(COMM_DATA_STORE_ROOT, default ~/projects/Comm-Data-Store); skipped without one.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -27,12 +31,17 @@ from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any
+from typing import LiteralString
+from typing import cast
 from uuid import UUID
 
 import docker
 import psycopg
 import pytest
 import pytest_asyncio
+from pglast import parse_sql
+from pglast import split
+from pglast.ast import CreateFunctionStmt
 from psycopg.types.json import Jsonb
 
 from postgres_mcp.outbound_gateway.context import ActionContextLoader
@@ -163,6 +172,31 @@ SCHEMA = """
     CREATE TRIGGER received_when_sent BEFORE INSERT ON messages
         FOR EACH ROW EXECUTE FUNCTION pg_temp.received_when_sent();
 """
+
+# The Comm-Data-Store functions the gateway's read queries call:
+# outbound_alias_is_hub (the subject resolver) and what it calls.
+CDS_FUNCTIONS = ("normalize_intent_lock_text", "cds_email_identity_class", "outbound_alias_is_hub")
+
+
+def cds_function_definitions(names: tuple[str, ...] = CDS_FUNCTIONS) -> list[str]:
+    """Each function's CREATE statement as Comm-Data-Store's migrations
+    leave it (the last migration that defines it wins), never a copy."""
+    migrations = Path(os.environ.get("COMM_DATA_STORE_ROOT", Path.home() / "projects" / "Comm-Data-Store")) / "migrations"
+    if not migrations.is_dir():
+        pytest.skip(f"Comm-Data-Store migrations unavailable at {migrations} (set COMM_DATA_STORE_ROOT)")
+    mentions = re.compile(rf"FUNCTION\s+(?:public\.)?(?:{'|'.join(names)})\s*\(", re.IGNORECASE)
+    found: dict[str, str] = {}
+    for migration in sorted(migrations.glob("*.sql")):
+        text = migration.read_text(encoding="utf-8")
+        if not mentions.search(text):
+            continue
+        for statement in split(text):
+            node = parse_sql(statement)[0].stmt
+            if isinstance(node, CreateFunctionStmt) and node.funcname and (name := node.funcname[-1].sval) in names:
+                found[name] = statement
+    missing = [name for name in names if name not in found]
+    assert not missing, f"Comm-Data-Store migrations define no {missing}"
+    return [found[name] for name in names]
 
 
 async def seed_wake_27279(conn) -> None:
@@ -432,6 +466,8 @@ def identity_email_request(text: str = "Following up on Aimee's application.", t
 async def conn(database):
     async with await psycopg.AsyncConnection.connect(database, autocommit=True) as connection:
         await connection.execute(SCHEMA)
+        for definition in cds_function_definitions():
+            await connection.execute(cast(LiteralString, definition))
         await seed_wake_27279(connection)
         await seed_quo_wake(connection)
         await seed_identity_wake(connection)
@@ -550,6 +586,19 @@ async def test_the_identical_request_again_is_the_same_action(conn):
     assert second.status is PublicStatus.DUPLICATE
     assert second.action_id == first.action_id == FIRST
     assert adapter.sent == [EMAIL_TEXT]
+
+
+@pytest.mark.asyncio
+async def test_the_subject_resolver_leaves_out_what_cds_calls_a_hub(conn):
+    """The resolver's query runs Comm-Data-Store's own outbound_alias_is_hub:
+    our Cliq user, a no-reply sender and our own phone never name a prospect."""
+    resolved = await OutboundGatewayRepository(SqlDriver(conn=conn)).resolve_canonical_subject(
+        ("zoho_cliq:918334727", "email:noreply@tenantcloud.com", "phone:+19083397021", f"email:{PROSPECT}"),
+        "",
+    )
+
+    assert resolved.personal_aliases == (f"email:{PROSPECT}",)
+    assert resolved.canonical_subject is None
 
 
 @pytest.mark.asyncio
