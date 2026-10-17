@@ -553,6 +553,36 @@ class PostgresActionStore:
         )
         return UUID(str(rows[0].cells["action_id"])) if rows else None
 
+    async def earlier_identical_sends(self, action_id: UUID) -> list[dict[str, Any]]:
+        """Completed sends of exactly this request -- same operation, same
+        recipient, same arguments -- by any other action in the last 72 hours,
+        from any wake or scope, newest first (at most 3). A completed
+        duplicate that itself sent nothing does not count. The agent reads
+        these in a refusal before it decides whether to override it."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT earlier.action_id, earlier.wakeup_event_id, earlier.provider_message_id,
+                   coalesce(earlier.provider_accepted_at, earlier.completed_at, earlier.updated_at) AS sent_at,
+                   earlier.recipient_scope->>'target_id' AS recipient
+            FROM outbound_actions this
+            JOIN outbound_actions earlier
+              ON earlier.action_id <> this.action_id
+             AND earlier.operation = this.operation
+             AND earlier.state = 'completed'
+             AND coalesce(earlier.detail_code, '') NOT IN
+                 ('already_handled', 'existing_lock_receipt', 'duplicate_inquiry_already_handled')
+             AND earlier.recipient_scope->>'target_id' = this.recipient_scope->>'target_id'
+             AND earlier.created_at > now() - interval '72 hours'
+             AND earlier.arguments = this.arguments
+            WHERE this.action_id = {}
+            ORDER BY sent_at DESC
+            LIMIT 3
+            """,
+            [action_id],
+        )
+        return [dict(row.cells) for row in rows or ()]
+
     async def request_account(self, request: ExecuteRequest) -> str | None:
         """provider_account of the stored action `request` repeats word for
         word -- the same match Comm-Data-Store migration 251's

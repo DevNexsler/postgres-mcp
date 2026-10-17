@@ -1013,6 +1013,21 @@ class OverrideRequest(StrictModel):
     decision: Literal["yes"] = "yes"
 
 
+class AlreadySent(StrictModel):
+    """A completed send of exactly the same request (operation, recipient and
+    arguments) by another action: what the agent must see before it
+    overrides a refusal. 2026-10-17: one wake emailed an attorney a case
+    packet; 21 minutes later a second wake's identical send was refused with
+    only "nothing was sent", the agent overrode it, and the attorney got the
+    packet twice."""
+
+    action_id: UUID
+    wakeup_event_id: int | None = None
+    provider_message_id: str | None = None
+    sent_at: datetime | None = None
+    recipient: str | None = None
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
@@ -1036,3 +1051,7 @@ class PublicResult(StrictModel):
     # the request to make (record.overridable). None otherwise, and omitted
     # from the wire like `detail`.
     override: OverrideRequest | None = None
+    # Set with `override` when another action already delivered this exact
+    # request (newest first): the agent sees the earlier send and its message
+    # id before it decides. None otherwise, and omitted from the wire.
+    already_sent: tuple[AlreadySent, ...] | None = None

@@ -34,6 +34,7 @@ from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
 from .models import STALE_CONTEXT_DETAILS
 from .models import ActionState
+from .models import AlreadySent
 from .models import CompletionKind
 from .models import ConfirmRequest
 from .models import ExecuteRequest
@@ -658,6 +659,20 @@ class OutboundActionService:
         if latest is None:
             return action_result(action)
         return _as_answer_of(action, action_result(latest))
+
+    async def earlier_identical_sends(self, action_id: UUID) -> tuple[AlreadySent, ...]:
+        """Other actions that already delivered exactly this request (see
+        PostgresActionStore.earlier_identical_sends). Empty when the store
+        cannot tell: the lookup only adds to a refusal, it never blocks one."""
+        finder = getattr(self._store, "earlier_identical_sends", None)
+        if finder is None:
+            return ()
+        try:
+            rows = await finder(action_id)
+        except Exception:
+            logger.warning("earlier identical send lookup failed for %s", action_id, exc_info=True)
+            return ()
+        return tuple(AlreadySent.model_validate(row) for row in rows or ())
 
     async def action_operation(self, action_id: UUID) -> Operation | None:
         action = await self._store.get(action_id)
