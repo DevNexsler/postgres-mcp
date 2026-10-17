@@ -44,6 +44,7 @@ from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
 from .models import ActionRole
+from .models import AlreadySent
 from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
@@ -165,15 +166,46 @@ async def handle_outbound_action(
         return _failure(error, parsed.op)
     if isinstance(result, dict):
         return result
+    result = await _with_earlier_sends(service, result)
     payload = result.model_dump(mode="json")
     # A plain send leaves detail unset, and every result except
     # needs_confirmation leaves new_context/question unset (override is set
     # only when nothing was sent) -- omit unset keys entirely so consumers
     # see no `null` field on the wire.
-    for optional in ("detail", "new_context", "question", "override"):
+    for optional in ("detail", "new_context", "question", "override", "already_sent"):
         if payload.get(optional) is None:
             payload.pop(optional, None)
     return payload
+
+
+def already_sent_detail(sent: tuple[AlreadySent, ...]) -> str:
+    """The first words of a refusal whose exact request another action already
+    delivered (Dan, 2026-10-17: "this was already sent. still override? here
+    is message ID")."""
+    first = sent[0]
+    to = f" to {first.recipient}" if first.recipient else ""
+    when = f" at {first.sent_at.isoformat()}" if first.sent_at else ""
+    wake = f", wake {first.wakeup_event_id}" if first.wakeup_event_id else ""
+    message = f"message id {first.provider_message_id}" if first.provider_message_id else "no provider message id"
+    more = f" ({len(sent) - 1} more identical send(s) listed in already_sent.)" if len(sent) > 1 else ""
+    return (
+        f"ALREADY SENT: this exact message already went{to}{when} ({message}; action {first.action_id}{wake}).{more} "
+        "Sending it again would deliver a second copy. Still override? Only if a second copy is really wanted; "
+        "say why in reason."
+    )
+
+
+async def _with_earlier_sends(service: OutboundActionService, result: PublicResult) -> PublicResult:
+    """A refusal the agent may override, with any identical earlier send put
+    in front of it. Only results that carry `override` are looked up: nothing
+    else can lead to a second send."""
+    if result.override is None:
+        return result
+    sent = await service.earlier_identical_sends(result.action_id)
+    if not isinstance(sent, tuple) or not sent:
+        return result
+    detail = " ".join(part for part in (already_sent_detail(sent), result.detail) if part)
+    return result.model_copy(update={"already_sent": sent, "detail": detail})
 
 
 async def _route(

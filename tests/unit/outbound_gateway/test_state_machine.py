@@ -127,6 +127,7 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
     assert result.new_context is None
     assert result.question is None
     assert result.override is None
+    assert result.already_sent is None
     assert set(result.model_dump()) == {
         "status",
         "action_id",
@@ -138,6 +139,7 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
         "new_context",
         "question",
         "override",
+        "already_sent",
     }
     with pytest.raises(ValidationError):
         type(result)(**result.model_dump(), raw_provider_payload={"secret": "x"})
