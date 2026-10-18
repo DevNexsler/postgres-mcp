@@ -74,3 +74,16 @@ def error_text(error: BaseException) -> str:
     if not isinstance(error, RequestRefusedError) and getattr(error, "sqlstate", None) is None:
         first = f"{type(error).__name__}: {first}"
     return first[:300]
+
+
+class ContactLockTimeoutError(Exception):
+    """Another reply to the same person held its contact lock past the
+    gateway's wait (PostgresActionStore.contact_serialized). Nothing was
+    recorded: the same request again retries the whole check. Its cause is
+    the database's lock_not_available / deadlock_detected (TRANSIENT)."""
+
+
+class ContactSerializationUnavailableError(Exception):
+    """The contact keys could not be read or locked for a reason other than
+    a lock wait (PostgresActionStore.contact_serialized). The send proceeds
+    unserialized: a failed lookup never stops a send."""

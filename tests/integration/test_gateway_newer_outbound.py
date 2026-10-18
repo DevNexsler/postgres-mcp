@@ -432,6 +432,8 @@ def identity_email_request(text: str = "Following up on Aimee's application.", t
 async def conn(database):
     async with await psycopg.AsyncConnection.connect(database, autocommit=True) as connection:
         await connection.execute(SCHEMA)
+        # Comm-Data-Store's hub rule, which the newer-context query calls.
+        await connection.execute((Path(__file__).resolve().parent / "fixtures" / "cds_outbound_alias_is_hub_251.sql").read_text())  # pyright: ignore[reportCallIssue, reportArgumentType] -- a checked-in SQL file
         await seed_wake_27279(connection)
         await seed_quo_wake(connection)
         await seed_identity_wake(connection)

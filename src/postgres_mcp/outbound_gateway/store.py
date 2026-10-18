@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime
 from hashlib import sha256
 from typing import Any
 from typing import Mapping
 from typing import Sequence
 from uuid import UUID
 
+from psycopg.rows import dict_row
+
 from postgres_mcp.sql import SafeSqlDriver
+from postgres_mcp.sql import SqlDriver
 
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
+from .errors import ContactLockTimeoutError
+from .errors import ContactSerializationUnavailableError
 from .identity import request_arguments
 from .models import ActionRole
 from .models import ActionState
@@ -22,6 +30,7 @@ from .models import CompletionKind
 from .models import ExecuteRequest
 from .models import Operation
 from .models import RequestRefusedError
+from .preflight import RECENTLY_ANSWERED_INTENTS
 from .service import OutboundActionRecord
 from .staff_warning import STAFF_WARNING_TEXT_PREFIX
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
@@ -88,6 +97,59 @@ def _explain_database_refusal(error: Exception) -> Exception:
         if match:
             return RequestRefusedError(f"{match.group(0).rstrip('.')}. {next_step}")
     return error
+
+
+# This action and its trigger message, and the action's contact keys
+# (Comm-Data-Store migration 269, docs/contact-identity-functions.md): its
+# trigger message's keys plus its own recipient's. Takes the action_id.
+_THIS_ACTION = """
+    this AS (
+        SELECT action.action_id, action.wakeup_event_id, action.created_at,
+               action.recipient_scope->>'target_id' AS target_id, wake.message_id
+        FROM outbound_actions AS action
+        LEFT JOIN hermes_wakeup_events AS wake ON wake.id = action.wakeup_event_id
+        WHERE action.action_id = {}
+    )"""
+_THIS_KEYS = """
+    keys AS (
+        SELECT ARRAY(
+            SELECT DISTINCT key.value
+            FROM (
+                SELECT k.contact_key AS value
+                FROM this CROSS JOIN LATERAL public.message_contact_keys(this.message_id) AS k
+                UNION
+                SELECT public.contact_key(this.target_id) FROM this
+            ) AS key
+            WHERE key.value IS NOT NULL
+            ORDER BY key.value
+        ) AS value
+    )"""
+# Advisory-lock namespace of a contact key (Comm-Data-Store's own advisory
+# locks hash 'prefix:' || key the same way).
+_CONTACT_LOCK_PREFIX = "outbound-contact-reply:"
+# lock_not_available (lock_timeout), deadlock_detected.
+_LOCK_WAIT_SQLSTATES = frozenset({"55P03", "40P01"})
+
+
+class _TransactionDriver:
+    """SqlDriver.execute_query on one connection inside the caller's open
+    transaction: no per-statement COMMIT, and each statement in a savepoint
+    so a failed one does not abort the transaction."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+
+    async def execute_query(self, query: Any, params: list[Any] | None = None, force_readonly: bool = False) -> list[SqlDriver.RowResult] | None:
+        del force_readonly
+        async with self.connection.transaction():
+            async with self.connection.cursor(row_factory=dict_row) as cursor:
+                if params:
+                    await cursor.execute(query, params)
+                else:
+                    await cursor.execute(query)
+                if cursor.description is None:
+                    return None
+                return [SqlDriver.RowResult(cells=dict(row)) for row in await cursor.fetchall()]
 
 
 class PostgresActionStore:
@@ -583,89 +645,146 @@ class PostgresActionStore:
         )
         return [dict(row.cells) for row in rows or ()]
 
-    async def recently_answered(self, action_id: UUID) -> list[dict[str, Any]]:
-        """Customer replies (prospect_reply inquiry_reply / showing_offer)
-        another wake already sent this action's recipient in the 72 hours
-        before it was recorded, newest first (at most 3) -- unless this wake
-        is not answering a customer, or the customer wrote something new
-        since. Empty means nothing to ask about.
-
-        Not asked (no rows):
-        - the wake's trigger is a staff directive or a schedule (zoho_cliq,
-          hermes_schedule, internal_qualification): someone asked for this send;
-        - the trigger message arrived after the newest such reply and is not
-          a word-for-word repeat (whitespace and case aside) of an inbound
-          from the same sender in the 72 hours before that reply: a new
-          question deserves its answer.
-
-        Asked: the trigger predates the reply (two lanes, one inquiry: wakes
-        27331/27332), or it repeats what that reply already answered (a
-        re-filed TenantCloud inquiry: wake 28084)."""
+    async def contact_keys(self, action_id: UUID) -> list[str]:
+        """This action's contact keys, sorted: its trigger message's
+        (Comm-Data-Store message_contact_keys) plus its own recipient's
+        (contact_key). The people a reply from it answers."""
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
-            r"""
-            WITH this AS (
-                SELECT action.action_id, action.wakeup_event_id, action.created_at,
-                       lower(btrim(action.recipient_scope->>'target_id')) AS recipient
-                FROM outbound_actions AS action
-                WHERE action.action_id = {}
-            ), prior AS (
-                SELECT earlier.action_id, earlier.wakeup_event_id, earlier.intent_kind AS intent,
-                       coalesce(earlier.provider_accepted_at, earlier.completed_at) AS sent_at,
-                       earlier.recipient_scope->>'target_id' AS recipient,
-                       left(earlier.arguments->>'text', 300) AS text_excerpt
-                FROM this
-                JOIN outbound_actions AS earlier
-                  ON earlier.wakeup_event_id <> this.wakeup_event_id
-                 AND earlier.action_id <> this.action_id
-                 AND earlier.action_role = 'prospect_reply'
-                 AND earlier.intent_kind IN ('inquiry_reply', 'showing_offer')
-                 AND earlier.provenance IN ('customer', 'operator_remediation')
-                 AND earlier.state = 'completed'
-                 AND earlier.completion_kind = 'sent'
-                 AND coalesce(earlier.detail_code, '') NOT IN
-                     ('already_handled', 'existing_lock_receipt', 'duplicate_inquiry_already_handled')
-                 AND lower(btrim(earlier.recipient_scope->>'target_id')) = this.recipient
-                 AND coalesce(earlier.provider_accepted_at, earlier.completed_at) < this.created_at
-                 AND coalesce(earlier.provider_accepted_at, earlier.completed_at)
-                     > this.created_at - interval '72 hours'
+            "WITH " + _THIS_ACTION + ", " + _THIS_KEYS + " SELECT unnest(keys.value) AS contact_key FROM keys",
+            [action_id],
+        )
+        return [str(row.cells["contact_key"]) for row in rows or ()]
+
+    async def recently_answered(self, action_id: UUID, *, as_of: datetime) -> list[dict[str, Any]]:
+        """Customer replies (RECENTLY_ANSWERED_INTENTS) another wake already
+        sent, or is sending right now, to any of this action's contact keys
+        inside Comm-Data-Store's contact_recently_answered_window() before
+        `as_of` (the gateway's clock: now, or a replayed moment), newest
+        first (at most 3), each with what triggered this wake. Empty means
+        nothing to ask about. Who the person is, what counts as answered or
+        in flight, and the window are Comm-Data-Store's (migration 269,
+        message_contact_keys / contact_key / prospect_replies_to_keys);
+        SafetyPreflight decides what the rows mean.
+
+        In flight counts (prepared, dispatching, provider_accepted, unknown),
+        and the window has no end, not this action's creation: two wakes on
+        two lanes for one inquiry record their actions at the same moment,
+        and the one that prepares second must see the first, even when the
+        first was recorded a moment later or is accepted by its provider
+        while this one checks (contact_serialized orders them).
+
+        Per row:
+        - trigger_source: messages.source of this wake's trigger message;
+        - trigger_is_new_question: the trigger arrived after the newest such
+          reply and is not a word-for-word repeat (whitespace and case
+          aside) of an inbound from the same sender in the window before
+          that reply."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "WITH "
+            + _THIS_ACTION
+            + ", "
+            + _THIS_KEYS
+            + r""",
+            prior AS (
+                SELECT reply.action_id, reply.wakeup_event_id, reply.intent_kind AS intent, reply.sent_at,
+                       reply.recipient, reply.reply_text, reply.reply_status
+                FROM this, keys,
+                     public.prospect_replies_to_keys(
+                         keys.value, {}::timestamptz - public.contact_recently_answered_window(), true
+                     ) AS reply
+                WHERE reply.wakeup_event_id IS DISTINCT FROM this.wakeup_event_id
+                  AND reply.action_id <> this.action_id
+                  AND reply.intent_kind = ANY({}::text[])
             ), newest AS (
                 SELECT max(sent_at) AS sent_at FROM prior
             ), trigger_message AS (
                 SELECT message.id, message.source, message.sent_at, message.sender_participant_id,
                        lower(regexp_replace(btrim(coalesce(message.body, '')), '\s+', ' ', 'g')) AS body
                 FROM this
-                JOIN hermes_wakeup_events AS wake ON wake.id = this.wakeup_event_id
-                JOIN messages AS message ON message.id = wake.message_id
+                JOIN messages AS message ON message.id = this.message_id
+            ), trigger_facts AS (
+                SELECT (SELECT source FROM trigger_message) AS trigger_source,
+                       coalesce((
+                           SELECT trigger_message.sent_at > newest.sent_at
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM messages AS earlier_inbound
+                                  WHERE earlier_inbound.id <> trigger_message.id
+                                    AND earlier_inbound.sender_participant_id = trigger_message.sender_participant_id
+                                    AND lower(coalesce(earlier_inbound.direction, '')) = 'inbound'
+                                    AND earlier_inbound.sent_at < newest.sent_at
+                                    AND earlier_inbound.sent_at
+                                        > newest.sent_at - public.contact_recently_answered_window()
+                                    AND lower(regexp_replace(btrim(coalesce(earlier_inbound.body, '')), '\s+', ' ', 'g'))
+                                        = trigger_message.body
+                              )
+                           FROM trigger_message CROSS JOIN newest
+                       ), false) AS trigger_is_new_question
             )
-            SELECT prior.action_id, prior.wakeup_event_id, prior.intent, prior.sent_at,
-                   prior.recipient, prior.text_excerpt
-            FROM prior
-            WHERE NOT EXISTS (
-                SELECT 1 FROM trigger_message
-                WHERE trigger_message.source IN ('zoho_cliq', 'hermes_schedule', 'internal_qualification')
-            )
-              AND NOT EXISTS (
-                SELECT 1
-                FROM trigger_message CROSS JOIN newest
-                WHERE trigger_message.sent_at > newest.sent_at
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages AS earlier_inbound
-                      WHERE earlier_inbound.id <> trigger_message.id
-                        AND earlier_inbound.sender_participant_id = trigger_message.sender_participant_id
-                        AND lower(coalesce(earlier_inbound.direction, '')) = 'inbound'
-                        AND earlier_inbound.sent_at < newest.sent_at
-                        AND earlier_inbound.sent_at > newest.sent_at - interval '72 hours'
-                        AND lower(regexp_replace(btrim(coalesce(earlier_inbound.body, '')), '\s+', ' ', 'g'))
-                            = trigger_message.body
-                  )
-            )
-            ORDER BY prior.sent_at DESC
+            SELECT prior.action_id, prior.wakeup_event_id, prior.intent, prior.sent_at, prior.recipient,
+                   prior.reply_text, prior.reply_status, trigger_facts.trigger_source,
+                   trigger_facts.trigger_is_new_question
+            FROM prior CROSS JOIN trigger_facts
+            ORDER BY prior.sent_at DESC, prior.action_id
             LIMIT 3
             """,
-            [action_id],
+            [action_id, as_of, sorted(RECENTLY_ANSWERED_INTENTS)],
         )
         return [dict(row.cells) for row in rows or ()]
+
+    @asynccontextmanager
+    async def contact_serialized(self, action_id: UUID, *, lock_timeout_ms: int) -> AsyncIterator[PostgresActionStore]:
+        """One transaction holding a transaction-scoped advisory lock on each
+        of this action's contact keys (sorted, so two holders never
+        deadlock), yielding a store bound to it. The caller's check
+        (recently_answered) and its prepare or reject run inside, so a second
+        reply to the same person waits until the first is recorded in flight
+        and then sees it. READ COMMITTED takes a new snapshot per statement,
+        and the locks are taken in statements of their own before the check:
+        the check sees whatever the previous holder committed.
+
+        Each statement inside runs in its own savepoint: one that fails
+        leaves the transaction (and the locks) usable for the next.
+
+        Raises ContactLockTimeoutError when a key stays locked longer than
+        lock_timeout_ms, and ContactSerializationUnavailableError when the keys
+        cannot be read or locked for any other reason (the caller sends
+        unserialized: a failed lookup never stops a send)."""
+        async with self._connection() as connection:
+            async with connection.transaction():
+                transactional = PostgresActionStore(_TransactionDriver(connection))
+                try:
+                    keys = await transactional.contact_keys(action_id)
+                    await SafeSqlDriver.execute_param_query(
+                        transactional._driver, "SELECT set_config('lock_timeout', {}, true)", [f"{max(1, lock_timeout_ms)}ms"]
+                    )
+                    for key in keys:
+                        await SafeSqlDriver.execute_param_query(
+                            transactional._driver,
+                            "SELECT pg_advisory_xact_lock(hashtextextended({}, 0))",
+                            [_CONTACT_LOCK_PREFIX + key],
+                        )
+                    await SafeSqlDriver.execute_param_query(transactional._driver, "SET LOCAL lock_timeout TO DEFAULT")
+                except Exception as error:
+                    if getattr(error, "sqlstate", None) in _LOCK_WAIT_SQLSTATES:
+                        raise ContactLockTimeoutError(f"another reply to this contact held its lock past {lock_timeout_ms} ms") from error
+                    raise ContactSerializationUnavailableError(str(error)) from error
+                yield transactional
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[Any]:
+        """A connection of its own: from the pool (production), else the
+        driver's single connection."""
+        driver = self._driver
+        if getattr(driver, "is_pool", False):
+            pool = await driver.conn.pool_connect()
+            async with pool.connection() as connection:
+                yield connection
+        elif isinstance(driver, _TransactionDriver):
+            yield driver.connection
+        else:
+            yield driver.conn
 
     async def request_account(self, request: ExecuteRequest) -> str | None:
         """provider_account of the stored action `request` repeats word for

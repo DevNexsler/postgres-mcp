@@ -15,9 +15,13 @@ from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.models import RecentlyAnswered
+from postgres_mcp.outbound_gateway.preflight import RECENTLY_ANSWERED_DETAIL
+from postgres_mcp.outbound_gateway.preflight import RECENTLY_ANSWERED_INTENTS
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
 from postgres_mcp.outbound_gateway.preflight import PreflightOutcome
+from postgres_mcp.outbound_gateway.preflight import RecentlyAnsweredEvidence
 from postgres_mcp.outbound_gateway.preflight import SafetyPreflight
 
 NOW = datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc)
@@ -104,7 +108,57 @@ def test_the_preflight_is_the_calendar_dependency_and_nothing_else(role, intent,
         assert decision.outcome is PreflightOutcome.MANUAL_REVIEW
     else:
         assert decision.outcome is PreflightOutcome.DEPENDENCY_WAIT
-    assert {outcome.value for outcome in PreflightOutcome} == {"ready", "dependency_wait", "manual_review"}
+    assert {outcome.value for outcome in PreflightOutcome} == {"ready", "dependency_wait", "manual_review", "refused"}
+
+
+EARLIER_REPLY = RecentlyAnswered(
+    action_id=UUID("95d784bf-0a66-59d1-9fb9-1e7d325d484a"),
+    wakeup_event_id=27994,
+    intent="inquiry_reply",
+    sent_at=NOW - timedelta(hours=27),
+    recipient="amc51816@gmail.com",
+    text_excerpt="Hi Amy",
+    reply_status="answered",
+)
+
+
+def test_an_earlier_reply_to_this_person_is_a_recently_answered_refusal():
+    answered = RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="tenantcloud_api")
+
+    decision = SafetyPreflight.evaluate(context(intent_kind=IntentKind.INQUIRY_REPLY), evidence(), answered)
+
+    assert (decision.outcome, decision.detail_code) == (PreflightOutcome.REFUSED, RECENTLY_ANSWERED_DETAIL)
+    assert decision.recently_answered == (EARLIER_REPLY,)
+
+
+@pytest.mark.parametrize(
+    "answered",
+    [
+        None,  # not asked, or the lookup failed: never stops a send
+        RecentlyAnsweredEvidence(replies=()),
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="zoho_cliq"),
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="hermes_schedule"),
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="internal_qualification"),
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="quo", trigger_is_new_question=True),
+    ],
+)
+def test_no_reply_a_requested_send_or_a_new_question_is_ready(answered):
+    decision = SafetyPreflight.evaluate(context(intent_kind=IntentKind.INQUIRY_REPLY), evidence(), answered)
+
+    assert decision.outcome is PreflightOutcome.READY
+
+
+@pytest.mark.parametrize("role", list(ActionRole))
+@pytest.mark.parametrize("intent", list(IntentKind))
+def test_only_inquiry_replies_and_offers_to_prospects_count_and_are_asked(role, intent):
+    counts = role is ActionRole.PROSPECT_REPLY and intent in {IntentKind.INQUIRY_REPLY, IntentKind.SHOWING_OFFER}
+    assert SafetyPreflight.counts_as_answer(role, intent) is counts
+    assert SafetyPreflight.asks_recently_answered(role, intent, is_answer=False, askable=True) is counts
+    # The agent's answer (override / stale-context successor) and the
+    # background prepare (nobody to ask) are never asked.
+    assert SafetyPreflight.asks_recently_answered(role, intent, is_answer=True, askable=True) is False
+    assert SafetyPreflight.asks_recently_answered(role, intent, is_answer=False, askable=False) is False
+    assert RECENTLY_ANSWERED_INTENTS == {"inquiry_reply", "showing_offer"}
 
 
 # ----------------------------------------------------------------------------
