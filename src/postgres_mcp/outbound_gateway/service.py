@@ -33,6 +33,7 @@ from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
 from .models import STALE_CONTEXT_DETAILS
+from .models import ActionRole
 from .models import ActionState
 from .models import AlreadySent
 from .models import CompletionKind
@@ -42,6 +43,7 @@ from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
 from .models import QuoSmsArguments
+from .models import RecentlyAnswered
 from .models import StaleContextDecision
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
@@ -68,6 +70,35 @@ from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
 
 logger = logging.getLogger(__name__)
+
+# A customer reply the agent is asked about when this recipient already got
+# one from another wake in the last 72 hours (PostgresActionStore.
+# recently_answered). The row ends `rejected` with this detail, so the result
+# carries the override; the agent's confirm no makes it agent_declined.
+RECENTLY_ANSWERED_DETAIL = "recently_answered"
+RECENTLY_ANSWERED_INTENTS = frozenset({"inquiry_reply", "showing_offer"})
+RECENTLY_ANSWERED_PREVIEW_CHARS = 300
+
+
+def recently_answered_detail(prior: tuple[RecentlyAnswered, ...], *, now: datetime) -> str:
+    """The refusal's words: who already got which reply, when, and what it
+    said, then the two answers the agent has."""
+    first = prior[0]
+    recipient = first.recipient or "this recipient"
+    ago = ""
+    if first.sent_at is not None:
+        hours = max(0.0, (now - first.sent_at).total_seconds() / 3600)
+        ago = f" {hours:.0f}h ago" if hours >= 1 else f" {max(1, round(hours * 60))} min ago"
+    wake = f", wake {first.wakeup_event_id}" if first.wakeup_event_id else ""
+    intent = f", {first.intent}" if first.intent else ""
+    text = " ".join((first.text_excerpt or "").split())[:RECENTLY_ANSWERED_PREVIEW_CHARS]
+    quoted = f': "{text}"' if text else ""
+    more = f" ({len(prior) - 1} more listed in recently_answered.)" if len(prior) > 1 else ""
+    return (
+        f"RECENTLY ANSWERED: {recipient} already got a reply{ago} (action {first.action_id}{wake}{intent}){quoted}.{more} "
+        "Check the thread: if this repeats that answer, send nothing (op confirm, decision no); if the prospect "
+        "needs something new, override with a reason"
+    )
 
 _RELOAD_REASON_MAX_CHARS = 300
 
@@ -558,6 +589,10 @@ class OutboundActionService:
         asked = await self._stale.check(action, context, agent_facing=agent_facing, confirm=confirm_stale, dispatch=dispatch)
         if asked is not None:
             return asked
+        if agent_facing:
+            refused = await self._refuse_if_recently_answered(action)
+            if refused is not None:
+                return refused
         if not dispatch:
             return await self._preflight_without_dispatch(action, context)
 
@@ -673,6 +708,53 @@ class OutboundActionService:
             logger.warning("earlier identical send lookup failed for %s", action_id, exc_info=True)
             return ()
         return tuple(AlreadySent.model_validate(row) for row in rows or ())
+
+    async def recently_answered(self, action_id: UUID) -> tuple[RecentlyAnswered, ...]:
+        """Customer replies another wake already sent this action's recipient
+        (see PostgresActionStore.recently_answered). Empty when the store
+        cannot tell: a failed lookup never stops a send."""
+        finder = getattr(self._store, "recently_answered", None)
+        if finder is None:
+            return ()
+        try:
+            rows = await finder(action_id)
+            return tuple(RecentlyAnswered.model_validate(row) for row in rows or ())
+        except Exception:
+            logger.warning("recently-answered lookup failed for %s; the send proceeds", action_id, exc_info=True)
+            return ()
+
+    async def _refuse_if_recently_answered(self, action: OutboundActionRecord) -> PublicResult | None:
+        """The agent's own new customer reply to someone another wake already
+        answered in the last 72 hours is refused once, naming that reply: the
+        agent reads it and either sends nothing (confirm no) or overrides with
+        a reason. Never a silent drop, and never asked twice: an override or
+        stale-context successor (retry_of_action_id) is the agent's answer."""
+        if (
+            action.state is not ActionState.RECEIVED
+            or action.action_role is not ActionRole.PROSPECT_REPLY
+            or action.intent_kind not in RECENTLY_ANSWERED_INTENTS
+            or action.retry_of_action_id is not None
+            or action.remediation_reason is not None
+        ):
+            return None
+        prior = await self.recently_answered(action.action_id)
+        if not prior:
+            return None
+        words = recently_answered_detail(prior, now=self._clock())
+        rejected = await self._store.reject(action.action_id, ActionState.RECEIVED, RECENTLY_ANSWERED_DETAIL, words)
+        if rejected.state is not ActionState.REJECTED:
+            # Another caller moved the row first: report it as it stands.
+            return action_result(rejected)
+        logger.warning(
+            "recently answered: wake %s action %s refused; %s got action %s from wake %s at %s",
+            action.wakeup_event_id,
+            action.action_id,
+            prior[0].recipient,
+            prior[0].action_id,
+            prior[0].wakeup_event_id,
+            prior[0].sent_at,
+        )
+        return action_result(rejected).model_copy(update={"recently_answered": prior})
 
     async def action_operation(self, action_id: UUID) -> Operation | None:
         action = await self._store.get(action_id)

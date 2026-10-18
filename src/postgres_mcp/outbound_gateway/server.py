@@ -172,7 +172,7 @@ async def handle_outbound_action(
     # needs_confirmation leaves new_context/question unset (override is set
     # only when nothing was sent) -- omit unset keys entirely so consumers
     # see no `null` field on the wire.
-    for optional in ("detail", "new_context", "question", "override", "already_sent"):
+    for optional in ("detail", "new_context", "question", "override", "already_sent", "recently_answered"):
         if payload.get(optional) is None:
             payload.pop(optional, None)
     return payload
@@ -413,7 +413,10 @@ def create_server(
             "message content changed). Any other result that did not send (status rejected, "
             "failed, duplicate, manual_review or stale) says why in detail, and may carry "
             "\"override\": that confirm request with the wake and action filled in (decision \"no\" "
-            "instead records that you chose not to send it). " + OVERRIDE_RULE + " A malformed request "
+            "instead records that you chose not to send it). detail_code recently_answered: this recipient "
+            "already got a customer reply from another wake in the last 72 hours (listed in recently_answered "
+            "with its text): if yours repeats it, answer decision \"no\"; if the prospect needs something new, "
+            "send the override with a reason. " + OVERRIDE_RULE + " A malformed request "
             "(detail_code invalid_request) recorded nothing: fix the field its detail names. "
             "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "

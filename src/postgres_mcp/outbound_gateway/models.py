@@ -1028,6 +1028,22 @@ class AlreadySent(StrictModel):
     recipient: str | None = None
 
 
+class RecentlyAnswered(StrictModel):
+    """A customer reply another wake already sent this recipient in the last
+    72 hours: what the agent must read before it sends another. 2026-09-28
+    (wakes 27331/27332, one tour request on two lanes) and 2026-10-09 (Amy
+    McDermott's repeated TenantCloud inquiry, wake 28084): a second wake
+    answered a prospect who already had an answer, in different words, so
+    byte-identical idempotency never saw it."""
+
+    action_id: UUID
+    wakeup_event_id: int | None = None
+    intent: str | None = None
+    sent_at: datetime | None = None
+    recipient: str | None = None
+    text_excerpt: str | None = None
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
@@ -1055,3 +1071,7 @@ class PublicResult(StrictModel):
     # request (newest first): the agent sees the earlier send and its message
     # id before it decides. None otherwise, and omitted from the wire.
     already_sent: tuple[AlreadySent, ...] | None = None
+    # Set with `override` when this recipient already got a customer reply
+    # from another wake in the last 72 hours (recently_answered, newest
+    # first). None otherwise, and omitted from the wire.
+    recently_answered: tuple[RecentlyAnswered, ...] | None = None
