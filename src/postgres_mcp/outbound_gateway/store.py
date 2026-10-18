@@ -583,6 +583,90 @@ class PostgresActionStore:
         )
         return [dict(row.cells) for row in rows or ()]
 
+    async def recently_answered(self, action_id: UUID) -> list[dict[str, Any]]:
+        """Customer replies (prospect_reply inquiry_reply / showing_offer)
+        another wake already sent this action's recipient in the 72 hours
+        before it was recorded, newest first (at most 3) -- unless this wake
+        is not answering a customer, or the customer wrote something new
+        since. Empty means nothing to ask about.
+
+        Not asked (no rows):
+        - the wake's trigger is a staff directive or a schedule (zoho_cliq,
+          hermes_schedule, internal_qualification): someone asked for this send;
+        - the trigger message arrived after the newest such reply and is not
+          a word-for-word repeat (whitespace and case aside) of an inbound
+          from the same sender in the 72 hours before that reply: a new
+          question deserves its answer.
+
+        Asked: the trigger predates the reply (two lanes, one inquiry: wakes
+        27331/27332), or it repeats what that reply already answered (a
+        re-filed TenantCloud inquiry: wake 28084)."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            r"""
+            WITH this AS (
+                SELECT action.action_id, action.wakeup_event_id, action.created_at,
+                       lower(btrim(action.recipient_scope->>'target_id')) AS recipient
+                FROM outbound_actions AS action
+                WHERE action.action_id = {}
+            ), prior AS (
+                SELECT earlier.action_id, earlier.wakeup_event_id, earlier.intent_kind AS intent,
+                       coalesce(earlier.provider_accepted_at, earlier.completed_at) AS sent_at,
+                       earlier.recipient_scope->>'target_id' AS recipient,
+                       left(earlier.arguments->>'text', 300) AS text_excerpt
+                FROM this
+                JOIN outbound_actions AS earlier
+                  ON earlier.wakeup_event_id <> this.wakeup_event_id
+                 AND earlier.action_id <> this.action_id
+                 AND earlier.action_role = 'prospect_reply'
+                 AND earlier.intent_kind IN ('inquiry_reply', 'showing_offer')
+                 AND earlier.provenance IN ('customer', 'operator_remediation')
+                 AND earlier.state = 'completed'
+                 AND earlier.completion_kind = 'sent'
+                 AND coalesce(earlier.detail_code, '') NOT IN
+                     ('already_handled', 'existing_lock_receipt', 'duplicate_inquiry_already_handled')
+                 AND lower(btrim(earlier.recipient_scope->>'target_id')) = this.recipient
+                 AND coalesce(earlier.provider_accepted_at, earlier.completed_at) < this.created_at
+                 AND coalesce(earlier.provider_accepted_at, earlier.completed_at)
+                     > this.created_at - interval '72 hours'
+            ), newest AS (
+                SELECT max(sent_at) AS sent_at FROM prior
+            ), trigger_message AS (
+                SELECT message.id, message.source, message.sent_at, message.sender_participant_id,
+                       lower(regexp_replace(btrim(coalesce(message.body, '')), '\s+', ' ', 'g')) AS body
+                FROM this
+                JOIN hermes_wakeup_events AS wake ON wake.id = this.wakeup_event_id
+                JOIN messages AS message ON message.id = wake.message_id
+            )
+            SELECT prior.action_id, prior.wakeup_event_id, prior.intent, prior.sent_at,
+                   prior.recipient, prior.text_excerpt
+            FROM prior
+            WHERE NOT EXISTS (
+                SELECT 1 FROM trigger_message
+                WHERE trigger_message.source IN ('zoho_cliq', 'hermes_schedule', 'internal_qualification')
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM trigger_message CROSS JOIN newest
+                WHERE trigger_message.sent_at > newest.sent_at
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages AS earlier_inbound
+                      WHERE earlier_inbound.id <> trigger_message.id
+                        AND earlier_inbound.sender_participant_id = trigger_message.sender_participant_id
+                        AND lower(coalesce(earlier_inbound.direction, '')) = 'inbound'
+                        AND earlier_inbound.sent_at < newest.sent_at
+                        AND earlier_inbound.sent_at > newest.sent_at - interval '72 hours'
+                        AND lower(regexp_replace(btrim(coalesce(earlier_inbound.body, '')), '\s+', ' ', 'g'))
+                            = trigger_message.body
+                  )
+            )
+            ORDER BY prior.sent_at DESC
+            LIMIT 3
+            """,
+            [action_id],
+        )
+        return [dict(row.cells) for row in rows or ()]
+
     async def request_account(self, request: ExecuteRequest) -> str | None:
         """provider_account of the stored action `request` repeats word for
         word -- the same match Comm-Data-Store migration 251's
