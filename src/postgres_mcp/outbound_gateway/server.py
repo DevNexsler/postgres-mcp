@@ -63,6 +63,7 @@ from .provider_client import McpServerConfig
 from .record import NEVER_ANOTHER_ROUTE
 from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
+from .service import DEFAULT_CONTACT_LOCK_TIMEOUT_MS
 from .service import OutboundActionService
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -413,10 +414,12 @@ def create_server(
             "message content changed). Any other result that did not send (status rejected, "
             "failed, duplicate, manual_review or stale) says why in detail, and may carry "
             "\"override\": that confirm request with the wake and action filled in (decision \"no\" "
-            "instead records that you chose not to send it). detail_code recently_answered: this recipient "
-            "already got a customer reply from another wake in the last 72 hours (listed in recently_answered "
-            "with its text): if yours repeats it, answer decision \"no\"; if the prospect needs something new, "
-            "send the override with a reason. " + OVERRIDE_RULE + " A malformed request "
+            "instead records that you chose not to send it). detail_code recently_answered: this person "
+            "already got a customer reply from another wake recently, or is being sent one right now (listed in "
+            "recently_answered with its text): if yours repeats it, answer decision \"no\"; if the prospect needs "
+            "something new, send the override with a reason. detail_code contact_reply_in_progress (retryable): "
+            "another reply to this person was still being recorded; nothing was sent, execute the same request "
+            "again in a few seconds. " + OVERRIDE_RULE + " A malformed request "
             "(detail_code invalid_request) recorded nothing: fix the field its detail names. "
             "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
@@ -886,6 +889,7 @@ async def build_runtime() -> GatewayRuntime:
         # newer context ends as a `stale_context_unasked` no-send.
         stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
         email_default_cc=_email_default_cc(),
+        contact_lock_timeout_ms=int(os.environ.get("OUTBOUND_CONTACT_LOCK_TIMEOUT_MS", str(DEFAULT_CONTACT_LOCK_TIMEOUT_MS))),
         # Same union worker.py and tenantcloud_delivery_server.py's
         # coordinator already use (TENANTCLOUD_OPERATIONS unconditionally,
         # plus OUTBOUND_RESTATE_OPERATIONS): ActionRecovery.exhaust() needs

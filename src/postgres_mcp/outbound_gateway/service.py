@@ -24,6 +24,8 @@ from .context import ContextDerivationError
 from .context import DerivedTarget
 from .context import canonical_payload_hash
 from .errors import GATEWAY_INTERNAL_ERROR
+from .errors import ContactLockTimeoutError
+from .errors import ContactSerializationUnavailableError
 from .errors import FailureKind
 from .errors import classify
 from .errors import error_text
@@ -33,7 +35,6 @@ from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
 from .models import STALE_CONTEXT_DETAILS
-from .models import ActionRole
 from .models import ActionState
 from .models import AlreadySent
 from .models import CompletionKind
@@ -45,9 +46,12 @@ from .models import PublicStatus
 from .models import QuoSmsArguments
 from .models import RecentlyAnswered
 from .models import StaleContextDecision
+from .preflight import RECENTLY_ANSWERED_DETAIL as RECENTLY_ANSWERED_DETAIL
+from .preflight import RECENTLY_ANSWERED_PREVIEW_CHARS
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
 from .preflight import PreflightOutcome
+from .preflight import RecentlyAnsweredEvidence
 from .preflight import SafetyPreflight
 from .record import ActionStore as ActionStore
 from .record import OutboundActionRecord as OutboundActionRecord
@@ -71,18 +75,20 @@ from .traffic_control import VALID_TRAFFIC_MODES
 
 logger = logging.getLogger(__name__)
 
-# A customer reply the agent is asked about when this recipient already got
-# one from another wake in the last 72 hours (PostgresActionStore.
-# recently_answered). The row ends `rejected` with this detail, so the result
-# carries the override; the agent's confirm no makes it agent_declined.
-RECENTLY_ANSWERED_DETAIL = "recently_answered"
-RECENTLY_ANSWERED_INTENTS = frozenset({"inquiry_reply", "showing_offer"})
-RECENTLY_ANSWERED_PREVIEW_CHARS = 300
+# A customer reply the agent is asked about (SafetyPreflight REFUSED
+# recently_answered) ends `rejected` with RECENTLY_ANSWERED_DETAIL, so the
+# result carries the override; the agent's confirm no makes it agent_declined.
+_IN_FLIGHT = "in_flight"
+# How long a reply waits for another reply to the same person to be recorded
+# (PostgresActionStore.contact_serialized) before it is refused, retryable,
+# with CONTACT_REPLY_BUSY_DETAIL. Configured by OUTBOUND_CONTACT_LOCK_TIMEOUT_MS.
+DEFAULT_CONTACT_LOCK_TIMEOUT_MS = 5000
+CONTACT_REPLY_BUSY_DETAIL = "contact_reply_in_progress"
 
 
 def recently_answered_detail(prior: tuple[RecentlyAnswered, ...], *, now: datetime) -> str:
-    """The refusal's words: who already got which reply, when, and what it
-    said, then the two answers the agent has."""
+    """The refusal's words: who already got (or is getting) which reply,
+    when, and what it said, then the two answers the agent has."""
     first = prior[0]
     recipient = first.recipient or "this recipient"
     ago = ""
@@ -94,10 +100,38 @@ def recently_answered_detail(prior: tuple[RecentlyAnswered, ...], *, now: dateti
     text = " ".join((first.text_excerpt or "").split())[:RECENTLY_ANSWERED_PREVIEW_CHARS]
     quoted = f': "{text}"' if text else ""
     more = f" ({len(prior) - 1} more listed in recently_answered.)" if len(prior) > 1 else ""
+    if first.reply_status == _IN_FLIGHT:
+        started = f", started{ago}" if ago else ""
+        got = f"is being sent a reply right now (action {first.action_id}{wake}{intent}{started})"
+    else:
+        got = f"already got a reply{ago} (action {first.action_id}{wake}{intent})"
     return (
-        f"RECENTLY ANSWERED: {recipient} already got a reply{ago} (action {first.action_id}{wake}{intent}){quoted}.{more} "
+        f"RECENTLY ANSWERED: {recipient} {got}{quoted}.{more} "
         "Check the thread: if this repeats that answer, send nothing (op confirm, decision no); if the prospect "
         "needs something new, override with a reason"
+    )
+
+
+def _recently_answered_evidence(rows: list[Mapping[str, Any]]) -> RecentlyAnsweredEvidence:
+    """PostgresActionStore.recently_answered's rows as SafetyPreflight's
+    evidence (every row carries the same trigger facts)."""
+    replies = tuple(
+        RecentlyAnswered(
+            action_id=row["action_id"],
+            wakeup_event_id=row.get("wakeup_event_id"),
+            intent=row.get("intent"),
+            sent_at=row.get("sent_at"),
+            recipient=row.get("recipient"),
+            text_excerpt=(row.get("reply_text") or "")[:RECENTLY_ANSWERED_PREVIEW_CHARS] or None,
+            reply_status=row.get("reply_status"),
+        )
+        for row in rows
+    )
+    first = rows[0] if rows else {}
+    return RecentlyAnsweredEvidence(
+        replies=replies,
+        trigger_source=first.get("trigger_source"),
+        trigger_is_new_question=bool(first.get("trigger_is_new_question")),
     )
 
 _RELOAD_REASON_MAX_CHARS = 300
@@ -263,6 +297,7 @@ class OutboundActionService:
         stale_confirm_enabled: bool = False,
         restate_operations: frozenset[Operation] = frozenset(),
         email_default_cc: str = "",
+        contact_lock_timeout_ms: int = DEFAULT_CONTACT_LOCK_TIMEOUT_MS,
     ):
         if traffic_mode not in VALID_TRAFFIC_MODES:
             raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
@@ -279,6 +314,7 @@ class OutboundActionService:
         self._store = store
         self._context_loader = context_loader
         self._email_default_cc = email_default_cc
+        self._contact_lock_timeout_ms = max(1, contact_lock_timeout_ms)
         self._evidence_loader = evidence_loader
         self._adapters = dict(adapters)
         self._provider_client = provider_client
@@ -584,20 +620,17 @@ class OutboundActionService:
         dispatch: bool = True,
     ) -> PublicResult:
         """The send gate every action passes: the stale-context question
-        (asked only of the agent), then the calendar dependency and dispatch
-        (or, with dispatch=False, prepare for Restate without provider I/O)."""
+        (asked only of the agent), then SafetyPreflight (recently answered,
+        the calendar dependency) and dispatch (or, with dispatch=False,
+        prepare for Restate without provider I/O)."""
         asked = await self._stale.check(action, context, agent_facing=agent_facing, confirm=confirm_stale, dispatch=dispatch)
         if asked is not None:
             return asked
-        if agent_facing:
-            refused = await self._refuse_if_recently_answered(action)
-            if refused is not None:
-                return refused
         if not dispatch:
-            return await self._preflight_without_dispatch(action, context)
+            return await self._preflight_without_dispatch(action, context, agent_facing=agent_facing)
 
         async def _preflight_fallback() -> PublicResult:
-            return await self._preflight(action, context)
+            return await self._preflight(action, context, agent_facing=agent_facing)
 
         return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
 
@@ -635,11 +668,19 @@ class OutboundActionService:
 
         return await self._settled(await self._require_action(action_id), received, agent_facing=False)
 
-    async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+    async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool = False) -> PublicResult:
+        try:
+            decision, row = await self._prepare_checked(action, context, agent_facing=agent_facing)
+        except ContactLockTimeoutError as busy:
+            if not agent_facing:
+                raise
+            return self._contact_busy(action, busy)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
-            return action_result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+            assert row is not None
+            return action_result(row, repeated=row.state is ActionState.COMPLETED)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            assert row is not None
+            return self._refused(action, decision, row)
         return await self._apply_preflight_decision(action, decision)
 
     async def _dispatch_stage(
@@ -709,52 +750,110 @@ class OutboundActionService:
             return ()
         return tuple(AlreadySent.model_validate(row) for row in rows or ())
 
-    async def recently_answered(self, action_id: UUID) -> tuple[RecentlyAnswered, ...]:
-        """Customer replies another wake already sent this action's recipient
-        (see PostgresActionStore.recently_answered). Empty when the store
-        cannot tell: a failed lookup never stops a send."""
-        finder = getattr(self._store, "recently_answered", None)
-        if finder is None:
-            return ()
-        try:
-            rows = await finder(action_id)
-            return tuple(RecentlyAnswered.model_validate(row) for row in rows or ())
-        except Exception:
-            logger.warning("recently-answered lookup failed for %s; the send proceeds", action_id, exc_info=True)
-            return ()
+    async def _prepare_checked(
+        self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool
+    ) -> tuple[PreflightDecision, OutboundActionRecord | None]:
+        """SafetyPreflight's decision for a row about to be prepared, and the
+        row it leaves: prepared when READY, rejected when REFUSED, None
+        otherwise (the caller applies a calendar decision).
 
-    async def _refuse_if_recently_answered(self, action: OutboundActionRecord) -> PublicResult | None:
-        """The agent's own new customer reply to someone another wake already
-        answered in the last 72 hours is refused once, naming that reply: the
-        agent reads it and either sends nothing (confirm no) or overrides with
-        a reason. Never a silent drop, and never asked twice: an override or
-        stale-context successor (retry_of_action_id) is the agent's answer."""
-        if (
-            action.state is not ActionState.RECEIVED
-            or action.action_role is not ActionRole.PROSPECT_REPLY
-            or action.intent_kind not in RECENTLY_ANSWERED_INTENTS
-            or action.retry_of_action_id is not None
-            or action.remediation_reason is not None
+        A customer reply that answers a prospect is decided and prepared
+        inside one transaction holding the advisory lock of each of its
+        contact keys (PostgresActionStore.contact_serialized): a second
+        reply to the same person, from any lane or address, waits until
+        the first is recorded in flight, then sees it and is asked about
+        it. A key still locked after contact_lock_timeout_ms raises
+        ContactLockTimeoutError (nothing recorded); keys that cannot be read
+        send unserialized, like a failed lookup."""
+        evidence = await self._evidence_loader.load(context)
+        if not SafetyPreflight.counts_as_answer(action.action_role, action.intent_kind):
+            return await self._decided(self._store, action, context, evidence, None)
+        serialized = getattr(self._store, "contact_serialized", None)
+        if serialized is not None:
+            try:
+                async with serialized(action.action_id, lock_timeout_ms=self._contact_lock_timeout_ms) as store:
+                    answered = await self._answered(store, action, agent_facing=agent_facing)
+                    return await self._decided(store, action, context, evidence, answered)
+            except ContactSerializationUnavailableError:
+                logger.warning("contact keys unavailable for action %s; preparing it unserialized", action.action_id, exc_info=True)
+        answered = await self._answered(self._store, action, agent_facing=agent_facing)
+        return await self._decided(self._store, action, context, evidence, answered)
+
+    async def _answered(self, store: Any, action: OutboundActionRecord, *, agent_facing: bool) -> RecentlyAnsweredEvidence | None:
+        """Other wakes' replies to this person, or None when not asked
+        (SafetyPreflight.asks_recently_answered) or the lookup failed -- a
+        failed lookup never stops a send."""
+        if not SafetyPreflight.asks_recently_answered(
+            action.action_role,
+            action.intent_kind,
+            is_answer=action.retry_of_action_id is not None or action.remediation_reason is not None,
+            askable=agent_facing and action.state is ActionState.RECEIVED,
         ):
             return None
-        prior = await self.recently_answered(action.action_id)
-        if not prior:
+        finder = getattr(store, "recently_answered", None)
+        if finder is None:
             return None
-        words = recently_answered_detail(prior, now=self._clock())
-        rejected = await self._store.reject(action.action_id, ActionState.RECEIVED, RECENTLY_ANSWERED_DETAIL, words)
+        try:
+            return _recently_answered_evidence(list(await finder(action.action_id, as_of=self._clock()) or ()))
+        except Exception:
+            logger.warning("recently-answered lookup failed for %s; the send proceeds", action.action_id, exc_info=True)
+            return None
+
+    async def _decided(
+        self,
+        store: Any,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        evidence: PreflightEvidence,
+        answered: RecentlyAnsweredEvidence | None,
+    ) -> tuple[PreflightDecision, OutboundActionRecord | None]:
+        decision = SafetyPreflight.evaluate(context, evidence, answered)
+        if decision.outcome is PreflightOutcome.READY:
+            return decision, await store.prepare(context, action.state)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            words = recently_answered_detail(decision.recently_answered, now=self._clock())
+            return decision, await store.reject(action.action_id, action.state, decision.detail_code, words)
+        return decision, None
+
+    def _refused(self, action: OutboundActionRecord, decision: PreflightDecision, rejected: OutboundActionRecord) -> PublicResult:
+        """A REFUSED decision's result: the rejected row, naming the earlier
+        replies; or, when another caller moved the row first, the row as it
+        stands."""
         if rejected.state is not ActionState.REJECTED:
-            # Another caller moved the row first: report it as it stands.
             return action_result(rejected)
+        first = decision.recently_answered[0]
         logger.warning(
-            "recently answered: wake %s action %s refused; %s got action %s from wake %s at %s",
+            "recently answered: wake %s action %s refused; %s got action %s (%s) from wake %s at %s",
             action.wakeup_event_id,
             action.action_id,
-            prior[0].recipient,
-            prior[0].action_id,
-            prior[0].wakeup_event_id,
-            prior[0].sent_at,
+            first.recipient,
+            first.action_id,
+            first.reply_status,
+            first.wakeup_event_id,
+            first.sent_at,
         )
-        return action_result(rejected).model_copy(update={"recently_answered": prior})
+        return action_result(rejected).model_copy(update={"recently_answered": decision.recently_answered})
+
+    def _contact_busy(self, action: OutboundActionRecord, busy: ContactLockTimeoutError) -> PublicResult:
+        """The agent's reply waited past contact_lock_timeout_ms for another
+        reply to the same person: not sent, nothing recorded, retryable. Never
+        sent unchecked (two replies at once is the race this lock prevents),
+        and never ended `rejected` (its override would skip the check)."""
+        logger.warning("action %s: %s; refused, retryable", action.action_id, busy)
+        seconds = self._contact_lock_timeout_ms / 1000
+        return PublicResult(
+            status=PublicStatus.FAILED,
+            action_id=action.action_id,
+            action_uid=action.action_uid,
+            provider_request_ref=None,
+            retryable=True,
+            detail_code=CONTACT_REPLY_BUSY_DETAIL,
+            detail=(
+                f"Not sent: another reply to this person was being recorded and the gateway waited {seconds:g}s "
+                "for it. Nothing went out from this action. Execute the same request again in a few seconds: "
+                "if that reply already answers them, you will be shown it first."
+            ),
+        )
 
     async def action_operation(self, action_id: UUID) -> Operation | None:
         action = await self._store.get(action_id)
@@ -826,11 +925,20 @@ class OutboundActionService:
             )
         return await self._recovery.exhaust(action_id)
 
-    async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        """The calendar dependency, then dispatch (execute and confirm)."""
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+    async def _preflight(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool = False) -> PublicResult:
+        """SafetyPreflight (recently answered, the calendar dependency), then
+        dispatch (execute and confirm)."""
+        try:
+            decision, prepared = await self._prepare_checked(action, context, agent_facing=agent_facing)
+        except ContactLockTimeoutError as busy:
+            if not agent_facing:
+                raise
+            return self._contact_busy(action, busy)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            assert prepared is not None
+            return self._refused(action, decision, prepared)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
+            assert prepared is not None
             if prepared.state is ActionState.COMPLETED:
                 return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:
@@ -845,9 +953,9 @@ class OutboundActionService:
             self._lease_owner,
             self._lease_seconds,
         )
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        decision, prepared = await self._prepare_checked(action, context, agent_facing=False)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
+            assert prepared is not None
             if prepared.state is ActionState.COMPLETED:
                 return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:

@@ -10,14 +10,20 @@ words; byte-identical idempotency could not tell. 2026-09-28, wakes
 27331/27332: one tour request on two lanes, two different slot lists four
 minutes apart.
 
-Which earlier replies count (other wake, same recipient, 72 h, and the
-trigger not a genuinely new question) is the store's SQL, proven against
-PostgreSQL in tests/integration/test_gateway_recently_answered.py. These
-tests pin what the service does with the answer.
+Which earlier replies count (other wake, any of the person's contact keys,
+Comm-Data-Store's window, answered or in flight) is the store's SQL over
+Comm-Data-Store's migration 269 functions, proven against PostgreSQL in
+tests/integration/test_gateway_recently_answered.py, including two
+concurrent replies through real advisory locks. What the rows mean (the
+trigger exceptions) is SafetyPreflight's (test_preflight.py). These tests pin
+what the service does with the answer, and how it serializes and fails.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock
@@ -25,15 +31,18 @@ from uuid import UUID
 
 import pytest
 
+from postgres_mcp.outbound_gateway.errors import ContactLockTimeoutError
+from postgres_mcp.outbound_gateway.errors import ContactSerializationUnavailableError
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
+from postgres_mcp.outbound_gateway.preflight import RECENTLY_ANSWERED_DETAIL
 from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
-from postgres_mcp.outbound_gateway.service import RECENTLY_ANSWERED_DETAIL
+from postgres_mcp.outbound_gateway.service import CONTACT_REPLY_BUSY_DETAIL
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 
 from . import test_stale_context_confirm as stale_tests
@@ -53,7 +62,10 @@ PRIOR = {
     "intent": "inquiry_reply",
     "sent_at": stale_tests.EXECUTED_AT - timedelta(hours=27),
     "recipient": RECIPIENT,
-    "text_excerpt": EARLIER_TEXT,
+    "reply_text": EARLIER_TEXT,
+    "reply_status": "answered",
+    "trigger_source": "tenantcloud_api",
+    "trigger_is_new_question": False,
 }
 REPLY = "Hi Amy, thanks for reaching out about Unit 7! We show weekdays 7:00 AM-3:30 PM."
 REASON = "She asked a new question about parking that the earlier reply did not cover."
@@ -70,7 +82,7 @@ class AnsweredLedger(stale_tests.LedgerStore):
         self.error = error
         self.looked_up: list[UUID] = []
 
-    async def recently_answered(self, action_id: UUID) -> list[dict[str, Any]]:
+    async def recently_answered(self, action_id: UUID, *, as_of: Any = None) -> list[dict[str, Any]]:
         self.looked_up.append(action_id)
         if self.error is not None:
             raise self.error
@@ -151,6 +163,7 @@ async def test_amy_repeat_is_refused_naming_the_earlier_reply_and_offering_the_o
             "sent_at": "2026-09-22T16:37:00.335447Z",
             "recipient": RECIPIENT,
             "text_excerpt": EARLIER_TEXT,
+            "reply_status": "answered",
         }
     ]
     row = store.rows[REFUSED]
@@ -301,3 +314,275 @@ async def test_status_lists_no_structured_field_when_none() -> None:
     )
     payload = await handle_outbound_action(service, POLICY, {"op": "status", "action_id": str(REFUSED)})
     assert "recently_answered" not in payload
+
+
+# ----------------------------------------------------------------------------
+# SafetyPreflight's exceptions, read from the rows' trigger facts.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {"trigger_source": "zoho_cliq"},
+        {"trigger_source": "hermes_schedule"},
+        {"trigger_source": "internal_qualification"},
+        {"trigger_is_new_question": True},
+    ],
+)
+async def test_a_staff_or_scheduled_wake_or_a_new_question_sends(facts: dict[str, Any]) -> None:
+    store = AnsweredLedger([{**PRIOR, **facts}])
+    service, adapter = harness(store)
+
+    result = await call(service, execute())
+
+    assert result["status"] == PublicStatus.SENT.value, result
+    assert adapter.sent == [REPLY]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_still_in_flight_is_named_as_being_sent_now() -> None:
+    in_flight = {**PRIOR, "reply_status": "in_flight", "sent_at": stale_tests.EXECUTED_AT - timedelta(minutes=2)}
+    store = AnsweredLedger([in_flight])
+    service, adapter = harness(store)
+
+    result = await call(service, execute())
+
+    assert (result["status"], result["detail_code"]) == (PublicStatus.REJECTED.value, RECENTLY_ANSWERED_DETAIL)
+    assert result["detail"].startswith(
+        f"Not sent: RECENTLY ANSWERED: {RECIPIENT} is being sent a reply right now (action {EARLIER}, wake 27994, inquiry_reply, started 2 min ago)"
+    )
+    assert result["recently_answered"][0]["reply_status"] == "in_flight"
+    assert "override" in result
+    assert adapter.sent == []
+
+
+# ----------------------------------------------------------------------------
+# Serialization: two replies to one person at once. The real advisory locks
+# are proven against PostgreSQL (tests/integration); this fake keeps their
+# contract -- one holder per contact key, the check and the prepare inside.
+# ----------------------------------------------------------------------------
+
+AMY_KEYS = frozenset({"email:amc51816@gmail.com", "phone:8622665285", "phone:9085550101"})
+LANE_A, LANE_B = 28300, 28301
+PHONE_A, PHONE_B = "+18622665285", "+19085550101"
+_IN_FLIGHT_STATES = {ActionState.PREPARED, ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED, ActionState.UNKNOWN}
+
+
+def phone_key(value: str) -> str:
+    return "phone:" + "".join(ch for ch in value if ch.isdigit())[-10:]
+
+
+class SerializedLedger(AnsweredLedger):
+    """The ledger with PostgresActionStore's contact_serialized contract: a
+    lock per contact key (each wake's trigger keys plus the action's own
+    recipient), and recently_answered read from the ledger itself, in flight
+    included. Every step yields to the event loop, so two unserialized
+    replies interleave exactly like the 2026-09-28 lanes did."""
+
+    def __init__(self, *, serialized: bool = True, lock_timeout: float = 0.5) -> None:
+        super().__init__()
+        self.serialized = serialized
+        self.lock_timeout = lock_timeout
+        self.locks: dict[str, asyncio.Lock] = {}
+        self.locked_for: list[UUID] = []
+        self.unavailable = False
+        if not serialized:
+            self.contact_serialized = None  # type: ignore[assignment]
+
+    def keys(self, action_id: UUID) -> list[str]:
+        row = self.rows[action_id]
+        return sorted(AMY_KEYS | {phone_key(str(row.recipient_scope["target_id"]))})
+
+    @asynccontextmanager
+    async def contact_serialized(self, action_id: UUID, *, lock_timeout_ms: int) -> AsyncIterator[SerializedLedger]:  # type: ignore[override]
+        if self.unavailable:
+            raise ContactSerializationUnavailableError("function message_contact_keys(bigint) does not exist")
+        held: list[asyncio.Lock] = []
+        try:
+            for key in self.keys(action_id):
+                lock = self.locks.setdefault(key, asyncio.Lock())
+                try:
+                    await asyncio.wait_for(lock.acquire(), self.lock_timeout)
+                except TimeoutError as error:
+                    raise ContactLockTimeoutError(f"{key} held past {lock_timeout_ms} ms") from error
+                held.append(lock)
+            self.locked_for.append(action_id)
+            yield self
+        finally:
+            for lock in held:
+                lock.release()
+
+    async def recently_answered(self, action_id: UUID, *, as_of: Any = None) -> list[dict[str, Any]]:
+        self.looked_up.append(action_id)
+        await asyncio.sleep(0)
+        if self.error is not None:
+            raise self.error
+        this = self.rows[action_id]
+        keys = set(self.keys(action_id))
+        found = []
+        for row in self.rows.values():
+            answered = row.state is ActionState.COMPLETED and row.completion_kind is not None and row.completion_kind.value == "sent"
+            if (
+                row.wakeup_event_id == this.wakeup_event_id
+                or row.intent_kind not in {"inquiry_reply", "showing_offer"}
+                or phone_key(str(row.recipient_scope["target_id"])) not in keys
+                or not (answered or row.state in _IN_FLIGHT_STATES)
+            ):
+                continue
+            found.append(
+                {
+                    "action_id": row.action_id,
+                    "wakeup_event_id": row.wakeup_event_id,
+                    "intent": row.intent_kind,
+                    "sent_at": stale_tests.EXECUTED_AT,
+                    "recipient": row.recipient_scope["target_id"],
+                    "reply_text": row.arguments.get("text"),
+                    "reply_status": "answered" if answered else "in_flight",
+                    "trigger_source": "zillow_rm_web_extract",
+                    "trigger_is_new_question": False,
+                }
+            )
+        return found
+
+    async def prepare(self, ctx, expected_state):
+        await asyncio.sleep(0)
+        return await super().prepare(ctx, expected_state)
+
+
+def lane(wake: int, phone: str, text: str) -> dict[str, Any]:
+    return {**execute(text), "wakeup_event_id": wake, "arguments": {"text": text, "to_phone": phone}}
+
+
+async def both_lanes(store: SerializedLedger) -> tuple[list[dict[str, Any]], list[str]]:
+    service, adapter = harness(store)
+    results = await asyncio.gather(
+        call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30.")),
+        call(service, lane(LANE_B, PHONE_B, "Hi Amy, how about Tuesday at 10?")),
+    )
+    return list(results), adapter.sent
+
+
+@pytest.mark.asyncio
+async def test_two_lanes_at_once_to_two_numbers_of_one_person_send_exactly_once() -> None:
+    results, sent = await both_lanes(SerializedLedger())
+
+    statuses = sorted(result["status"] for result in results)
+    assert statuses == [PublicStatus.REJECTED.value, PublicStatus.SENT.value], results
+    assert len(sent) == 1
+    [refused] = [result for result in results if result["status"] == PublicStatus.REJECTED.value]
+    assert refused["detail_code"] == RECENTLY_ANSWERED_DETAIL
+    # In flight or already sent by then: either way the first lane's reply.
+    assert refused["recently_answered"][0]["reply_status"] in {"in_flight", "answered"}
+    assert "override" in refused
+
+
+@pytest.mark.asyncio
+async def test_negative_control_without_the_lock_both_lanes_send() -> None:
+    """The fake really races: unserialized, each check runs before the other
+    prepares, and both send -- the 2026-09-28 double reply."""
+    results, sent = await both_lanes(SerializedLedger(serialized=False))
+
+    assert [result["status"] for result in results] == [PublicStatus.SENT.value] * 2, results
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_lock_held_too_long_refuses_retryably_and_records_nothing() -> None:
+    store = SerializedLedger(lock_timeout=0.01)
+    service, adapter = harness(store)
+    blocker = store.locks.setdefault("email:amc51816@gmail.com", asyncio.Lock())
+    await blocker.acquire()
+
+    busy = await call(service, lane(LANE_A, PHONE_A, REPLY))
+
+    assert busy["status"] == PublicStatus.FAILED.value
+    assert (busy["detail_code"], busy["retryable"]) == (CONTACT_REPLY_BUSY_DETAIL, True)
+    assert "override" not in busy
+    assert "Execute the same request again" in busy["detail"]
+    assert adapter.sent == []
+    action = stale_tests.action_id_for(LANE_A, "prospect_reply", 0)
+    assert store.rows[action].state is ActionState.RECEIVED
+
+    blocker.release()
+    again = await call(service, lane(LANE_A, PHONE_A, REPLY))
+
+    assert again["status"] == PublicStatus.SENT.value, again
+    assert adapter.sent == [REPLY]
+
+
+@pytest.mark.asyncio
+async def test_after_a_lock_timeout_the_retry_sees_the_reply_that_held_it() -> None:
+    store = SerializedLedger(lock_timeout=0.01)
+    service, adapter = harness(store)
+    sent = await call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30."))
+    assert sent["status"] == PublicStatus.SENT.value
+
+    retried = await call(service, lane(LANE_B, PHONE_B, "Hi Amy, how about Tuesday at 10?"))
+
+    assert (retried["status"], retried["detail_code"]) == (PublicStatus.REJECTED.value, RECENTLY_ANSWERED_DETAIL)
+    assert retried["recently_answered"][0]["reply_status"] == "answered"
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_background_prepare_leaves_a_busy_row_for_its_next_advance() -> None:
+    """Nobody waits on Restate's prepare: a lock timeout is a passing error
+    there, the row stays received (never rejected) and nothing is sent."""
+    store = SerializedLedger(lock_timeout=0.01)
+    service, _adapter = harness(store)
+    context = await stale_tests.FakeLoader().load(parse_outbound_request(lane(LANE_A, PHONE_A, REPLY)))
+    await store.create_or_load(context)
+    blocker = store.locks.setdefault("email:amc51816@gmail.com", asyncio.Lock())
+    await blocker.acquire()
+
+    result = await service.prepare(context.action_id)
+
+    assert result.status is PublicStatus.FAILED
+    assert store.rows[context.action_id].state is ActionState.RECEIVED
+    assert store.looked_up == []
+    blocker.release()
+
+
+@pytest.mark.asyncio
+async def test_an_override_still_takes_the_lock_so_a_concurrent_reply_sees_it() -> None:
+    store = SerializedLedger()
+    service, adapter = harness(store)
+    await call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30."))
+    refused = await call(service, lane(LANE_B, PHONE_B, "Hi Amy, parking is included."))
+    assert refused["detail_code"] == RECENTLY_ANSWERED_DETAIL
+
+    overridden = await call(service, {**refused["override"], "reason": REASON})
+
+    assert overridden["status"] == PublicStatus.SENT.value, overridden
+    successor = UUID(overridden["action_id"])
+    assert successor in store.locked_for
+    assert successor not in store.looked_up
+    assert len(adapter.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_unreadable_contact_keys_send_unserialized() -> None:
+    store = SerializedLedger()
+    store.unavailable = True
+    service, adapter = harness(store)
+
+    result = await call(service, lane(LANE_A, PHONE_A, REPLY))
+
+    assert result["status"] == PublicStatus.SENT.value, result
+    assert adapter.sent == [REPLY]
+    assert store.locked_for == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_inside_the_lock_still_sends() -> None:
+    store = SerializedLedger()
+    store.error = RuntimeError("function prospect_replies_to_keys(text[], timestamp with time zone, boolean) does not exist")
+    service, adapter = harness(store)
+
+    result = await call(service, lane(LANE_A, PHONE_A, REPLY))
+
+    assert result["status"] == PublicStatus.SENT.value, result
+    assert adapter.sent == [REPLY]
+    assert store.locked_for == [stale_tests.action_id_for(LANE_A, "prospect_reply", 0)]
