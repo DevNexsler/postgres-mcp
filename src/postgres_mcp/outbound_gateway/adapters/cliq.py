@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID
 
 from ..cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH
@@ -23,6 +26,14 @@ from .base import json_objects
 from .base import receipt_from_observation
 from .base import request_ref
 from .base import terminal_content
+
+# Deployment-owned aliases, kept out of agent prompts. Longest alias wins so
+# a full name is consumed before its first-name alias.
+_STAFF_MENTIONS = {name.casefold(): zuid for name, zuid in json.loads(Path(__file__).with_name("cliq_staff.json").read_text()).items()}
+_STAFF_MENTION_PATTERN = re.compile(
+    r"\{@[^}]*\}|(?<![\w@.+-])@(" + "|".join(re.escape(name) for name in sorted(_STAFF_MENTIONS, key=len, reverse=True)) + r")(?![\w@]|[.-]\w)",
+    re.IGNORECASE,
+)
 
 
 class CliqAdapter:
@@ -51,7 +62,10 @@ class CliqAdapter:
             tool=tool,
             arguments={
                 target_field: context.target.target_id,
-                "text": str(context.arguments["text"]),
+                "text": _STAFF_MENTION_PATTERN.sub(
+                    lambda match: "{@" + _STAFF_MENTIONS[match[1].casefold()] + "}" if match[1] else match[0],
+                    str(context.arguments["text"]),
+                ),
                 "sync_message": True,
                 "idempotency_key": (
                     f"cliq-wake:{context.wakeup_event_id}:"
