@@ -38,6 +38,8 @@ from .adapters.base import ProviderAdapter
 from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
+from .idempotency_policy import ReinvokeSafety
+from .idempotency_policy import reinvoke_safety
 from .context import ActionContext
 from .metrics import PROVIDER_PENDING_WAIT_CEILING_SECONDS
 from .metrics import provider_pending_wait_seconds
@@ -254,12 +256,11 @@ def plan_claim_for_final_check(action: OutboundActionRecord) -> Plan:
 
 
 def _ceiling_fail(action: OutboundActionRecord, *, reason: str | None = None) -> ProviderObservation:
-    """The definitive_failed observation a Restate-flagged operation's spent
-    retry budget lands on -- never manual_review (see plan_exhaust's
-    ``restate_flagged`` branch): the workflow already owns this decision
-    (retry_policy.RETRY_CEILING_SECONDS/decide()), so a person is never
-    handed a stray dead_letter row for an operation the workflow itself
-    settles."""
+    """Terminal failure for work known safe to close, with retry evidence.
+
+    Unknown effects without safe provider deduplication never use this
+    observation: plan_exhaust parks those for review instead.
+    """
     evidence: dict[str, Any] = {"kind": "retry_ceiling"}
     if reason:
         evidence["reload_error"] = reason
@@ -288,9 +289,10 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, res
     `restate_operations`). For those operations the Restate workflow +
     retry_policy.py own every retry/give-up decision, so an outcome nobody
     could settle -- even after `_final_provider_check`'s one last look --
-    becomes `definitive_failed` (with exactly one staff warning) instead of
-    the legacy worker's dead_letter -> manual_review parking. The legacy
-    (non-flagged) path is unchanged: a human still reviews it."""
+    becomes `definitive_failed` only when the existing reinvocation policy
+    says provider deduplication makes a repeat safe. Other unknown outcomes
+    keep dead_letter -> manual_review, without entering retry_ready. The
+    workflow still emits exactly one staff warning."""
     recovered = plan_recover_acceptance(action)
     if recovered is not None:
         return recovered
@@ -302,13 +304,14 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, res
     if state in {ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED}:
         steps = (Claim(state), Transition(state, ActionState.UNKNOWN, exhausted))
         state = ActionState.UNKNOWN
+    can_close_unknown = restate_flagged and reinvoke_safety(action.operation) is ReinvokeSafety.SAFE_TO_REINVOKE
     if state is ActionState.UNKNOWN:
         steps = (
             *steps,
             Claim(ActionState.UNKNOWN),
             Transition(ActionState.UNKNOWN, ActionState.RECONCILING, _ambiguous("retry_budget_exhausted_reconciliation", action)),
         )
-        if restate_flagged:
+        if can_close_unknown:
             return (
                 *steps,
                 Transition(ActionState.RECONCILING, ActionState.RETRY_READY, exhausted),
@@ -316,7 +319,7 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, res
             )
         return (*steps, *_dead_letter_for_review(ActionState.RECONCILING, exhausted, review, has_lease=True))
     if state in {ActionState.RECONCILING, ActionState.DEPENDENCY_WAIT}:
-        if restate_flagged and state is ActionState.RECONCILING:
+        if can_close_unknown and state is ActionState.RECONCILING:
             # The row is already leased (plan_claim_for_final_check's own
             # Claim ran before exhaust() got here) -- outbound_action_transition_
             # allowed has no reconciling -> definitive_failed edge, only
