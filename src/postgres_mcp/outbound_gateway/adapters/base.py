@@ -43,6 +43,7 @@ class ProviderObservation:
     category: str | None = None
     retryable: bool = False
     evidence: Mapping[str, Any] | None = None
+    dispatch_started_at: datetime | None = None
 
 
 @dataclass(frozen=True)

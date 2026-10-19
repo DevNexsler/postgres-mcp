@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from types import MappingProxyType
@@ -570,8 +571,9 @@ async def test_quo_adapter_requires_id_and_reconciles_exact_message_tuple():
     ambiguous = McpCallResult(error_kind=TransportErrorKind.TIMEOUT, is_error=True, safe_detail="transport_timeout")
     history = McpCallResult(
         structured_content={
-            "messages": [
+            "data": [
                 {
+                    "status": "sent",
                     "id": "quo-message-2",
                     "direction": "outgoing",
                     "to": "+19085550199",
@@ -584,7 +586,7 @@ async def test_quo_adapter_requires_id_and_reconciles_exact_message_tuple():
     retry_client = FakeClient(ambiguous, history)
     unknown = await adapter.invoke(retry_client, request)
     assert unknown.disposition is ProviderDisposition.AMBIGUOUS
-    reconciled = await adapter.reconcile(retry_client, context(Operation.QUO_SMS_SEND), ACTION_UID, unknown)
+    reconciled = await adapter.reconcile(retry_client, context(Operation.QUO_SMS_SEND), ACTION_UID, replace(unknown, dispatch_started_at=NOW))
     assert reconciled.disposition is ProviderDisposition.ACCEPTED
     assert reconciled.message_id == "quo-message-2"
 
@@ -1900,14 +1902,14 @@ def quo_message(**overrides):
 def quo_list_as_text(*messages):
     import json
 
-    return McpCallResult(structured_content=None, text=json.dumps(list(messages), indent=2))
+    return McpCallResult(structured_content=None, text=json.dumps({"data": list(messages)}, indent=2))
 
 
 def quo_ctx():
     return context(Operation.QUO_SMS_SEND, recipient_phone=QUO_TO)
 
 
-PRIOR = ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous", provider_request_ref="req-1")
+PRIOR = ProviderObservation(ProviderDisposition.AMBIGUOUS, "prior_dispatch_ambiguous", provider_request_ref="req-1", dispatch_started_at=NOW)
 
 
 @pytest.mark.asyncio
@@ -1923,9 +1925,8 @@ async def test_quo_reconcile_reads_the_live_text_shape_and_finds_the_sent_messag
 
 
 @pytest.mark.asyncio
-async def test_quo_reconcile_absent_from_a_loaded_thread_is_not_sent_and_retryable():
-    """The 2026-09-30 case: the thread loads, holds the tenant's own message,
-    and our text is not in it -- Quo never created it, so send it again."""
+async def test_quo_reconcile_absent_from_a_loaded_thread_stays_unknown():
+    """Operator replaced absence-as-proof rule: unread matches never authorize resend."""
     tenant_message = quo_message(
         id="AC-in", direction="incoming", to=["+14845550100"], text="no one has been to my unit"
     )
@@ -1933,9 +1934,9 @@ async def test_quo_reconcile_absent_from_a_loaded_thread_is_not_sent_and_retryab
 
     observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
 
-    assert observed.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
-    assert observed.retryable is True
-    assert observed.detail_code == "quo_message_not_sent"
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS
+    assert observed.retryable is False
+    assert observed.detail_code == "quo_reconciliation_inconclusive"
 
 
 @pytest.mark.asyncio
@@ -1984,8 +1985,9 @@ async def test_quo_reconcile_still_reads_the_structured_shape():
     client = FakeClient(
         McpCallResult(
             structured_content={
-                "messages": [
+                "data": [
                     {
+                        "status": "sent",
                         "id": "quo-message-2",
                         "direction": "outgoing",
                         "to": QUO_TO,
@@ -2008,4 +2010,85 @@ def test_quo_provider_calls_wait_as_long_as_quo_waits_for_its_carrier():
 
     config = quo_server_config()
     assert config.timeout_seconds == 30.0
-    assert config.allowed_tools == frozenset({"send_message", "list_messages", "get_message"})
+    assert config.allowed_tools == frozenset({"send_message", "list_messages", "get_message", "list_messages_page"})
+
+
+@pytest.mark.asyncio
+async def test_quo_history_absence_never_authorizes_retry():
+    client = FakeClient(quo_list_as_text(quo_message(text="unrelated")))
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS
+    assert not observed.retryable
+
+
+@pytest.mark.asyncio
+async def test_quo_known_receipt_is_read_by_id_before_history():
+    from dataclasses import replace
+
+    client = FakeClient(quo_list_as_text(quo_message()))
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(
+        client, quo_ctx(), ACTION_UID, replace(PRIOR, message_id="AC-live-shape-1")
+    )
+    assert client.calls == [("quo", "get_message", {"message_id": "AC-live-shape-1"})]
+    assert observed.disposition is ProviderDisposition.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_quo_history_follows_pages_and_checks_line_and_dispatch_window():
+    from dataclasses import replace
+
+    event = quo_message(id="AC-page-2")
+    client = FakeClient(
+        McpCallResult(structured_content={"data": [], "nextPageToken": "page-2"}),
+        McpCallResult(structured_content={"data": [event]}),
+    )
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(
+        client, quo_ctx(), ACTION_UID, replace(PRIOR, dispatch_started_at=NOW)
+    )
+    assert observed.message_id == "AC-page-2"
+    assert [call[1] for call in client.calls] == ["list_messages_page"] * 2
+    assert client.calls[0][2]["created_after"] == NOW.isoformat()
+    assert client.calls[0][2]["phone_number_id"] == "leasing-line"
+    assert client.calls[1][2]["page_token"] == "page-2"
+
+
+@pytest.mark.asyncio
+async def test_quo_send_reads_json_text_receipt_immediately():
+    import json
+
+    client = FakeClient(McpCallResult(text=json.dumps(quo_message()), structured_content=None))
+    adapter = QuoSmsAdapter(user_id="user-1")
+    observation = await adapter.invoke(client, adapter.build_request(quo_ctx(), ACTION_UID))
+    assert observation.disposition is ProviderDisposition.ACCEPTED
+    assert adapter.parse_receipt(quo_ctx(), observation).provider_message_id == "AC-live-shape-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"phoneNumberId": "other-line"}, {"createdAt": "2026-07-15T23:59:59Z"},
+    {"direction": "incoming"}, {"status": "failed"}, {"to": ["+19085550000"]},
+])
+async def test_quo_history_positive_evidence_must_match_dispatch(changes):
+    client = FakeClient(McpCallResult(structured_content={"data": [quo_message(**changes)]}))
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS
+    assert not observed.retryable
+
+
+@pytest.mark.asyncio
+async def test_quo_repeated_history_cursor_stays_unknown_and_stops():
+    page = McpCallResult(structured_content={"data": [], "nextPageToken": "cycle"})
+    client = FakeClient(page, page)
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(client, quo_ctx(), ACTION_UID, PRIOR)
+    assert len(client.calls) == 2
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS
+
+
+@pytest.mark.asyncio
+async def test_quo_missing_dispatch_timestamp_cannot_adopt_an_older_send():
+    client = FakeClient()
+    observed = await QuoSmsAdapter(user_id="user-1").reconcile(
+        client, quo_ctx(), ACTION_UID, replace(PRIOR, dispatch_started_at=None)
+    )
+    assert client.calls == []
+    assert observed.disposition is ProviderDisposition.AMBIGUOUS

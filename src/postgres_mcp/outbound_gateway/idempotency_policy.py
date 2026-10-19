@@ -27,12 +27,11 @@ per-operation call must be looked up, not re-derived at the call site.
 Findings, one line each (see the operation's own adapter module for the
 full reasoning):
 
-- ``quo.sms.send`` -- CONFIRM_BY_READBACK. Quo's public ``/messages`` POST
-  (QUO-Gated-MCP's ``quo_client.send_message``) takes no idempotency key at
-  all: a blind resend is a genuine second text to the customer. Settled
-  instead by ``QuoSmsAdapter.reconcile()``'s ``list_messages`` exact-tuple
-  read-back (recipient + content + time >= source_sent_at) -- independent of
-  any job/request state, so it still works after the fact.
+- ``quo.sms.send`` -- CONFIRM_BY_READBACK. The configured Quo client
+  sends no idempotency key, so blind resend risks a second customer text.
+  Reconcile a saved provider message ID directly; without one, follow direct
+  ``list_messages_page`` cursors over the dispatch window and accept only
+  positive line/recipient/content/time evidence. Absence remains unknown.
 - ``email.send`` -- CONFIRM_BY_READBACK. Agent-Email-Server's job records are
   in-memory (``JobQueue``'s ``jobs = new Map()``) and evict on a TTL; its own
   ``request_status`` "lost" response literally says "Re-run the original
