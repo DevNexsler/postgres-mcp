@@ -395,9 +395,10 @@ async def test_quo_ambiguous_forever_settled_by_readback_completes_with_no_warni
         transport_timeout(),
         McpCallResult(
             structured_content={
-                "messages": [
+                "data": [
                     {
                         "id": "quo-message-2",
+                        "status": "sent",
                         "direction": "outgoing",
                         "to": "+19085550199",
                         "content": "Friday at 10:30 works. — Nigel",
@@ -412,7 +413,7 @@ async def test_quo_ambiguous_forever_settled_by_readback_completes_with_no_warni
         operation=Operation.QUO_SMS_SEND,
         adapter=QuoSmsAdapter(user_id="user-1"),
         context=quo_context(),
-        record=quo_record(),
+        record=dataclass_replace(quo_record(), dispatch_started_at=CREATED_AT),
         provider_client=client,
     )
     assert result.phase is DeliveryPhase.COMPLETE
@@ -423,11 +424,8 @@ async def test_quo_ambiguous_forever_settled_by_readback_completes_with_no_warni
 
 
 @pytest.mark.asyncio
-async def test_quo_timeout_then_absent_from_quo_thread_is_resent_once_and_completes():
-    """2026-09-30, action b78d5668: the send timed out, the text never reached
-    Quo, and the action sat "inconclusive" for an hour. Quo's thread (live
-    shape: JSON text, `to` a list, `createdAt`) loads without our text, so the
-    send is retried -- once -- and completes."""
+async def test_quo_timeout_then_absent_from_quo_thread_escalates_without_resend():
+    """Operator decision: history absence is unknown, never permission to retry."""
     import json as _json
 
     tenant_message = {
@@ -441,22 +439,22 @@ async def test_quo_timeout_then_absent_from_quo_thread_is_resent_once_and_comple
     }
     client = ScriptThenRepeatClient(
         transport_timeout(),
-        McpCallResult(structured_content=None, text=_json.dumps([tenant_message])),
-        McpCallResult(structured_content={"status": "sent", "message_id": "quo-message-resent"}),
+        McpCallResult(structured_content=None, text=_json.dumps({"data": [tenant_message]})),
     )
     result, store, _clock, staff_warning = await run_case(
         action_id=QUO_ACTION_ID,
         operation=Operation.QUO_SMS_SEND,
         adapter=QuoSmsAdapter(user_id="user-1"),
         context=quo_context(),
-        record=quo_record(),
+        record=dataclass_replace(quo_record(), dispatch_started_at=CREATED_AT),
         provider_client=client,
     )
-    assert result.phase is DeliveryPhase.COMPLETE
-    assert store.current.state is ActionState.COMPLETED
-    assert store.current.provider_message_id == "quo-message-resent"
-    assert client.tool_calls() == ["send_message", "list_messages", "send_message"]
-    assert staff_warning.calls == []
+    assert result.phase is DeliveryPhase.TERMINAL
+    assert store.current.state is ActionState.DEFINITIVE_FAILED
+    assert store.current.provider_message_id is None
+    assert client.tool_calls().count("send_message") == 1
+    assert "list_messages_page" in client.tool_calls()
+    assert len(staff_warning.calls) == 1
 
 
 @pytest.mark.asyncio

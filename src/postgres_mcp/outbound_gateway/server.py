@@ -672,7 +672,7 @@ def quo_server_config() -> McpServerConfig:
         url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
         transport="sse",
         headers=_bearer_headers("QUO_MCP_TOKEN"),
-        allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
+        allowed_tools=frozenset({"send_message", "list_messages", "get_message", "list_messages_page"}),
         timeout_seconds=QUO_PROVIDER_TIMEOUT_SECONDS,
     )
 

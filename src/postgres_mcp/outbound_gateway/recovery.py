@@ -479,6 +479,8 @@ class ActionRecovery:
                 ProviderDisposition.AMBIGUOUS,
                 "retry_budget_exhausted_final_check",
                 provider_request_ref=claimed.provider_request_ref,
+                message_id=claimed.provider_message_id,
+                dispatch_started_at=claimed.dispatch_started_at,
             ),
         )
         if observation.disposition is ProviderDisposition.ACCEPTED:
@@ -541,6 +543,8 @@ class ActionRecovery:
                 ProviderDisposition.AMBIGUOUS,
                 "prior_dispatch_ambiguous",
                 provider_request_ref=reconciling.provider_request_ref,
+                message_id=reconciling.provider_message_id,
+                dispatch_started_at=reconciling.dispatch_started_at,
             ),
         )
         return await self._finish_observation(reconciling, context, adapter, observation)
@@ -601,6 +605,8 @@ class ActionRecovery:
                 ProviderDisposition.AMBIGUOUS,
                 "prior_dispatch_ambiguous",
                 provider_request_ref=action.provider_request_ref,
+                message_id=action.provider_message_id,
+                dispatch_started_at=action.dispatch_started_at,
             ),
         )
         if observation.disposition is ProviderDisposition.PENDING:
