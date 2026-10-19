@@ -285,6 +285,10 @@ def write_attestation(directory: Path, record: Attestation) -> Path:
 def record_command(args: argparse.Namespace) -> int:
     """Attest the tree a green tier just ran over."""
     root = repository_root()
+    tree = tree_of("HEAD", cwd=root)
+    if args.tree and tree != args.tree:
+        print("landing gate: tree changed during the test run; recording nothing", file=sys.stderr)
+        return REFUSED
     dirt = working_tree_dirt(cwd=root)
     if dirt:
         print(
@@ -293,7 +297,7 @@ def record_command(args: argparse.Namespace) -> int:
         )
         return ALLOWED
     record = Attestation(
-        tree=tree_of("HEAD", cwd=root),
+        tree=tree,
         tier=args.tier,
         scope=args.scope,
         commit=git("rev-parse", "HEAD", cwd=root),
@@ -356,9 +360,8 @@ def install_command(args: argparse.Namespace) -> int:
     a relative value into an absolute path under whichever checkout the
     session started in -- a maintenance worktree that is later reaped, leaving
     git no hook to run. The common directory is git's default and the one that
-    setup names, so the gate survives it. The hook still judges with the
-    pushing worktree's own `scripts/merge_gate.py` and is inert where that
-    does not exist.
+    setup names, so the gate survives it. The installed gate is copied beside the hook, independent of the
+    pushing checkout. Reinstall after changing the gate or hook.
     """
     root = repository_root()
     source = root / HOOKS_PATH / "pre-push"
@@ -381,6 +384,7 @@ def install_command(args: argparse.Namespace) -> int:
         )
         return UNUSABLE
     target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / "scripts" / "merge_gate.py", target.parent / "postgres-mcp-merge-gate.py")
     shutil.copy2(source, target)
     git("config", "--local", "core.hooksPath", str(target.parent.resolve()), cwd=root)
     print(f"landing gate: installed {target}")
@@ -395,6 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--tier", required=True)
     record.add_argument("--scope", required=True)
     record.add_argument("--run-id", default="")
+    record.add_argument("--tree", default="", help="tree captured before running tests")
     record.set_defaults(handler=record_command)
 
     pre_push = commands.add_parser("pre-push", help="judge a push (git pre-push hook)")
