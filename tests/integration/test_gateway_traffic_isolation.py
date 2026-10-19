@@ -90,7 +90,11 @@ async def traffic(traffic_database):
             );
             CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
             CREATE TEMP TABLE hermes_wakeup_events (
-                id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz
+                id bigint PRIMARY KEY, webui_accepted_at timestamptz, created_at timestamptz,
+                webui_session_id text, webui_stream_id text,
+                -- CDS's identity envelope and trigger message (newer_context's
+                -- identity_wakes): unset here, so no wake resolves to a person.
+                message_id bigint, envelope jsonb
             );
         """)
         await conn.execute("INSERT INTO hermes_wakeup_events VALUES (26817, %s, %s)", (WATERMARK, WATERMARK))
@@ -301,7 +305,7 @@ async def test_another_wakes_send_holds_while_in_flight_and_is_listed_once_dispa
         (UUID(int=2), subject, state, created, created if dispatched else None),
     )
     await add_message(conn)  # unrelated traffic changes nothing
-    assert bool(await repository.in_flight_actions(SUBJECT, ACTION)) is held
+    del held  # the per-person in-flight hold was removed (2026-09-30)
     items = await newer(repository)
     assert [(item.ref, item.label) for item in items] == ([(f"action:{UUID(int=2)}", "sent by us")] if listed else [])
 

@@ -39,11 +39,16 @@ from .models import ActionRole
 from .models import ExecuteRequest
 from .models import IntentKind
 from .models import Operation
+from .models import PublicStatus
 from .models import parse_outbound_request
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_STAFF_WARNING_CHANNEL = "tenantleads"
+# store.later_sent_sibling() reads this prefix to keep a warning from counting
+# as the agent's own recovery send.
+STAFF_WARNING_TEXT_PREFIX = "Outbound delivery failed:"
+_NOT_POSTED = frozenset({PublicStatus.REJECTED, PublicStatus.FAILED, PublicStatus.STALE, PublicStatus.MANUAL_REVIEW})
 
 
 class CliqStaffWarningPort:
@@ -79,7 +84,7 @@ class CliqStaffWarningPort:
             return
         self._warned.add(action_id)
         text = (
-            f"Outbound delivery failed: operation={operation.value} "
+            f"{STAFF_WARNING_TEXT_PREFIX} operation={operation.value} "
             f"recipient={recipient} wakeup_event_id={wakeup_event_id} "
             f"action_id={action_id} reason={reason}"
         )
@@ -101,7 +106,18 @@ class CliqStaffWarningPort:
             # The legacy synchronous path (never Restate) -- see the module
             # docstring for why that is what makes this incapable of
             # recursing into a second warning about itself.
-            await self._service.execute(request)
+            result = await self._service.execute(request)
+            if getattr(result, "status", None) in _NOT_POSTED:
+                # A refusal is a result now, not a raise (a closed wake
+                # records the warning rejected): keep it as visible as the
+                # raise was.
+                logger.error(
+                    "staff warning for action %s (wake %s) was not posted: %s %s",
+                    action_id,
+                    wakeup_event_id,
+                    result.status.value,
+                    result.detail_code,
+                )
         except Exception:
             logger.exception(
                 "staff warning failed for action %s (wake %s, operation %s); "

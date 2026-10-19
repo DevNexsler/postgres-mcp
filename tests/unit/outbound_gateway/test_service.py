@@ -14,6 +14,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from types import MappingProxyType
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
@@ -47,11 +48,13 @@ from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.provider_client import McpProviderClient
 from postgres_mcp.outbound_gateway.provider_client import McpServerConfig
+from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from postgres_mcp.outbound_gateway.tenantcloud_shared import tenantcloud_persisted_arguments
-from postgres_mcp.outbound_gateway.traffic_control import InFlightAction
+
+from .test_stale_context_confirm import SqlError
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -303,6 +306,18 @@ class FakeStore:
             next_attempt_at=NOW + timedelta(seconds=delay_seconds),
         )
         return self.current
+
+    async def reject(self, action_id, expected_state, detail_code, error_detail):
+        """Comm-Data-Store reject_outbound_action: a row still in
+        expected_state (received/dependency_wait) -> rejected with its
+        reason; anything else comes back unchanged."""
+        self.calls.append(("reject", detail_code, error_detail))
+        if self.current.state is expected_state and expected_state in {ActionState.RECEIVED, ActionState.DEPENDENCY_WAIT}:
+            self.current = replace(self.current, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail)
+        return self.current
+
+    async def successor(self, action_id):
+        return None
 
     async def get(self, action_id):
         return self.current if self.current and self.current.action_id == action_id else None
@@ -1413,10 +1428,11 @@ async def test_tenantcloud_message_send_404_says_the_thread_does_not_exist_and_t
 
     assert result.status is PublicStatus.FAILED
     assert store.current.state is ActionState.DEFINITIVE_FAILED
-    assert result.detail == (
+    assert result.detail.startswith(
         "TenantCloud has no messenger thread 555 (a lead id is not a thread id). If this lead has no "
-        "thread, reply with email.send to the lead's email instead."
+        "thread, reply with email.send to the lead's email instead. "
     )
+    assert result.override is not None and result.override.action_id == result.action_id
 
 
 @pytest.mark.asyncio
@@ -1494,7 +1510,8 @@ async def test_an_unrelated_tenantcloud_rejection_keeps_the_ordinary_detail():
     result = await svc.execute(request())
 
     assert result.status is PublicStatus.FAILED
-    assert result.detail is None
+    assert result.detail.startswith("Not sent: tenantcloud_provider_rejected. ")
+    assert "messenger thread" not in (result.detail or "")
 
 
 @pytest.mark.asyncio
@@ -1920,7 +1937,7 @@ async def test_worker_terminalizes_context_that_can_no_longer_be_derived():
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
     assert any(call[0] == "transition" and call[2] is ActionState.DEAD_LETTER for call in store.calls)
-    assert result.detail == "wakeup event does not exist"
+    assert result.detail.startswith("wakeup event does not exist. ")
 
 
 @pytest.mark.asyncio
@@ -2033,7 +2050,7 @@ async def test_exhaust_parks_in_manual_review_carrying_the_real_reload_reason():
     assert result.status is PublicStatus.MANUAL_REVIEW
     assert store.current.state is ActionState.MANUAL_REVIEW
     assert adapter.calls == []
-    assert result.detail == "wakeup event does not exist"
+    assert result.detail.startswith("wakeup event does not exist. ")
 
 
 def _accepted_observation() -> ProviderObservation:
@@ -2048,79 +2065,26 @@ def _accepted_observation() -> ProviderObservation:
 
 
 @pytest.mark.asyncio
-async def test_traffic_control_enforce_defers_lease_held_instead_of_terminalizing():
-    """Important 6: a lease block is inherently short-lived -- the other
-    in-flight action will reach a terminal state on its own -- unlike a
-    stale-context block, which needs a conscious agent decision. A
-    deterministic action_id plus a terminal DEFINITIVE_FAILED meant a
-    seconds-long lease overlap would brick that resend forever, since
-    override never bypasses a lease (only staleness). So enforce+lease_held
-    must defer: no claim()/definitive_fail() at all, the row stays exactly
-    where prepare() (the same call _preflight()'s READY branch uses) left
-    it -- non-terminal and worker-visible, so the worker's next resume()
-    (PREPARED is in worker.py's list_work -> resume() routing) re-runs this
-    same gate and self-heals once the lease clears.
-
-    FakeStore() with no initial row means create_or_load() lands on a
-    fresh RECEIVED row (row()'s default state) -- claim_outbound_action's
-    live whitelist excludes 'received' (migrations/
-    068_outbound_gateway_observability.sql:156-159), so this also exercises
-    the RECEIVED regression: the gate still moves the row through
-    prepare() first (to reach a worker-visible state), it just never goes
-    on to claim()/definitive_fail() for a lease_held verdict."""
-    store = FakeStore()
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="Friday works for us too.",
-            )
-        ]
+@pytest.mark.parametrize("entry", ["execute", "resume"])
+async def test_another_wakes_uncertain_send_never_holds_this_action(entry):
+    """2026-09-30: an uncertain quo.sms.send (action b78d5668) held a
+    calendar update 22 min and a staff Cliq post 9.5 min for the same person.
+    There is no per-person hold any more: this action goes out on its own;
+    a newer send the agent has not seen is the stale-context question."""
+    store = FakeStore() if entry == "execute" else FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
+    adapter = FakeAdapter(_accepted_observation())
+    uncertain_sms = SimpleNamespace(
+        action_id=uuid4(), operation="quo.sms.send", state="unknown", created_at=NOW, preview="Hi Carol"
     )
+    probe = FakeProbe(in_flight=[uncertain_sms])
+    gateway = service(store, adapter, traffic_mode="enforce", traffic_probe=probe)
 
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
+    result = await (gateway.execute(request()) if entry == "execute" else gateway.resume(ACTION_ID))
 
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "lease_held"
-    assert result.detail is not None
-    assert "Friday works for us too." in result.detail
-    assert [call[0] for call in store.calls] == ["create", "prepare"]
-    assert store.current.state is ActionState.PREPARED
-    assert adapter.calls == []
-
-
-@pytest.mark.asyncio
-async def test_resume_enforce_defers_lease_held_on_an_already_prepared_action():
-    """Same Important 6 behavior, but from resume() on an action that was
-    already PREPARED (no RECEIVED->prepare() dance involved at all --
-    claimable is just the action as-is, so this proves the defer applies
-    independent of the RECEIVED special case)."""
-    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID))
-    adapter = FakeAdapter()
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="Friday works for us too.",
-            )
-        ]
-    )
-
-    result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).resume(ACTION_ID)
-
-    assert result.status is PublicStatus.PENDING
-    assert result.detail_code == "lease_held"
-    assert result.detail is not None
-    assert not any(call[0] in ("claim", "definitive_fail") for call in store.calls)
-    assert store.current.state is ActionState.PREPARED
-    assert adapter.calls == []
+    assert result.status is PublicStatus.SENT
+    assert result.detail_code != "lease_held"
+    assert adapter.calls
+    assert not any(call[0] == "in_flight" for call in probe.calls)
 
 
 @pytest.mark.asyncio
@@ -2197,38 +2161,12 @@ async def test_traffic_control_shadow_logs_and_dispatches(caplog):
 async def test_traffic_control_off_never_calls_probe():
     store = FakeStore()
     adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(
-        in_flight=[
-            InFlightAction(
-                action_id=uuid4(),
-                operation="email.send",
-                state="dispatching",
-                created_at=NOW,
-                preview="would block if consulted",
-            )
-        ]
-    )
+    probe = FakeProbe()
 
     result = await service(store, adapter, traffic_mode="off", traffic_probe=probe).execute(request())
 
     assert result.status is PublicStatus.SENT
     assert probe.calls == []
-
-
-@pytest.mark.asyncio
-async def test_traffic_control_fails_open_and_dispatches_on_probe_error(caplog):
-    store = FakeStore()
-    adapter = FakeAdapter(_accepted_observation())
-    probe = FakeProbe(raise_on_in_flight=True)
-
-    with caplog.at_level(logging.WARNING):
-        result = await service(store, adapter, traffic_mode="enforce", traffic_probe=probe).execute(request())
-
-    assert result.status is PublicStatus.SENT
-    assert adapter.calls
-    assert not any(call[0] == "definitive_fail" for call in store.calls)
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("traffic control" in message for message in messages)
 
 
 def test_traffic_mode_rejects_unknown_value():
@@ -2388,12 +2326,26 @@ async def test_resume_swallows_post_dispatch_exception_and_returns_durable_row_s
 def _assert_not_sent(result, adapter, caplog, error_type):
     assert result.status is PublicStatus.FAILED
     assert result.detail_code == "gateway_internal_error"
-    assert result.detail.startswith("Not sent: the gateway hit an internal error before sending")
-    assert f"({error_type}: " in result.detail
+    assert result.detail.startswith("Not sent: the gateway hit an error before sending")
+    assert f"({error_type}" in result.detail
     assert "Nothing went out. Execute the same request again to retry, or record needs_human." in result.detail
     assert ("invoke",) not in adapter.calls
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("pre-send exception" in m and str(ACTION_ID) in m for m in errors)
+    assert any("error before any send" in m and str(ACTION_ID) in m for m in errors)
+
+
+def _assert_refused(result, store, adapter, error_type, detail_code="gateway_error"):
+    """An error before the row was prepared ends it rejected, with the
+    error's words and the override that still sends it -- never a
+    `received` row nothing picks up again."""
+    assert result.status is PublicStatus.REJECTED
+    assert result.detail_code == detail_code
+    assert store.current.state is ActionState.REJECTED
+    assert result.detail.startswith(f"Not sent: {error_type}")
+    assert OVERRIDE_RULE in result.detail
+    assert result.override is not None
+    assert (result.override.op, result.override.decision, result.override.action_id) == ("confirm", "yes", ACTION_ID)
+    assert ("invoke",) not in adapter.calls
 
 
 @pytest.mark.asyncio
@@ -2406,9 +2358,10 @@ async def test_an_evidence_loading_error_is_reported_not_sent(caplog):
     with caplog.at_level(logging.ERROR):
         result = await svc.execute(request())
 
-    _assert_not_sent(result, adapter, caplog, "TypeError")
-    assert store.current.state is ActionState.RECEIVED
+    _assert_refused(result, store, adapter, "TypeError: ")
     assert not any(call[0] == "schedule" for call in store.calls)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("error before any send" in m and str(ACTION_ID) in m for m in errors)
 
 
 @pytest.mark.asyncio
@@ -2426,8 +2379,7 @@ async def test_a_preflight_error_is_reported_not_sent(caplog):
     ):
         result = await svc.execute(request())
 
-    _assert_not_sent(result, adapter, caplog, "AttributeError")
-    assert store.current.state is ActionState.RECEIVED
+    _assert_refused(result, store, adapter, "AttributeError: ")
 
 
 def _accepted(ref="req-1"):
@@ -2442,7 +2394,9 @@ def _accepted(ref="req-1"):
 
 
 @pytest.mark.asyncio
-async def test_an_evidence_error_then_the_same_request_again_sends_once(caplog):
+async def test_an_evidence_error_then_the_same_request_again_is_the_same_refusal(caplog):
+    """The identical request is the same action: it reports the refusal
+    again and never sends; sending it anyway is the override (op confirm)."""
     store = FakeStore()
     adapter = FakeAdapter(_accepted())
     svc = service(store, adapter)
@@ -2450,13 +2404,11 @@ async def test_an_evidence_error_then_the_same_request_again_sends_once(caplog):
 
     with caplog.at_level(logging.ERROR):
         first = await svc.execute(request())
-        _assert_not_sent(first, adapter, caplog, "TypeError")
-        assert store.current.state is ActionState.RECEIVED
+        _assert_refused(first, store, adapter, "TypeError: ")
         second = await svc.execute(request())
 
-    assert second.status is PublicStatus.SENT
-    assert second.action_id == first.action_id
-    assert adapter.calls.count(("invoke",)) == 1
+    assert (second.status, second.action_id, second.override) == (PublicStatus.REJECTED, first.action_id, first.override)
+    assert ("invoke",) not in adapter.calls
 
 
 @pytest.mark.asyncio
@@ -2489,19 +2441,48 @@ async def test_a_request_build_error_goes_back_to_retry_ready_and_the_same_reque
 
 
 @pytest.mark.asyncio
-async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left_for_the_worker(caplog):
+@pytest.mark.parametrize(
+    ("error", "words"),
+    [
+        (TypeError("boom"), "TypeError: boom"),
+        (SqlError("canceling statement due to statement timeout", "57014"), "canceling statement"),
+        (ConnectionResetError("reset"), "ConnectionResetError: reset"),
+    ],
+    ids=["fault", "statement_timeout", "connection_reset"],
+)
+async def test_a_worker_resume_error_before_the_provider_call_is_logged_and_left_for_the_worker(caplog, error, words):
+    """Nobody is waiting on a background resume: anything but a refusal
+    leaves the row as it was, for Restate's next advance (or the worker's
+    next cycle) under the same retry ceiling. Ending it would strand a send
+    that a retry seconds later would have made."""
     store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
     adapter = FakeAdapter()
     svc = service(store, adapter)
-    svc._evidence_loader.load.side_effect = TypeError("boom")
+    svc._evidence_loader.load.side_effect = error
 
     with caplog.at_level(logging.ERROR):
         result = await svc.resume(ACTION_ID)
 
-    _assert_not_sent(result, adapter, caplog, "TypeError")
+    _assert_not_sent(result, adapter, caplog, words)
     # Claimed (one attempt spent), still listed by the worker.
     assert store.current.state is ActionState.DEPENDENCY_WAIT
     assert [call[0] for call in store.calls] == ["claim"]
+
+
+@pytest.mark.asyncio
+async def test_a_worker_resume_refusal_before_the_provider_call_ends_the_waiting_row_rejected(caplog):
+    """A refusal fails the same way every time: the waiting row is ended as
+    a recorded refusal, and Restate stops on it (rejected is terminal)."""
+    store = FakeStore(row(ActionState.DEPENDENCY_WAIT, action_uid=None))
+    adapter = FakeAdapter()
+    svc = service(store, adapter)
+    store.prepare = AsyncMock(side_effect=SqlError("canonical outbound-action key resolves to multiple durable actions", "22023"))
+
+    with caplog.at_level(logging.ERROR):
+        result = await svc.resume(ACTION_ID)
+
+    _assert_refused(result, store, adapter, "canonical outbound-action key resolves", detail_code="gateway_refused")
+    assert [call[0] for call in store.calls] == ["claim", "reject"]
 
 
 @pytest.mark.asyncio
@@ -2577,7 +2558,7 @@ async def test_a_later_action_of_the_same_role_carries_its_own_identity():
     assert result.status is PublicStatus.SENT
     assert result.action_id == later
     assert store.calls[0] == ("create", ACTION_ID)
-    assert probe.calls[0] == ("in_flight", "prospect:amanda", later)
+    assert probe.calls[0] == ("newer_context", "prospect:amanda", later)
     assert probe.calls[-1][-1] == later
 
 

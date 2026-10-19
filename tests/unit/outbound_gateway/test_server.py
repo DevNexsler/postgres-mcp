@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 from starlette.testclient import TestClient
 
 from postgres_mcp.outbound_gateway.adapters.tenantcloud import TenantCloudAdapter
@@ -17,12 +18,14 @@ from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicResult
 from postgres_mcp.outbound_gateway.models import PublicStatus
+from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
 from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import TENANTCLOUD_ORIGIN
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
+from postgres_mcp.outbound_gateway.server import _quo_sending_lines
 from postgres_mcp.outbound_gateway.server import _reject_tenantcloud_origin_overrides
 from postgres_mcp.outbound_gateway.server import _tenantcloud_adapters
 from postgres_mcp.outbound_gateway.server import _tenantcloud_enabled
@@ -50,6 +53,34 @@ def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):
     assert _bearer_headers("QUO_MCP_TOKEN") == {}
     monkeypatch.setenv("QUO_MCP_TOKEN", "provider-secret")
     assert _bearer_headers("QUO_MCP_TOKEN") == {"Authorization": "Bearer provider-secret"}
+
+
+def test_quo_sending_lines_are_config_keyed_on_the_number_from_phone_names(monkeypatch):
+    """OUTBOUND_QUO_SENDING_LINES_JSON is the only source of a sending line;
+    unset, there are none (CDS's compose sets PFG-General, Collections and
+    Maintenance)."""
+    monkeypatch.delenv("OUTBOUND_QUO_SENDING_LINES_JSON", raising=False)
+    assert _quo_sending_lines() == {}
+    monkeypatch.setenv(
+        "OUTBOUND_QUO_SENDING_LINES_JSON",
+        '{" +16107095575 ": "PN8ujudrpa", "+17579972130": " PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}',
+    )
+    assert _quo_sending_lines() == {"+16107095575": "PN8ujudrpa", "+17579972130": "PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "words"),
+    [
+        ("{not json", "Expecting property name"),
+        ('["+16107095575"]', "must be a JSON string-to-string object"),
+        ('{"6107095575": "PN8ujudrpa"}', "keys must be E.164 phone numbers"),
+        ('{"+16107095575": "  "}', "values must be Quo phone_number_ids"),
+    ],
+)
+def test_malformed_quo_sending_lines_stop_the_gateway_at_start(monkeypatch, raw, words):
+    monkeypatch.setenv("OUTBOUND_QUO_SENDING_LINES_JSON", raw)
+    with pytest.raises(ValueError, match=words):
+        _quo_sending_lines()
 
 
 def public(status=PublicStatus.SENT, detail="provider_receipt_verified"):
@@ -141,8 +172,9 @@ async def test_execute_and_status_delegate_only_after_strict_json_validation():
     assert status["status"] == "unknown"
     service.execute.assert_awaited_once()
     service.status.assert_awaited_once_with(ACTION_ID)
-    with pytest.raises(ValueError, match="invalid outbound action request"):
-        await handle_outbound_action(service, policy, {**execute_payload(), "recipient": "attacker@example.com"})
+    rejected = await handle_outbound_action(service, policy, {**execute_payload(), "recipient": "attacker@example.com"})
+    assert (rejected["status"], rejected["detail_code"]) == ("rejected", "invalid_request")
+    service.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -248,13 +280,40 @@ async def test_validation_error_names_field_and_values():
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
     bad = {**execute_payload(), "action_role": "bogus_role"}
 
-    with pytest.raises(ValueError) as exc:
-        await handle_outbound_action(service, policy, bad)
+    result = await handle_outbound_action(service, policy, bad)
 
-    msg = str(exc.value)
+    msg = result["detail"]
     assert "action_role" in msg
     for role in ActionRole:
         assert role.value in msg
+
+
+@pytest.mark.asyncio
+async def test_malformed_requests_are_rejected_results_not_mcp_tool_errors():
+    """hermes-agent counts every MCP tool error toward a 3-strike breaker that
+    parks the whole server (#3264). A client's malformed arguments are the
+    caller's mistake, not a gateway failure: the tool must answer them as an
+    ordinary result that names the field, so three in a row leave the server
+    connected for every other caller."""
+    service = AsyncMock()
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+    malformed = [
+        {**execute_payload(), "arguments": {**execute_payload()["arguments"], "reply_to": 5}},
+        {key: value for key, value in execute_payload().items() if key != "action_role"},
+        {key: value for key, value in execute_payload().items() if key != "intent_kind"},
+    ]
+
+    async with create_connected_server_and_client_session(mcp) as client:
+        results = [await client.call_tool("outbound_action", {"request": request}) for request in malformed]
+
+    assert [result.isError for result in results] == [False, False, False]
+    bodies = [result.structuredContent or {} for result in results]
+    assert [(body["status"], body["detail_code"]) for body in bodies] == [("rejected", "invalid_request")] * 3
+    assert "execute.reply_to: Extra inputs are not permitted" in bodies[0]["detail"]
+    assert "execute.action_role: Field required" in bodies[1]["detail"]
+    assert "execute.intent_kind: Field required" in bodies[2]["detail"]
+    assert all("Nothing was sent" in body["detail"] for body in bodies)
+    assert service.mock_calls == []
 
 
 @pytest.mark.asyncio
@@ -370,7 +429,30 @@ def test_focused_server_tool_description_teaches_the_stale_context_confirm_answe
     assert "needs_confirmation" in description
     assert '"op": "confirm"' in description
     assert '"yes"|"no"|"revise"' in description
-    assert "override" not in description.casefold()
+
+
+def test_focused_server_tool_description_names_the_override_only_as_op_confirm_and_never_another_route():
+    """Wake 27138 was told "resend with override=true"; that call could not
+    work and the agent sent through the provider directly. The override is
+    taught only as the op confirm request, in the same breath as "never send
+    through any other tool or route" -- never as a flag on execute."""
+    service = AsyncMock()
+    mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
+
+    description = next(tool for tool in mcp._tool_manager.list_tools() if tool.name == "outbound_action").description or ""
+
+    lowered = description.casefold()
+    assert "override=true" not in lowered and '"override": true' not in lowered
+    # The one override rule, word for word as Comm-Data-Store teaches it.
+    assert OVERRIDE_RULE in description
+    # The request is the result's own override object (it carries the
+    # wakeup_event_id confirm requires), plus the agent's reason.
+    assert 'send that object back as the outbound_action request, adding "reason"' in OVERRIDE_RULE
+    never = "Never send through another tool or route."
+    assert OVERRIDE_RULE.endswith(never)
+    # Every mention of override comes before, and ends with, the
+    # never-another-route rule.
+    assert description.rindex("override") < description.index(never)
 
 
 @pytest.mark.asyncio

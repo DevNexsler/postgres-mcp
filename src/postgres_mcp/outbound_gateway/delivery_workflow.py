@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
@@ -37,6 +38,7 @@ from urllib.request import Request
 from urllib.request import build_opener
 from uuid import UUID
 
+from .errors import GATEWAY_INTERNAL_ERROR
 from .idempotency_policy import reinvoke_safety
 from .models import ActionState
 from .models import Operation
@@ -47,8 +49,11 @@ from .retry_policy import RETRY_CEILING_SECONDS
 from .retry_policy import NoopStaffWarningPort
 from .retry_policy import StaffWarningPort
 from .retry_policy import ceiling_exceeded
+from .retry_policy import elapsed_step_backoff_seconds
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
+
+logger = logging.getLogger(__name__)
 
 _RECIPIENT_ARGUMENT_KEYS = (
     "to_address",
@@ -94,17 +99,33 @@ class DeliveryResult:
     phase: DeliveryPhase
     detail_code: str
     retry_after_seconds: int = 0
+    # Set on a TERMINAL failure that owes staff a warning: the workflow waits
+    # STAFF_WARNING_GRACE_SECONDS, then calls warn_unless_recovered().
+    staff_warning: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        outcome: dict[str, object] = {
             "phase": self.phase.value,
             "detail_code": self.detail_code,
             "retry_after_seconds": self.retry_after_seconds,
         }
+        if self.staff_warning:
+            outcome["staff_warning"] = True
+        return outcome
+
+
+# How long a failed action waits before its staff warning. The agent gets the
+# failure in its own tool result and usually fixes it within the same turn
+# (wake 28410, 2026-10-14: a wrong Cliq chat id, resent to the right one 90 s
+# later). A warning posted at the moment of failure reported a problem that
+# was already solved.
+STAFF_WARNING_GRACE_SECONDS = 300
 
 
 class DeliveryStore(Protocol):
     async def get(self, action_id: UUID) -> Any: ...
+
+    async def later_sent_sibling(self, action_id: UUID) -> UUID | None: ...
 
 
 class DeliveryService(Protocol):
@@ -177,6 +198,7 @@ class OutboundDeliveryCoordinator:
         operations: frozenset[Operation] | None = None,
         context_wait_ceiling_seconds: int = RETRY_CEILING_SECONDS,
         staff_warning: StaffWarningPort | None = None,
+        staff_warning_grace_seconds: int = STAFF_WARNING_GRACE_SECONDS,
     ) -> None:
         self._store = store
         self._service = service
@@ -196,6 +218,7 @@ class OutboundDeliveryCoordinator:
         # staff_warning.CliqStaffWarningPort(service). See retry_policy.py's
         # StaffWarningPort docstring for the exactly-one-per-action contract.
         self._staff_warning = staff_warning or NoopStaffWarningPort()
+        self.staff_warning_grace_seconds = max(1, staff_warning_grace_seconds)
         # NOT read by advance() (see its body): retry_policy.py's elapsed-time
         # ceiling (context_wait_ceiling_seconds, above) is the one budget for
         # every operation this coordinator serves, including the ambiguous-
@@ -238,7 +261,14 @@ class OutboundDeliveryCoordinator:
         if action.state not in (_AMBIGUOUS_STATES | _RESUMABLE_STATES):
             return DeliveryResult(DeliveryPhase.WAIT, "action_not_prepared", 5)
 
-        auth = await self._auth.ensure_ready()
+        # Only TenantCloud operations need a TenantCloud login. Gating every
+        # Restate-routed send on it parked Cliq/email/SMS replies for 300 s
+        # whenever TenantCloud reported login_required (action c6d15f16).
+        auth = (
+            await self._auth.ensure_ready()
+            if action.operation in TENANTCLOUD_OPERATIONS
+            else AuthResult(AuthState.READY)
+        )
         if auth.state is not AuthState.READY:
             default_delay = {
                 AuthState.LOGIN_REQUIRED: 300,
@@ -252,48 +282,48 @@ class OutboundDeliveryCoordinator:
                 max(1, auth.retry_after_seconds or default_delay),
             )
 
+        # retry_policy.py owns every retry/backoff/ceiling decision for every
+        # action this coordinator advances (by construction, only operations
+        # in ``self._operations`` -- Restate-routed ones). attempt_count is
+        # never read here: the legacy worker's 5/12 attempt caps
+        # (``self._max_attempts`` / ``self._max_ambiguous_attempts``, kept
+        # only for the non-Restate path in worker.py/service.py) do not apply
+        # once an operation is on Restate -- a send that answers slowly a
+        # handful of times must not get a smaller effective budget than one
+        # that answers instantly every time (see retry_policy.py's module
+        # docstring). The one ceiling is elapsed wall-clock time since the
+        # action's own created_at, bounded at
+        # ``self._context_wait_ceiling_seconds`` (RETRY_CEILING_SECONDS, one
+        # hour, by default). None (a hand-built record, or a store that
+        # predates created_at) is treated as "just created" -- same
+        # convention as service.py's TenantCloud auth-wait ceiling anchor.
+        action_created_at = getattr(action, "created_at", None)
+        elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
+        exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
         if action.state is ActionState.RECEIVED:
-            result = await self._service.prepare(action_id)
-            if (
-                result.status is PublicStatus.PENDING
-                and getattr(result, "detail", None) in _CONTEXT_WAIT_DETAILS
-            ):
-                return DeliveryResult(
-                    DeliveryPhase.WAIT,
-                    result.detail,
-                    300,
-                )
+            # A received row past the ceiling was never prepared: exhaust()
+            # ends it rejected (nothing was sent) instead of preparing again.
+            result = await self._service.exhaust(action_id) if exhausted else await self._service.prepare(action_id)
+            if result.status is PublicStatus.PENDING and result.detail_code in _CONTEXT_WAIT_DETAILS:
+                return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, CONTEXT_RELOAD_WAIT_SECONDS)
+        elif action.state in _AMBIGUOUS_STATES:
+            result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
+        elif exhausted:
+            result = await self._service.exhaust(action_id)
         else:
-            # retry_policy.py owns every retry/backoff/ceiling decision for
-            # every action this coordinator advances (by construction, only
-            # operations in ``self._operations`` -- Restate-routed ones).
-            # attempt_count is never read here: the legacy worker's 5/12
-            # attempt caps (``self._max_attempts`` / ``self._max_ambiguous_attempts``,
-            # kept only for the non-Restate path in worker.py/service.py) do
-            # not apply once an operation is on Restate -- a send that answers
-            # slowly a handful of times must not get a smaller effective
-            # budget than one that answers instantly every time (see
-            # retry_policy.py's module docstring). The one ceiling is
-            # elapsed wall-clock time since the action's own created_at,
-            # bounded at ``self._context_wait_ceiling_seconds``
-            # (RETRY_CEILING_SECONDS, one hour, by default).
-            action_created_at = getattr(action, "created_at", None)
-            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
-            exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
-            if action.state in _AMBIGUOUS_STATES:
-                result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
-            elif exhausted:
-                result = await self._service.exhaust(action_id)
-            else:
-                result = await self._service.resume(action_id)
+            result = await self._service.resume(action_id)
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
+        if result.status is PublicStatus.FAILED and result.detail_code == GATEWAY_INTERNAL_ERROR:
+            # A step failed before any send and left the row as it was
+            # (service._settled ends a row in the background only for a
+            # refusal): a passing database error, most often. Ending the
+            # workflow here would leave that row with nobody to advance it
+            # -- every resubmission answers 409 for the retention window.
+            # Wait and try again under the same elapsed ceiling, which ends
+            # it (definitive_failed, or rejected if it was never prepared).
+            return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, elapsed_step_backoff_seconds(elapsed))
         if result.status is PublicStatus.MANUAL_REVIEW:
-            # None (a hand-built record, or a store that predates
-            # created_at) is treated as "just created" -- same convention
-            # as service.py's TenantCloud auth-wait ceiling anchor.
-            action_created_at = getattr(action, "created_at", None)
-            elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
             wait_detail = result.detail_code if result.detail_code in _CONTEXT_WAIT_DETAILS else getattr(result, "detail", None)
             if wait_detail in _CONTEXT_WAIT_DETAILS and should_wait_for_context_reload(
                 wait_detail,
@@ -314,25 +344,45 @@ class OutboundDeliveryCoordinator:
             PublicStatus.STALE,
             PublicStatus.MANUAL_REVIEW,
         }:
-            if result.status is not PublicStatus.STALE:
-                # STALE is a deliberate no-send (freshness preflight), never a
-                # failure -- see PublicStatus's own docstring -- so it never
-                # warns. Everything else here is the workflow giving up for
-                # good: a definitive provider rejection, or retry_policy's
-                # ceiling. Exactly one warning per action (warn_once is keyed
-                # on action_id; see StaffWarningPort's docstring for the
-                # coarser wake-scoped grain the current action-id derivation
-                # actually gives it).
-                await self._staff_warning.warn_once(
-                    action_id,
-                    getattr(action, "action_uid", None),
-                    result.detail_code,
-                    wakeup_event_id=getattr(action, "wakeup_event_id", 0),
-                    operation=action.operation,
-                    recipient=_best_effort_recipient(getattr(action, "arguments", None)),
-                )
-            return DeliveryResult(DeliveryPhase.TERMINAL, result.detail_code)
+            # STALE is a deliberate no-send (freshness preflight), never a
+            # failure -- see PublicStatus's own docstring -- so it never
+            # warns. Everything else here is the workflow giving up for good:
+            # a definitive provider rejection, or retry_policy's ceiling. The
+            # warning itself is not sent here: the workflow waits out the
+            # grace period first (warn_unless_recovered).
+            return DeliveryResult(
+                DeliveryPhase.TERMINAL,
+                result.detail_code,
+                staff_warning=result.status is not PublicStatus.STALE,
+            )
         return await self.status(action_id)
+
+    async def warn_unless_recovered(self, action_id: UUID, reason: str) -> None:
+        """Warn staff about a failed action unless a later send of the same
+        role on the same wake has gone out since. The agent sees every failure
+        in its tool result and resends; staff only need to hear about the
+        failures it did not fix. Exactly one warning per action (warn_once is
+        keyed on action_id)."""
+        action = await self._store.get(action_id)
+        if action is None:
+            return
+        try:
+            recovered_by = await self._store.later_sent_sibling(action_id)
+        except Exception:
+            # Unknown is not recovered: warn.
+            logger.exception("could not check whether action %s was recovered; warning staff", action_id)
+            recovered_by = None
+        if recovered_by is not None:
+            logger.info("action %s failed (%s) but later action %s on the same wake was sent; no staff warning", action_id, reason, recovered_by)
+            return
+        await self._staff_warning.warn_once(
+            action_id,
+            getattr(action, "action_uid", None),
+            reason,
+            wakeup_event_id=getattr(action, "wakeup_event_id", 0),
+            operation=action.operation,
+            recipient=_best_effort_recipient(getattr(action, "arguments", None)),
+        )
 
 
 class SecretAuthGate:
@@ -508,11 +558,24 @@ def build_restate_app(coordinator: OutboundDeliveryCoordinator, *, workflow_name
                 retry,
             )
             if outcome["phase"] in {DeliveryPhase.COMPLETE.value, DeliveryPhase.TERMINAL.value}:
-                return outcome
+                break
             delay = outcome.get("retry_after_seconds")
             if type(delay) is not int or delay < 1:
                 raise restate.TerminalError("invalid delivery retry delay", status_code=500)
             await ctx.sleep(timedelta(seconds=min(delay, 3600)), name=f"wait {step}")
             step += 1
+        if outcome.get("staff_warning"):
+            await ctx.sleep(
+                timedelta(seconds=coordinator.staff_warning_grace_seconds),
+                name="staff warning grace",
+            )
+            reason = str(outcome["detail_code"])
+
+            async def warn_step() -> dict[str, object]:
+                await coordinator.warn_unless_recovered(action_id, reason)
+                return {}
+
+            await ctx.run_typed("staff warning", warn_step, retry)
+        return outcome
 
     return restate.app([workflow])

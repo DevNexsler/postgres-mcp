@@ -78,7 +78,7 @@ def capture(path):
             FROM outbound_action_attempts ORDER BY created_at, attempt_id
         """).fetchall()
         snapshot["wakes"] = conn.execute("""
-            SELECT w.id, w.created_at, w.webui_accepted_at
+            SELECT w.id, w.created_at, w.webui_accepted_at, w.webui_session_id, w.webui_stream_id
             FROM hermes_wakeup_events w
             WHERE EXISTS (SELECT 1 FROM outbound_actions a WHERE a.wakeup_event_id=w.id)
         """).fetchall()
@@ -188,7 +188,10 @@ async def load_snapshot(conn, snapshot):
             id bigint PRIMARY KEY, channel_id bigint, created_at timestamptz, direction text, source text
         );
         CREATE TABLE raw_events (id bigint PRIMARY KEY, payload jsonb);
-        CREATE TABLE hermes_wakeup_events (id bigint PRIMARY KEY, created_at timestamptz, webui_accepted_at timestamptz);
+        CREATE TABLE hermes_wakeup_events (
+            id bigint PRIMARY KEY, created_at timestamptz, webui_accepted_at timestamptz,
+            webui_session_id text, webui_stream_id text
+        );
         CREATE VIEW messages AS
             SELECT m.*, m.id AS raw_event_id, 'historical message'::text AS body
             FROM message_history m, replay_clock c WHERE m.created_at<=c.at;
@@ -226,7 +229,8 @@ async def load_snapshot(conn, snapshot):
             [(m["id"], Jsonb({"data": {"object": {"from": m["sender"], "to": m["recipient"]}}})) for m in snapshot["messages"]],
         )
         await cursor.executemany(
-            "INSERT INTO hermes_wakeup_events VALUES (%s,%s,%s)", [(w["id"], w["created_at"], w["webui_accepted_at"]) for w in snapshot["wakes"]]
+            "INSERT INTO hermes_wakeup_events VALUES (%s,%s,%s,%s,%s)",
+            [(w["id"], w["created_at"], w["webui_accepted_at"], w.get("webui_session_id"), w.get("webui_stream_id")) for w in snapshot["wakes"]],
         )
     await conn.execute("ANALYZE")
 

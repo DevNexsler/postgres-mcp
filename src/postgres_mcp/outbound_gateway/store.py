@@ -4,22 +4,35 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime
 from hashlib import sha256
 from typing import Any
 from typing import Mapping
 from typing import Sequence
 from uuid import UUID
 
+from psycopg.rows import dict_row
+
 from postgres_mcp.sql import SafeSqlDriver
+from postgres_mcp.sql import SqlDriver
 
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
 from .context import ActionContext
+from .errors import ContactLockTimeoutError
+from .errors import ContactSerializationUnavailableError
+from .identity import request_arguments
 from .models import ActionRole
 from .models import ActionState
 from .models import CompletionKind
+from .models import ExecuteRequest
 from .models import Operation
+from .models import RequestRefusedError
+from .preflight import RECENTLY_ANSWERED_INTENTS
 from .service import OutboundActionRecord
+from .staff_warning import STAFF_WARNING_TEXT_PREFIX
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -62,12 +75,6 @@ def _verified_readback_evidence(value: ProviderObservation) -> Mapping[str, Any]
 # what happened and what to do next.
 _DATABASE_REFUSAL_NEXT_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"ordinary outbound action cannot attach to terminal wake \S+"),
-        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
-        "the gateway), so no new action can be recorded on it. Do not retry this request. Record "
-        "needs_human with what you meant to send, or send it from a new wake.",
-    ),
-    (
         re.compile(r"outbound action immutable context mismatch for \S+"),
         "Nothing was sent by this request: that action is already recorded with different content, "
         "and a recorded action never changes. Do not retry this request. Sending new content is a new "
@@ -79,17 +86,6 @@ _DATABASE_REFUSAL_NEXT_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
         "Nothing was sent: a wake records at most 10 actions. Record needs_human with what is still "
         "to send.",
     ),
-    (
-        re.compile(r"stale context confirmation cannot send for terminal wake \S+"),
-        "Nothing was sent: that wake is already closed (finalized, or ended by a send made outside "
-        "the gateway). Do not retry this answer. Record needs_human with what you meant to send, or "
-        "send it from a new wake.",
-    ),
-    (
-        re.compile(r"stale context already answered[^\n]*"),
-        'Nothing new was sent: the first answer stands. Check the action with op "status" to see '
-        "what it did.",
-    ),
 )
 
 
@@ -99,8 +95,61 @@ def _explain_database_refusal(error: Exception) -> Exception:
     for pattern, next_step in _DATABASE_REFUSAL_NEXT_STEPS:
         match = pattern.search(message)
         if match:
-            return ValueError(f"{match.group(0).rstrip('.')}. {next_step}")
+            return RequestRefusedError(f"{match.group(0).rstrip('.')}. {next_step}")
     return error
+
+
+# This action and its trigger message, and the action's contact keys
+# (Comm-Data-Store migration 269, docs/contact-identity-functions.md): its
+# trigger message's keys plus its own recipient's. Takes the action_id.
+_THIS_ACTION = """
+    this AS (
+        SELECT action.action_id, action.wakeup_event_id, action.created_at,
+               action.recipient_scope->>'target_id' AS target_id, wake.message_id
+        FROM outbound_actions AS action
+        LEFT JOIN hermes_wakeup_events AS wake ON wake.id = action.wakeup_event_id
+        WHERE action.action_id = {}
+    )"""
+_THIS_KEYS = """
+    keys AS (
+        SELECT ARRAY(
+            SELECT DISTINCT key.value
+            FROM (
+                SELECT k.contact_key AS value
+                FROM this CROSS JOIN LATERAL public.message_contact_keys(this.message_id) AS k
+                UNION
+                SELECT public.contact_key(this.target_id) FROM this
+            ) AS key
+            WHERE key.value IS NOT NULL
+            ORDER BY key.value
+        ) AS value
+    )"""
+# Advisory-lock namespace of a contact key (Comm-Data-Store's own advisory
+# locks hash 'prefix:' || key the same way).
+_CONTACT_LOCK_PREFIX = "outbound-contact-reply:"
+# lock_not_available (lock_timeout), deadlock_detected.
+_LOCK_WAIT_SQLSTATES = frozenset({"55P03", "40P01"})
+
+
+class _TransactionDriver:
+    """SqlDriver.execute_query on one connection inside the caller's open
+    transaction: no per-statement COMMIT, and each statement in a savepoint
+    so a failed one does not abort the transaction."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+
+    async def execute_query(self, query: Any, params: list[Any] | None = None, force_readonly: bool = False) -> list[SqlDriver.RowResult] | None:
+        del force_readonly
+        async with self.connection.transaction():
+            async with self.connection.cursor(row_factory=dict_row) as cursor:
+                if params:
+                    await cursor.execute(query, params)
+                else:
+                    await cursor.execute(query)
+                if cursor.description is None:
+                    return None
+                return [SqlDriver.RowResult(cells=dict(row)) for row in await cursor.fetchall()]
 
 
 class PostgresActionStore:
@@ -484,6 +533,55 @@ class PostgresActionStore:
             ],
         )
 
+    async def reject(
+        self,
+        action_id: UUID,
+        expected_state: ActionState,
+        detail_code: str,
+        error_detail: str,
+    ) -> OutboundActionRecord:
+        """End an action nothing started on as a recorded refusal, with its
+        reason. The database moves it only while it is still in
+        expected_state with nothing started (received, or dependency_wait),
+        and otherwise returns it unchanged -- a row another caller advanced
+        is never rejected. Comm-Data-Store migration 251."""
+        return await self._one(
+            "SELECT * FROM reject_outbound_action({}, {}, {}, {})",
+            [action_id, expected_state.value, detail_code, error_detail],
+        )
+
+    async def override(
+        self,
+        action_id: UUID,
+        *,
+        wakeup_event_id: int,
+        actor: str,
+        reason: str | None,
+        decision: str,
+    ) -> OutboundActionRecord:
+        """The agent's answer to an action that was not sent, recorded on it
+        (override_reason / override_actor / override_decided_at /
+        override_decision). yes: the successor that sends it (same request,
+        fresh action_uid, retry_of_action_id = action_id, remediation_reason
+        agent_override), minted once -- repeating it returns the same
+        successor. no: the action itself, dropped on purpose. The database
+        owns every guard (own wake, nothing sent, the per-wake cap).
+        Comm-Data-Store migration 251."""
+        return await self._one(
+            "SELECT * FROM override_outbound_action({}, {}, {}, {}, {})",
+            [action_id, wakeup_event_id, actor, reason, decision],
+        )
+
+    async def successor(self, action_id: UUID) -> OutboundActionRecord | None:
+        """The action that carries this one's send after the agent's yes
+        (retry_of_action_id is unique), if any."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "SELECT * FROM outbound_actions WHERE retry_of_action_id = {}",
+            [action_id],
+        )
+        return await self._hydrated_record(rows[0].cells) if rows else None
+
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
@@ -491,6 +589,232 @@ class PostgresActionStore:
             [action_id],
         )
         return await self._hydrated_record(rows[0].cells) if rows else None
+
+    async def later_sent_sibling(self, action_id: UUID) -> UUID | None:
+        """A completed send of the same role on the same wake, created after
+        this action failed, or None. "After it failed" (terminal_at, not
+        created_at) keeps an unrelated send queued alongside it from counting:
+        only a send the agent made once it could see the failure is a
+        recovery. Staff warnings themselves never count."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT later.action_id
+            FROM outbound_actions failed
+            JOIN outbound_actions later
+              ON later.wakeup_event_id = failed.wakeup_event_id
+             AND later.action_role = failed.action_role
+             AND later.created_at > coalesce(failed.terminal_at, failed.updated_at)
+             AND later.state = 'completed'
+             AND coalesce(later.arguments->>'text', '') NOT LIKE {}
+            WHERE failed.action_id = {}
+            ORDER BY later.created_at
+            LIMIT 1
+            """,
+            [STAFF_WARNING_TEXT_PREFIX + "%", action_id],
+        )
+        return UUID(str(rows[0].cells["action_id"])) if rows else None
+
+    async def earlier_identical_sends(self, action_id: UUID) -> list[dict[str, Any]]:
+        """Completed sends of exactly this request -- same operation, same
+        recipient, same arguments -- by any other action in the last 72 hours,
+        from any wake or scope, newest first (at most 3). A completed
+        duplicate that itself sent nothing does not count. The agent reads
+        these in a refusal before it decides whether to override it."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT earlier.action_id, earlier.wakeup_event_id, earlier.provider_message_id,
+                   coalesce(earlier.provider_accepted_at, earlier.completed_at, earlier.updated_at) AS sent_at,
+                   earlier.recipient_scope->>'target_id' AS recipient
+            FROM outbound_actions this
+            JOIN outbound_actions earlier
+              ON earlier.action_id <> this.action_id
+             AND earlier.operation = this.operation
+             AND earlier.state = 'completed'
+             AND coalesce(earlier.detail_code, '') NOT IN
+                 ('already_handled', 'existing_lock_receipt', 'duplicate_inquiry_already_handled')
+             AND earlier.recipient_scope->>'target_id' = this.recipient_scope->>'target_id'
+             AND earlier.created_at > now() - interval '72 hours'
+             AND earlier.arguments = this.arguments
+            WHERE this.action_id = {}
+            ORDER BY sent_at DESC
+            LIMIT 3
+            """,
+            [action_id],
+        )
+        return [dict(row.cells) for row in rows or ()]
+
+    async def contact_keys(self, action_id: UUID) -> list[str]:
+        """This action's contact keys, sorted: its trigger message's
+        (Comm-Data-Store message_contact_keys) plus its own recipient's
+        (contact_key). The people a reply from it answers."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "WITH " + _THIS_ACTION + ", " + _THIS_KEYS + " SELECT unnest(keys.value) AS contact_key FROM keys",
+            [action_id],
+        )
+        return [str(row.cells["contact_key"]) for row in rows or ()]
+
+    async def recently_answered(self, action_id: UUID, *, as_of: datetime) -> list[dict[str, Any]]:
+        """Customer replies (RECENTLY_ANSWERED_INTENTS) another wake already
+        sent, or is sending right now, to any of this action's contact keys
+        inside Comm-Data-Store's contact_recently_answered_window() before
+        `as_of` (the gateway's clock: now, or a replayed moment), newest
+        first (at most 3), each with what triggered this wake. Empty means
+        nothing to ask about. Who the person is, what counts as answered or
+        in flight, and the window are Comm-Data-Store's (migration 269,
+        message_contact_keys / contact_key / prospect_replies_to_keys);
+        SafetyPreflight decides what the rows mean.
+
+        In flight counts (prepared, dispatching, provider_accepted, unknown),
+        and the window has no end, not this action's creation: two wakes on
+        two lanes for one inquiry record their actions at the same moment,
+        and the one that prepares second must see the first, even when the
+        first was recorded a moment later or is accepted by its provider
+        while this one checks (contact_serialized orders them).
+
+        Per row:
+        - trigger_source: messages.source of this wake's trigger message;
+        - trigger_is_new_question: the trigger arrived after the newest such
+          reply and is not a word-for-word repeat (whitespace and case
+          aside) of an inbound from the same sender in the window before
+          that reply."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            "WITH "
+            + _THIS_ACTION
+            + ", "
+            + _THIS_KEYS
+            + r""",
+            prior AS (
+                SELECT reply.action_id, reply.wakeup_event_id, reply.intent_kind AS intent, reply.sent_at,
+                       reply.recipient, reply.reply_text, reply.reply_status
+                FROM this, keys,
+                     public.prospect_replies_to_keys(
+                         keys.value, {}::timestamptz - public.contact_recently_answered_window(), true
+                     ) AS reply
+                WHERE reply.wakeup_event_id IS DISTINCT FROM this.wakeup_event_id
+                  AND reply.action_id <> this.action_id
+                  AND reply.intent_kind = ANY({}::text[])
+            ), newest AS (
+                SELECT max(sent_at) AS sent_at FROM prior
+            ), trigger_message AS (
+                SELECT message.id, message.source, message.sent_at, message.sender_participant_id,
+                       lower(regexp_replace(btrim(coalesce(message.body, '')), '\s+', ' ', 'g')) AS body
+                FROM this
+                JOIN messages AS message ON message.id = this.message_id
+            ), trigger_facts AS (
+                SELECT (SELECT source FROM trigger_message) AS trigger_source,
+                       coalesce((
+                           SELECT trigger_message.sent_at > newest.sent_at
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM messages AS earlier_inbound
+                                  WHERE earlier_inbound.id <> trigger_message.id
+                                    AND earlier_inbound.sender_participant_id = trigger_message.sender_participant_id
+                                    AND lower(coalesce(earlier_inbound.direction, '')) = 'inbound'
+                                    AND earlier_inbound.sent_at < newest.sent_at
+                                    AND earlier_inbound.sent_at
+                                        > newest.sent_at - public.contact_recently_answered_window()
+                                    AND lower(regexp_replace(btrim(coalesce(earlier_inbound.body, '')), '\s+', ' ', 'g'))
+                                        = trigger_message.body
+                              )
+                           FROM trigger_message CROSS JOIN newest
+                       ), false) AS trigger_is_new_question
+            )
+            SELECT prior.action_id, prior.wakeup_event_id, prior.intent, prior.sent_at, prior.recipient,
+                   prior.reply_text, prior.reply_status, trigger_facts.trigger_source,
+                   trigger_facts.trigger_is_new_question
+            FROM prior CROSS JOIN trigger_facts
+            ORDER BY prior.sent_at DESC, prior.action_id
+            LIMIT 3
+            """,
+            [action_id, as_of, sorted(RECENTLY_ANSWERED_INTENTS)],
+        )
+        return [dict(row.cells) for row in rows or ()]
+
+    @asynccontextmanager
+    async def contact_serialized(self, action_id: UUID, *, lock_timeout_ms: int) -> AsyncIterator[PostgresActionStore]:
+        """One transaction holding a transaction-scoped advisory lock on each
+        of this action's contact keys (sorted, so two holders never
+        deadlock), yielding a store bound to it. The caller's check
+        (recently_answered) and its prepare or reject run inside, so a second
+        reply to the same person waits until the first is recorded in flight
+        and then sees it. READ COMMITTED takes a new snapshot per statement,
+        and the locks are taken in statements of their own before the check:
+        the check sees whatever the previous holder committed.
+
+        Each statement inside runs in its own savepoint: one that fails
+        leaves the transaction (and the locks) usable for the next.
+
+        Raises ContactLockTimeoutError when a key stays locked longer than
+        lock_timeout_ms, and ContactSerializationUnavailableError when the keys
+        cannot be read or locked for any other reason (the caller sends
+        unserialized: a failed lookup never stops a send)."""
+        async with self._connection() as connection:
+            async with connection.transaction():
+                transactional = PostgresActionStore(_TransactionDriver(connection))
+                try:
+                    keys = await transactional.contact_keys(action_id)
+                    await SafeSqlDriver.execute_param_query(
+                        transactional._driver, "SELECT set_config('lock_timeout', {}, true)", [f"{max(1, lock_timeout_ms)}ms"]
+                    )
+                    for key in keys:
+                        await SafeSqlDriver.execute_param_query(
+                            transactional._driver,
+                            "SELECT pg_advisory_xact_lock(hashtextextended({}, 0))",
+                            [_CONTACT_LOCK_PREFIX + key],
+                        )
+                    await SafeSqlDriver.execute_param_query(transactional._driver, "SET LOCAL lock_timeout TO DEFAULT")
+                except Exception as error:
+                    if getattr(error, "sqlstate", None) in _LOCK_WAIT_SQLSTATES:
+                        raise ContactLockTimeoutError(f"another reply to this contact held its lock past {lock_timeout_ms} ms") from error
+                    raise ContactSerializationUnavailableError(str(error)) from error
+                yield transactional
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[Any]:
+        """A connection of its own: from the pool (production), else the
+        driver's single connection."""
+        driver = self._driver
+        if getattr(driver, "is_pool", False):
+            pool = await driver.conn.pool_connect()
+            async with pool.connection() as connection:
+                yield connection
+        elif isinstance(driver, _TransactionDriver):
+            yield driver.connection
+        else:
+            yield driver.conn
+
+    async def request_account(self, request: ExecuteRequest) -> str | None:
+        """provider_account of the stored action `request` repeats word for
+        word -- the same match Comm-Data-Store migration 251's
+        create_or_load_outbound_action makes -- or None."""
+        rows = await SafeSqlDriver.execute_param_query(
+            self._driver,
+            """
+            SELECT provider_account FROM outbound_actions
+            WHERE identity_version = 'v1'
+              AND wakeup_event_id = {}
+              AND action_role = {}
+              AND retry_of_action_id IS NULL
+              AND operation = {}
+              AND intent_kind = {}
+              AND appointment_slot IS NOT DISTINCT FROM {}
+              AND arguments = {}::jsonb
+            ORDER BY effect_ordinal
+            LIMIT 1
+            """,
+            [
+                request.wakeup_event_id,
+                request.action_role.value,
+                request.operation.value,
+                request.intent_kind,
+                request.appointment_slot,
+                _json(request_arguments(request.arguments)),
+            ],
+        )
+        return str(rows[0].cells["provider_account"] or "") if rows else None
 
     async def schedule_next_attempt(
         self,
@@ -588,6 +912,9 @@ class PostgresActionStore:
                 else None
             ),
             remediation_reason=cells.get("remediation_reason"),
+            override_decision=cells.get("override_decision"),
+            dispatch_started_at=cells.get("dispatch_started_at"),
+            error_detail=cells.get("error_detail"),
             stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
             created_at=cells.get("created_at"),

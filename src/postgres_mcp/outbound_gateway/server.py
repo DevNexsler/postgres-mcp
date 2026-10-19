@@ -37,22 +37,33 @@ from .context import ActionContextLoader
 from .context import RoutingPolicy
 from .delivery_workflow import RestateWorkflowSubmitter
 from .delivery_workflow import SecretAuthGate
+from .errors import FailureKind
+from .errors import classify
+from .errors import error_text
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
 from .models import ActionRole
+from .models import AlreadySent
 from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
+from .models import OutboundRequest
 from .models import PublicResult
 from .models import PublicStatus
+from .models import RequestRefusedError
 from .models import StatusRequest
 from .models import SuggestRequest
+from .models import normalize_target_email
+from .models import normalize_target_phone
 from .models import operation_catalog
 from .models import parse_outbound_request
 from .provider_client import McpProviderClient
 from .provider_client import McpServerConfig
+from .record import NEVER_ANOTHER_ROUTE
+from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
+from .service import DEFAULT_CONTACT_LOCK_TIMEOUT_MS
 from .service import OutboundActionService
 from .store import PostgresActionStore
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -131,10 +142,82 @@ async def handle_outbound_action(
             hint = f" (valid: {', '.join(sorted(role.value for role in ActionRole))})"
         elif location.endswith("operation"):
             hint = f" (valid: {', '.join(sorted(op.value for op in Operation))})"
-        raise ValueError(
-            f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
-            "that field and send again; the tool description lists each operation's exact arguments."
-        ) from exc
+        # A malformed request is the caller's mistake, answered as an ordinary
+        # result rather than an MCP tool error: hermes-agent counts tool errors
+        # toward a breaker that parks the whole server for every caller
+        # (#3264). No action exists yet, so there is no action_id to return.
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "invalid_request",
+            "detail": (
+                f"invalid outbound action request: {location}: {first['msg']}{hint}. Nothing was sent: fix "
+                "that field and send again; the tool description lists each operation's exact arguments."
+            ),
+        }
+    try:
+        result = await _route(
+            service,
+            policy,
+            parsed,
+            tenantcloud_submitter=tenantcloud_submitter,
+            restate_operations=restate_operations,
+        )
+    except Exception as error:
+        return _failure(error, parsed.op)
+    if isinstance(result, dict):
+        return result
+    result = await _with_earlier_sends(service, result)
+    payload = result.model_dump(mode="json")
+    # A plain send leaves detail unset, and every result except
+    # needs_confirmation leaves new_context/question unset (override is set
+    # only when nothing was sent) -- omit unset keys entirely so consumers
+    # see no `null` field on the wire.
+    for optional in ("detail", "new_context", "question", "override", "already_sent", "recently_answered"):
+        if payload.get(optional) is None:
+            payload.pop(optional, None)
+    return payload
+
+
+def already_sent_detail(sent: tuple[AlreadySent, ...]) -> str:
+    """The first words of a refusal whose exact request another action already
+    delivered (Dan, 2026-10-17: "this was already sent. still override? here
+    is message ID")."""
+    first = sent[0]
+    to = f" to {first.recipient}" if first.recipient else ""
+    when = f" at {first.sent_at.isoformat()}" if first.sent_at else ""
+    wake = f", wake {first.wakeup_event_id}" if first.wakeup_event_id else ""
+    message = f"message id {first.provider_message_id}" if first.provider_message_id else "no provider message id"
+    more = f" ({len(sent) - 1} more identical send(s) listed in already_sent.)" if len(sent) > 1 else ""
+    return (
+        f"ALREADY SENT: this exact message already went{to}{when} ({message}; action {first.action_id}{wake}).{more} "
+        "Sending it again would deliver a second copy. Still override? Only if a second copy is really wanted; "
+        "say why in reason."
+    )
+
+
+async def _with_earlier_sends(service: OutboundActionService, result: PublicResult) -> PublicResult:
+    """A refusal the agent may override, with any identical earlier send put
+    in front of it. Only results that carry `override` are looked up: nothing
+    else can lead to a second send."""
+    if result.override is None:
+        return result
+    sent = await service.earlier_identical_sends(result.action_id)
+    if not isinstance(sent, tuple) or not sent:
+        return result
+    detail = " ".join(part for part in (already_sent_detail(sent), result.detail) if part)
+    return result.model_copy(update={"already_sent": sent, "detail": detail})
+
+
+async def _route(
+    service: OutboundActionService,
+    policy: FeaturePolicy,
+    parsed: OutboundRequest,
+    *,
+    tenantcloud_submitter: RestateWorkflowSubmitter | None,
+    restate_operations: frozenset[Operation] | None,
+) -> PublicResult | dict[str, Any]:
+    """The answer to one parsed request: suggestions, or an action's result."""
     if isinstance(parsed, SuggestRequest):
         return {
             "wakeup_event_id": parsed.wakeup_event_id,
@@ -165,6 +248,7 @@ async def handle_outbound_action(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code=detail,
+                detail=SENDING_PAUSED_DETAIL,
             )
         elif parsed.operation not in policy.enabled_operations:
             action_id = uuid5(
@@ -178,6 +262,7 @@ async def handle_outbound_action(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code="operation_disabled",
+                detail=_operation_disabled_detail(parsed.operation, policy),
             )
         else:
             routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
@@ -198,16 +283,50 @@ async def handle_outbound_action(
                         )
             else:
                 result = await service.execute(parsed)
-    payload = result.model_dump(mode="json")
-    # Every result except a traffic-control block leaves detail unset, and
-    # every result except needs_confirmation leaves new_context/question
-    # unset -- omit those keys entirely so existing consumers see no new
-    # field on the wire, instead of a `null` that would still be a shape
-    # change for strict clients.
-    for optional in ("detail", "new_context", "question"):
-        if payload.get(optional) is None:
-            payload.pop(optional, None)
-    return payload
+    return result
+
+
+def _failure(error: Exception, op: str) -> dict[str, Any]:
+    """Every failure is an ordinary result, never an MCP tool error:
+    hermes-agent counts tool errors toward a breaker that parks the gateway
+    for every caller (#3463), and raw error text reads to the agent as an
+    outage to route around. A refusal (errors.classify) is the caller's to
+    correct, in its own words; anything else is the gateway's. A row the
+    call recorded is answered by the service itself (its action_id, and the
+    override where nothing was sent), so reaching here the call may have
+    failed before or after recording one."""
+    if classify(error) is FailureKind.REFUSAL:
+        return {
+            "status": PublicStatus.REJECTED.value,
+            "retryable": False,
+            "detail_code": "request_refused",
+            "detail": str(error) if isinstance(error, RequestRefusedError) else error_text(error),
+        }
+    logger.exception("outbound_action %s failed", op)
+    return {
+        "status": PublicStatus.FAILED.value,
+        "retryable": False,
+        "detail_code": "gateway_error",
+        "detail": (
+            f"The gateway hit an error ({error_text(error)}) before it could say what happened. The same "
+            "call again is the same action, never a second send: make it again to see where it stands; if it "
+            f"fails again, record needs_human. {NEVER_ANOTHER_ROUTE}"
+        ),
+    }
+
+
+SENDING_PAUSED_DETAIL = (
+    "Not sent: an operator has paused sending through this gateway, and nothing was recorded. Record "
+    f"needs_human with what you meant to send. {NEVER_ANOTHER_ROUTE}"
+)
+
+
+def _operation_disabled_detail(operation: Operation, policy: FeaturePolicy) -> str:
+    enabled = ", ".join(sorted(op.value for op in policy.enabled_operations)) or "none"
+    return (
+        f"Not sent: {operation.value} is not enabled on this gateway, and nothing was recorded. Enabled "
+        f"operations: {enabled}. Use one of them, or record needs_human. {NEVER_ANOTHER_ROUTE}"
+    )
 
 
 async def _confirm(
@@ -218,10 +337,10 @@ async def _confirm(
     tenantcloud_submitter: RestateWorkflowSubmitter | None,
     restate_operations: frozenset[Operation] | None = None,
 ) -> PublicResult:
-    """Route a stale_context answer. A decline is a ledger write only and is
-    always accepted; a yes is a send and obeys the same write switches as
-    execute. TenantCloud sends are prepared here and handed to Restate, like
-    enqueue()."""
+    """Route a stale_context answer or an override. A decline is a ledger
+    write only and is always accepted; a yes is a send and obeys the same
+    write switches as execute. A Restate-routed successor is prepared here
+    and handed to Restate, like enqueue()."""
     sends = request.decision.value != "no"
     if sends:
         if not policy.writes_enabled or policy.kill_switch:
@@ -232,6 +351,7 @@ async def _confirm(
                 provider_request_ref=None,
                 retryable=False,
                 detail_code="kill_switch_open" if policy.kill_switch else "writes_disabled",
+                detail=SENDING_PAUSED_DETAIL,
             )
     parent_operation = await service.action_operation(request.action_id)
     if sends and parent_operation is not None and parent_operation not in policy.enabled_operations:
@@ -242,6 +362,7 @@ async def _confirm(
             provider_request_ref=None,
             retryable=False,
             detail_code="operation_disabled",
+            detail=_operation_disabled_detail(parent_operation, policy),
         )
     routed_operations = TENANTCLOUD_OPERATIONS if restate_operations is None else (TENANTCLOUD_OPERATIONS | restate_operations)
     routed = parent_operation in routed_operations and tenantcloud_submitter is not None
@@ -290,7 +411,17 @@ def create_server(
             "messages, including any we already sent to that recipient (direction \"sent by us\") -- and answer "
             "once with {\"op\": \"confirm\", \"wakeup_event_id\", \"action_id\", \"decision\": \"yes\"|\"no\"|\"revise\"} "
             "exactly as its question shows (revise also carries arguments with only the "
-            "message content changed). Every send, from any wake, goes through this tool: "
+            "message content changed). Any other result that did not send (status rejected, "
+            "failed, duplicate, manual_review or stale) says why in detail, and may carry "
+            "\"override\": that confirm request with the wake and action filled in (decision \"no\" "
+            "instead records that you chose not to send it). detail_code recently_answered: this person "
+            "already got a customer reply from another wake recently, or is being sent one right now (listed in "
+            "recently_answered with its text): if yours repeats it, answer decision \"no\"; if the prospect needs "
+            "something new, send the override with a reason. detail_code contact_reply_in_progress (retryable): "
+            "another reply to this person was still being recorded; nothing was sent, execute the same request "
+            "again in a few seconds. " + OVERRIDE_RULE + " A malformed request "
+            "(detail_code invalid_request) recorded nothing: fix the field its detail names. "
+            "Every send, from any wake, goes through this tool: "
             "{\"request\": {\"op\": \"execute\", \"wakeup_event_id\": <wake>, "
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "
@@ -362,6 +493,28 @@ def _json_mapping(name: str, default: dict[str, str]) -> dict[str, str]:
     if not isinstance(value, dict) or not all(isinstance(key, str) and isinstance(item, str) for key, item in value.items()):
         raise ValueError(f"{name} must be a JSON string-to-string object")
     return value
+
+
+def _quo_sending_lines() -> dict[str, str]:
+    """OUTBOUND_QUO_SENDING_LINES_JSON: the only lines quo.sms.send can
+    text from (its from_phone), E.164 number -> Quo phone_number_id. Keys
+    are normalized the way from_phone is, so the lookup matches what the
+    agent sent."""
+    lines = _json_mapping("OUTBOUND_QUO_SENDING_LINES_JSON", {})
+    try:
+        normalized = {normalize_target_phone(phone, field="phone"): line.strip() for phone, line in lines.items()}
+    except ValueError as exc:
+        raise ValueError("OUTBOUND_QUO_SENDING_LINES_JSON keys must be E.164 phone numbers") from exc
+    if not all(normalized.values()):
+        raise ValueError("OUTBOUND_QUO_SENDING_LINES_JSON values must be Quo phone_number_ids")
+    return normalized
+
+
+def _email_default_cc() -> str:
+    """OUTBOUND_EMAIL_DEFAULT_CC: the address a customer email that omits cc
+    is copied to (identity.with_default_cc). Unset or empty: off."""
+    raw = os.environ.get("OUTBOUND_EMAIL_DEFAULT_CC", "").strip()
+    return normalize_target_email(raw, field="OUTBOUND_EMAIL_DEFAULT_CC") if raw else ""
 
 
 def _enabled_operations() -> frozenset[Operation]:
@@ -507,6 +660,23 @@ def _build_tenantcloud_adapter() -> TenantCloudAdapter:
     return TenantCloudAdapter(mutations_factory=build_mutations)
 
 
+# Quo's own call to its carrier API waits up to 30 s (QUO-Gated-MCP
+# quo_client.py). Cutting it off at the 10 s default turned a slow carrier into
+# an ambiguous send (action b78d5668, 2026-09-30); 30 s is this client's cap.
+QUO_PROVIDER_TIMEOUT_SECONDS = 30.0
+
+
+def quo_server_config() -> McpServerConfig:
+    return McpServerConfig(
+        name="quo",
+        url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
+        transport="sse",
+        headers=_bearer_headers("QUO_MCP_TOKEN"),
+        allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
+        timeout_seconds=QUO_PROVIDER_TIMEOUT_SECONDS,
+    )
+
+
 def build_tenantcloud_auth_gate() -> SecretAuthGate:
     """Build same scoped auth path used by TenantCloud provider writes."""
     _reject_tenantcloud_origin_overrides()
@@ -622,12 +792,8 @@ async def build_runtime() -> GatewayRuntime:
             # application notifications) replies from that same mailbox.
             {"zillow": "nigel-zoho", "hotpads": "nigel-zoho", "tenantcloud": "nigel-zoho", "zoho_mail": "nigel-zoho"},
         ),
-        quo_line_by_provider=_json_mapping(
-            "OUTBOUND_QUO_LINES_JSON",
-            {provider: os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", "") for provider in ("hotpads", "quo", "tenantcloud", "zillow", "zumper")},
-        ),
         email_default_account=os.environ.get("OUTBOUND_EMAIL_DEFAULT_ACCOUNT", "nigel-zoho"),
-        quo_default_line=os.environ.get("OUTBOUND_QUO_PHONE_NUMBER_ID", ""),
+        quo_sending_lines=_quo_sending_lines(),
         calendar_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_NAME", "nigel")},
         calendar_account_by_profile={"appointment-setter": os.environ.get("OUTBOUND_CALENDAR_ACCOUNT", "nigel-zoho")},
         cliq_target_by_intent=_json_mapping(
@@ -675,13 +841,7 @@ async def build_runtime() -> GatewayRuntime:
                     }
                 ),
             ),
-            "quo": McpServerConfig(
-                name="quo",
-                url=os.environ.get("QUO_MCP_URL", "http://127.0.0.1:8080/sse"),
-                transport="sse",
-                headers=_bearer_headers("QUO_MCP_TOKEN"),
-                allowed_tools=frozenset({"send_message", "list_messages", "get_message"}),
-            ),
+            "quo": quo_server_config(),
         }
     )
     email_domains = _json_mapping(
@@ -728,6 +888,8 @@ async def build_runtime() -> GatewayRuntime:
         # (default): never ask, and never send stale -- an action with unshown
         # newer context ends as a `stale_context_unasked` no-send.
         stale_confirm_enabled=_bool("OUTBOUND_STALE_CONFIRM_ENABLED", False),
+        email_default_cc=_email_default_cc(),
+        contact_lock_timeout_ms=int(os.environ.get("OUTBOUND_CONTACT_LOCK_TIMEOUT_MS", str(DEFAULT_CONTACT_LOCK_TIMEOUT_MS))),
         # Same union worker.py and tenantcloud_delivery_server.py's
         # coordinator already use (TENANTCLOUD_OPERATIONS unconditionally,
         # plus OUTBOUND_RESTATE_OPERATIONS): ActionRecovery.exhaust() needs

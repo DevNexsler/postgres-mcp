@@ -205,9 +205,12 @@ def normalize_event_url(value: Any, *, field: str) -> str | None:
     return candidate
 
 
-def normalize_email_list(value: Any, *, field: str, maximum: int) -> tuple[str, ...] | None:
+def normalize_email_list(
+    value: Any, *, field: str, maximum: int, allow_empty: bool = False
+) -> tuple[str, ...] | None:
     """Optional list of addresses (Cc, attendees): each format-checked, order
-    kept, duplicates dropped. None means omitted."""
+    kept, duplicates dropped. None means omitted; allow_empty keeps an
+    explicit [] as () -- "none", which is not the same as omitted."""
     if value is None:
         return None
     if not isinstance(value, (list, tuple)):
@@ -217,8 +220,8 @@ def normalize_email_list(value: Any, *, field: str, maximum: int) -> tuple[str, 
         address = normalize_target_email(item, field=field)
         if address.casefold() not in {existing.casefold() for existing in addresses}:
             addresses.append(address)
-    if not 1 <= len(addresses) <= maximum:
-        raise ValueError(f"{field} must list between 1 and {maximum} addresses")
+    if not (0 if allow_empty else 1) <= len(addresses) <= maximum:
+        raise ValueError(f"{field} must list between {0 if allow_empty else 1} and {maximum} addresses")
     return tuple(addresses)
 
 
@@ -297,8 +300,9 @@ class EmailAttachment(StrictModel):
 class EmailArguments(StrictModel):
     to_address: str
     text: str
-    # Optional: the subject defaults to "Re: <the wake's subject>"; cc is
-    # added to the source's configured copy address (management@pfg.io).
+    # Optional: the subject defaults to "Re: <the wake's subject>". cc
+    # omitted (None) takes the gateway's default copy (identity.
+    # with_default_cc); cc given, [] included, is sent exactly as given.
     subject: str | None = None
     cc: tuple[str, ...] | None = None
     attachments: tuple[EmailAttachment, ...] | None = None
@@ -342,7 +346,7 @@ class EmailArguments(StrictModel):
     @field_validator("cc", mode="before")
     @classmethod
     def normalize_cc(cls, value: Any) -> tuple[str, ...] | None:
-        return normalize_email_list(value, field="cc", maximum=10)
+        return normalize_email_list(value, field="cc", maximum=10, allow_empty=True)
 
     @field_validator("text", mode="before")
     @classmethod
@@ -353,11 +357,27 @@ class EmailArguments(StrictModel):
 class QuoSmsArguments(StrictModel):
     to_phone: str
     text: str
+    # The line to send from, by its number (context.RoutingPolicy.
+    # quo_sending_lines). Required of every new text -- context derivation
+    # refuses one without it -- but optional here so texts recorded before
+    # it existed still parse and hash as stored (LATER_OPTIONAL_ARGUMENTS).
+    # Only stripped here: the map's keys are E.164, so a malformed value is
+    # simply not a line, and its refusal lists the lines it can send from.
+    from_phone: str | None = None
 
     @field_validator("to_phone", mode="before")
     @classmethod
     def normalize_to_phone(cls, value: Any) -> str:
         return normalize_target_phone(value, field="to_phone")
+
+    @field_validator("from_phone", mode="before")
+    @classmethod
+    def normalize_from_phone(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("from_phone must be a string")
+        return value.strip() or None
 
     @field_validator("text", mode="before")
     @classmethod
@@ -557,6 +577,13 @@ def parse_iso_date(value: Any, *, field: str) -> date:
     return parsed
 
 
+# TenantCloud refuses a thread message over 1000 characters with HTTP 422.
+# Every rejected send through 2026-09-30 was 1025-1227 characters and every
+# accepted one was at most 837; the longest body TenantCloud ever returned is
+# exactly 1000 (an inbound tenant message cut off mid-sentence).
+TENANTCLOUD_MESSAGE_MAX_CHARACTERS = 1000
+
+
 class TenantCloudMessageArguments(StrictModel):
     thread_id: PositiveBigInt
     text: str
@@ -565,7 +592,15 @@ class TenantCloudMessageArguments(StrictModel):
     @classmethod
     def normalize_text(cls, value: Any, info: ValidationInfo) -> str:
         text = normalize_tenantcloud_text(value, field="text", maximum=10_000)
-        return refuse_tenantcloud_wide_characters(text, field="text", info=info)
+        text = refuse_tenantcloud_wide_characters(text, field="text", info=info)
+        # A stored action is rebuilt on reconcile and resume; the rejected
+        # over-long ones must still rebuild so they can settle.
+        if len(text) > TENANTCLOUD_MESSAGE_MAX_CHARACTERS and not (info.context or {}).get("stored_action"):
+            raise ValueError(
+                f"text is {len(text)} characters; a TenantCloud message can be at most "
+                f"{TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters. Shorten it and send again"
+            )
+        return text
 
 
 class LeadStatusArguments(StrictModel):
@@ -653,10 +688,15 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
     Operation.EMAIL_SEND: (
         ActionRole.PROSPECT_REPLY,
         IntentKind.INQUIRY_REPLY,
-        "email anyone; sent from Nigel's mailbox; attachments is a list of "
+        "email anyone; sent from Nigel's mailbox; management@pfg.io is cc'd on customer emails "
+        "unless you pass cc (use [] for none); attachments is a list of "
         "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
     ),
-    Operation.QUO_SMS_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "text anyone (to_phone E.164)"),
+    Operation.QUO_SMS_SEND: (
+        ActionRole.PROSPECT_REPLY,
+        IntentKind.INQUIRY_REPLY,
+        "text anyone (to_phone E.164); from_phone (E.164) is the line to send from, always required",
+    ),
     Operation.CLIQ_CHAT_POST: (ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),
     Operation.CLIQ_CHANNEL_POST: (
         ActionRole.INTERNAL_NOTIFICATION,
@@ -666,7 +706,11 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
     Operation.CALENDAR_CREATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),
     Operation.CALENDAR_UPDATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),
     Operation.CALENDAR_DELETE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),
-    Operation.TENANTCLOUD_MESSAGE_SEND: (ActionRole.PROSPECT_REPLY, IntentKind.INQUIRY_REPLY, "reply in a TenantCloud thread"),
+    Operation.TENANTCLOUD_MESSAGE_SEND: (
+        ActionRole.PROSPECT_REPLY,
+        IntentKind.INQUIRY_REPLY,
+        f"reply in a TenantCloud thread; text at most {TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters",
+    ),
     Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_LEAD_STATUS, "mark a lead working"),
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: (
         ActionRole.PROVIDER_MUTATION,
@@ -681,6 +725,11 @@ OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
 }
 
 
+# Optional in the model only so stored actions still parse; every new
+# request must carry them (QuoSmsArguments.from_phone).
+REQUIRED_OF_NEW_REQUESTS = frozenset({"from_phone"})
+
+
 def operation_catalog() -> str:
     """One line per operation: the exact role, intent and argument names
     (optional ones marked ?), drawn from the argument models themselves."""
@@ -688,7 +737,8 @@ def operation_catalog() -> str:
     for operation, model in ARGUMENT_MODELS.items():
         role, intent, purpose = OPERATION_USAGE[operation]
         fields = ", ".join(
-            name if field.is_required() else f"{name}?" for name, field in model.model_fields.items()
+            name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?"
+            for name, field in model.model_fields.items()
         )
         lines.append(
             f'{operation.value}: action_role "{role.value}", intent_kind "{intent.value}", '
@@ -795,8 +845,14 @@ class SuggestRequest(StrictModel):
     wakeup_event_id: PositiveBigInt
 
 
+# A reason copied from an instruction instead of written: "<why>",
+# "<required: ...>", "reason", "why", "...", or the hint's own words.
+_TEMPLATE_REASON = re.compile(r"<[^>]*>|reason|why|\.+|add reason\b.*|\(?why you still want to send\)?\.?", re.IGNORECASE)
+
+
 class ConfirmRequest(StrictModel):
-    """Answer to a needs_confirmation (stale_context) result.
+    """Answer to a needs_confirmation (stale_context) result, or the agent's
+    override of an action that was not sent.
 
     `yes` sends the blocked message unchanged, `revise` sends `arguments`
     instead (same operation, role, intent and target -- only content fields
@@ -805,19 +861,35 @@ class ConfirmRequest(StrictModel):
     decline and sends nothing. One answer per blocked action: repeating it
     returns the recorded result, a different answer is refused.
     wakeup_event_id is REQUIRED and must be the blocked action's own wake --
-    a confirmation never crosses wakes."""
+    a confirmation never crosses wakes.
+
+    On a result that carries `override` (rejected, failed, a no-send
+    duplicate, ...), `yes` with a `reason` sends the same message anyway
+    through a successor action (Comm-Data-Store override_outbound_action),
+    and `no` records that the agent chose not to send it; the first answer
+    and reason are recorded on the refused action. A blank or template
+    reason ("<why>", "reason") is no reason."""
 
     op: Literal["confirm"]
     wakeup_event_id: PositiveBigInt
     action_id: UUID
     decision: StaleContextDecision
     arguments: dict[str, Any] | None = None
+    reason: Annotated[str, Field(max_length=500)] | None = None
 
     @field_validator("decision", mode="before")
     @classmethod
     def normalize_decision(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().casefold()
+        return value
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip()
+            return None if not value or _TEMPLATE_REASON.fullmatch(value) else value
         return value
 
     @model_validator(mode="after")
@@ -856,7 +928,25 @@ _REQUEST_ADAPTER = TypeAdapter(OutboundRequest)
 
 
 def parse_outbound_request(payload: Any) -> OutboundRequest:
-    return _REQUEST_ADAPTER.validate_python(payload)
+    return _REQUEST_ADAPTER.validate_python(_default_execute_op(payload))
+
+
+def _default_execute_op(payload: Any) -> Any:
+    """Fill a missing `op` with "execute" when the request can only be an execute.
+
+    Agents often send a complete send request without `op`, and the discriminator
+    error it produces does not tell them what to add. Only execute carries
+    `operation`; status and confirm carry `action_id` instead, so a request with
+    `operation` and no `action_id` is unambiguous. Everything else is left for the
+    normal validation error."""
+    if (
+        isinstance(payload, dict)
+        and "op" not in payload
+        and "operation" in payload
+        and "action_id" not in payload
+    ):
+        return {"op": "execute", **payload}
+    return payload
 
 
 _SENT_DIRECTIONS = frozenset({"outbound", "outgoing", "sent"})
@@ -903,6 +993,63 @@ class ContextItem(StrictModel):
     preview: Annotated[str, Field(max_length=300)]
 
 
+class RequestRefusedError(ValueError):
+    """The gateway refused this request as asked. Nothing was sent, and the
+    message tells the caller what to do instead: fix the request, answer
+    differently, or record needs_human. The tool answers it as an ordinary
+    rejected result, not an MCP tool error, because hermes-agent counts tool
+    errors toward a breaker that parks the gateway for every caller (#3463).
+    A gateway fault is never one of these."""
+
+
+class OverrideRequest(StrictModel):
+    """The outbound_action request that still sends a message that was not
+    sent: confirm yes on the refused action. The agent adds its own
+    `reason`; there is deliberately no placeholder to echo back."""
+
+    op: Literal["confirm"] = "confirm"
+    wakeup_event_id: PositiveBigInt
+    action_id: UUID
+    decision: Literal["yes"] = "yes"
+
+
+class AlreadySent(StrictModel):
+    """A completed send of exactly the same request (operation, recipient and
+    arguments) by another action: what the agent must see before it
+    overrides a refusal. 2026-10-17: one wake emailed an attorney a case
+    packet; 21 minutes later a second wake's identical send was refused with
+    only "nothing was sent", the agent overrode it, and the attorney got the
+    packet twice."""
+
+    action_id: UUID
+    wakeup_event_id: int | None = None
+    provider_message_id: str | None = None
+    sent_at: datetime | None = None
+    recipient: str | None = None
+
+
+class RecentlyAnswered(StrictModel):
+    """A customer reply another wake already sent this person (any of their
+    contact keys), or is sending right now, inside Comm-Data-Store's
+    contact_recently_answered_window(): what the agent must read before it
+    sends another. 2026-09-28
+    (wakes 27331/27332, one tour request on two lanes) and 2026-10-09 (Amy
+    McDermott's repeated TenantCloud inquiry, wake 28084): a second wake
+    answered a prospect who already had an answer, in different words, so
+    byte-identical idempotency never saw it."""
+
+    action_id: UUID
+    wakeup_event_id: int | None = None
+    intent: str | None = None
+    sent_at: datetime | None = None
+    recipient: str | None = None
+    text_excerpt: str | None = None
+    # Comm-Data-Store prospect_reply_status: 'answered' (sent) or 'in_flight'
+    # (prepared, dispatching, provider_accepted or unknown -- it may already
+    # be in front of the prospect).
+    reply_status: str | None = None
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
@@ -912,16 +1059,26 @@ class PublicResult(StrictModel):
     # Every other result keeps the historical False.
     retryable: bool = False
     detail_code: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_]+$")]
-    # Human-readable elaboration of detail_code. None everywhere except traffic-control
-    # blocks: that is the one path where the calling agent must read *why* (which
-    # in-flight action or newer message) to decide skip vs. record needs_human --
-    # detail_code alone ("lease_held"/"stale_context") does not carry that. Override
-    # is an operator remediation and is not named in this text. Left unset (None)
-    # for every other result so existing consumers see no new key on the wire
-    # (server.py omits it from the response payload when None).
+    # Human-readable elaboration of detail_code: what happened and what to do
+    # next. Set on every result that did not send (and on pending/unknown);
+    # None on a plain send, and then omitted from the wire (server.py drops
+    # every None optional key).
     detail: str | None = None
     # needs_confirmation only: every item newer than the context the agent
     # was shown (newest last, capped) and the exact yes/no question. None
     # everywhere else, and omitted from the wire like `detail`.
     new_context: tuple[ContextItem, ...] | None = None
     question: str | None = None
+    # Set when nothing was sent and the agent may still send it unchanged:
+    # the request to make (record.overridable). None otherwise, and omitted
+    # from the wire like `detail`.
+    override: OverrideRequest | None = None
+    # Set with `override` when another action already delivered this exact
+    # request (newest first): the agent sees the earlier send and its message
+    # id before it decides. None otherwise, and omitted from the wire.
+    already_sent: tuple[AlreadySent, ...] | None = None
+    # Set with `override` when this person already got (or is getting) a
+    # customer reply from another wake inside the recently-answered window
+    # (recently_answered, newest first). None otherwise, and omitted from
+    # the wire.
+    recently_answered: tuple[RecentlyAnswered, ...] | None = None

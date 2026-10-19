@@ -152,6 +152,11 @@ class CasLedger:
         self.row = replace(self.row, state=ActionState.PREPARED, action_uid=ACTION_UID)
         return self.row
 
+    async def reject(self, action_id, expected_state, detail_code, error_detail):
+        self._write(expected_state)
+        self.row = replace(self.row, state=ActionState.REJECTED, detail_code=detail_code, error_detail=error_detail)
+        return self.row
+
     async def create_or_load(self, ctx):
         return self.row
 
@@ -227,7 +232,7 @@ class Loader:
     def __init__(self, context, *, derivable: bool) -> None:
         self._context, self._derivable = context, derivable
 
-    async def load(self, request):
+    async def load(self, request, *, recorded_account=""):
         if not self._derivable:
             raise ContextDerivationError("the wake's source message is gone")
         return self._context

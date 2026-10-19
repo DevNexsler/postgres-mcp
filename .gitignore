@@ -183,6 +183,8 @@ devenv.local.nix
 # pre-commit
 .pre-commit-config.yaml
 *.sql
+# Comm-Data-Store functions vendored for the gateway integration tests.
+!tests/integration/fixtures/*.sql
 
 # Local feature worktrees
 .worktrees/

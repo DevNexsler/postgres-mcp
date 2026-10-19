@@ -23,37 +23,116 @@ from .context import ActionContextLoader
 from .context import ContextDerivationError
 from .context import DerivedTarget
 from .context import canonical_payload_hash
+from .errors import GATEWAY_INTERNAL_ERROR
+from .errors import ContactLockTimeoutError
+from .errors import ContactSerializationUnavailableError
+from .errors import FailureKind
+from .errors import classify
+from .errors import error_text
+from .identity import with_default_cc
 from .metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from .metrics import CircuitStatus
 from .metrics import bounded_backoff_seconds
 from .metrics import tenantcloud_auth_wait_seconds
+from .models import STALE_CONTEXT_DETAILS
 from .models import ActionState
+from .models import AlreadySent
 from .models import CompletionKind
 from .models import ConfirmRequest
 from .models import ExecuteRequest
 from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
+from .models import QuoSmsArguments
+from .models import RecentlyAnswered
 from .models import StaleContextDecision
+from .preflight import RECENTLY_ANSWERED_DETAIL as RECENTLY_ANSWERED_DETAIL
+from .preflight import RECENTLY_ANSWERED_PREVIEW_CHARS
 from .preflight import PreflightDecision
 from .preflight import PreflightEvidence
 from .preflight import PreflightOutcome
+from .preflight import RecentlyAnsweredEvidence
 from .preflight import SafetyPreflight
 from .record import ActionStore as ActionStore
 from .record import OutboundActionRecord as OutboundActionRecord
 from .record import action_result
+from .record import answer
+from .record import answered_by_successor
 from .record import is_due
+from .record import overridable
 from .record import require_action
+from .record import why_not_overridable
 from .recovery import ActionRecovery
 from .retry_policy import elapsed_step_backoff_seconds
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
+from .stale_context import answer_refusal
+from .stale_context import check_own_wake
 from .stale_context import execute_answer
+from .stale_context import refusal
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 from .traffic_control import VALID_TRAFFIC_MODES
-from .traffic_control import in_flight_hold
 
 logger = logging.getLogger(__name__)
+
+# A customer reply the agent is asked about (SafetyPreflight REFUSED
+# recently_answered) ends `rejected` with RECENTLY_ANSWERED_DETAIL, so the
+# result carries the override; the agent's confirm no makes it agent_declined.
+_IN_FLIGHT = "in_flight"
+# How long a reply waits for another reply to the same person to be recorded
+# (PostgresActionStore.contact_serialized) before it is refused, retryable,
+# with CONTACT_REPLY_BUSY_DETAIL. Configured by OUTBOUND_CONTACT_LOCK_TIMEOUT_MS.
+DEFAULT_CONTACT_LOCK_TIMEOUT_MS = 5000
+CONTACT_REPLY_BUSY_DETAIL = "contact_reply_in_progress"
+
+
+def recently_answered_detail(prior: tuple[RecentlyAnswered, ...], *, now: datetime) -> str:
+    """The refusal's words: who already got (or is getting) which reply,
+    when, and what it said, then the two answers the agent has."""
+    first = prior[0]
+    recipient = first.recipient or "this recipient"
+    ago = ""
+    if first.sent_at is not None:
+        hours = max(0.0, (now - first.sent_at).total_seconds() / 3600)
+        ago = f" {hours:.0f}h ago" if hours >= 1 else f" {max(1, round(hours * 60))} min ago"
+    wake = f", wake {first.wakeup_event_id}" if first.wakeup_event_id else ""
+    intent = f", {first.intent}" if first.intent else ""
+    text = " ".join((first.text_excerpt or "").split())[:RECENTLY_ANSWERED_PREVIEW_CHARS]
+    quoted = f': "{text}"' if text else ""
+    more = f" ({len(prior) - 1} more listed in recently_answered.)" if len(prior) > 1 else ""
+    if first.reply_status == _IN_FLIGHT:
+        started = f", started{ago}" if ago else ""
+        got = f"is being sent a reply right now (action {first.action_id}{wake}{intent}{started})"
+    else:
+        got = f"already got a reply{ago} (action {first.action_id}{wake}{intent})"
+    return (
+        f"RECENTLY ANSWERED: {recipient} {got}{quoted}.{more} "
+        "Check the thread: if this repeats that answer, send nothing (op confirm, decision no); if the prospect "
+        "needs something new, override with a reason"
+    )
+
+
+def _recently_answered_evidence(rows: list[Mapping[str, Any]]) -> RecentlyAnsweredEvidence:
+    """PostgresActionStore.recently_answered's rows as SafetyPreflight's
+    evidence (every row carries the same trigger facts)."""
+    replies = tuple(
+        RecentlyAnswered(
+            action_id=row["action_id"],
+            wakeup_event_id=row.get("wakeup_event_id"),
+            intent=row.get("intent"),
+            sent_at=row.get("sent_at"),
+            recipient=row.get("recipient"),
+            text_excerpt=(row.get("reply_text") or "")[:RECENTLY_ANSWERED_PREVIEW_CHARS] or None,
+            reply_status=row.get("reply_status"),
+        )
+        for row in rows
+    )
+    first = rows[0] if rows else {}
+    return RecentlyAnsweredEvidence(
+        replies=replies,
+        trigger_source=first.get("trigger_source"),
+        trigger_is_new_question=bool(first.get("trigger_is_new_question")),
+    )
 
 _RELOAD_REASON_MAX_CHARS = 300
 
@@ -72,6 +151,17 @@ def _bounded_reload_reason(error: Exception) -> str:
     stays defensive about length and newlines regardless."""
     text = " ".join(str(error).split())
     return text[:_RELOAD_REASON_MAX_CHARS] if text else type(error).__name__
+
+# The detail_code of a row ended `rejected` because a step on it failed
+# before any send (Comm-Data-Store reject_outbound_action), by failure kind.
+_REJECTED_CODES = {
+    FailureKind.REFUSAL: "gateway_refused",
+    FailureKind.TRANSIENT: "gateway_transient_error",
+    FailureKind.FAULT: "gateway_error",
+}
+# A `received` row Restate could not prepare within its retry ceiling.
+_UNPREPARED_DETAIL = "prepare_retry_exhausted"
+
 
 # States execute() reports as-is without re-driving them.
 _EXECUTE_TERMINAL_STATES = frozenset(
@@ -206,6 +296,8 @@ class OutboundActionService:
         traffic_probe: Any | None = None,
         stale_confirm_enabled: bool = False,
         restate_operations: frozenset[Operation] = frozenset(),
+        email_default_cc: str = "",
+        contact_lock_timeout_ms: int = DEFAULT_CONTACT_LOCK_TIMEOUT_MS,
     ):
         if traffic_mode not in VALID_TRAFFIC_MODES:
             raise ValueError(f"traffic_mode must be one of {sorted(VALID_TRAFFIC_MODES)}, got {traffic_mode!r}")
@@ -221,6 +313,8 @@ class OutboundActionService:
             )
         self._store = store
         self._context_loader = context_loader
+        self._email_default_cc = email_default_cc
+        self._contact_lock_timeout_ms = max(1, contact_lock_timeout_ms)
         self._evidence_loader = evidence_loader
         self._adapters = dict(adapters)
         self._provider_client = provider_client
@@ -239,8 +333,7 @@ class OutboundActionService:
         # docstring).
         self._restate_operations = restate_operations
         self._traffic_mode = traffic_mode
-        # One probe: the in-flight lease (traffic_control.InFlightProbe) and
-        # the newer-context query (stale_context.NewerContextProbe).
+        # The newer-context query (stale_context.NewerContextProbe).
         self._traffic_probe = traffic_probe
         self._stale = StaleContextQuestions(
             store=store,
@@ -286,7 +379,10 @@ class OutboundActionService:
         return await self._execute(request, dispatch=False)
 
     async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
-        context = await self._context_loader.load(request)
+        # Before anything reads the request: the default is part of what was
+        # asked, so the hash, the identity and the stored arguments carry it.
+        request = with_default_cc(request, self._email_default_cc)
+        context = await self._load(request)
         enabled = self._stale.enabled
         action = None
         existing = None
@@ -301,6 +397,42 @@ class OutboundActionService:
                 action = existing
         if action is None:
             action = await self._store.create_or_load(context)
+        latest = await self._latest_answer(action)
+        if latest is not None:
+            # The same message again after the agent's yes (an override, or a
+            # stale_context yes): the successor that carries it, re-driven if
+            # it is still waiting -- never a second send, never re-offered.
+            return _as_answer_of(action, await self._drive_answered(latest, dispatch=dispatch))
+
+        async def recorded(row: OutboundActionRecord) -> PublicResult:
+            return await self._execute_recorded(row, context, request, enabled=enabled, dispatch=dispatch)
+
+        return await self._settled(action, recorded, agent_facing=True)
+
+    async def _load(self, request: ExecuteRequest) -> ActionContext:
+        try:
+            return await self._context_loader.load(request)
+        except ContextDerivationError:
+            # A text recorded before from_phone existed, repeated word for
+            # word, is that same action on its recorded line. Refused, the
+            # agent's resend with from_phone would be a new action: the
+            # prospect would get the text twice.
+            if request.operation is not Operation.QUO_SMS_SEND or getattr(request.arguments, "from_phone", None):
+                raise
+            recorded = await self._store.request_account(request)
+            if recorded is None:
+                raise
+            return await self._context_loader.load(request, recorded_account=recorded)
+
+    async def _execute_recorded(
+        self,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        request: ExecuteRequest,
+        *,
+        enabled: bool,
+        dispatch: bool,
+    ) -> PublicResult:
         # A wake may hold several actions per role (CDS migration 204); the one
         # the database returned is this request's, whatever its ordinal.
         context = self._context_for(action, context)
@@ -322,9 +454,161 @@ class OutboundActionService:
         return await self._drive(action, context, agent_facing=True, confirm_stale=request.override, dispatch=dispatch)
 
     async def confirm(self, request: ConfirmRequest, *, dispatch: bool = True) -> PublicResult:
-        """Answer a needs_confirmation (stale_context) result: see
-        StaleContextQuestions.confirm."""
-        return await self._stale.confirm(request, dispatch=dispatch)
+        """op confirm. On an action holding a stale_context question it is
+        that question's answer (StaleContextQuestions.confirm); on any other
+        action it is the agent's answer to a refusal: yes still sends it, no
+        records that it chose not to."""
+        parent = await self._require_action(request.action_id)
+        check_own_wake(parent, request)
+        if parent.operation is Operation.QUO_SMS_SEND and request.decision is not StaleContextDecision.NO:
+            # An answer cannot change a text's line, so one it cannot send
+            # from is refused here, before a successor exists to be refused
+            # for it and offered the override again.
+            arguments = parent.execute_request().arguments
+            assert isinstance(arguments, QuoSmsArguments)
+            try:
+                self._context_loader.sending_line(arguments, parent.provider_account)
+            except ContextDerivationError as error:
+                raise refusal(f"confirm refused for action {parent.action_id}: {error}") from error
+        if parent.state is ActionState.STALE and parent.detail_code in STALE_CONTEXT_DETAILS:
+            return await self._stale.confirm(request, parent, dispatch=dispatch)
+        return await self._override(parent, request, dispatch=dispatch)
+
+    async def _override(self, parent: OutboundActionRecord, request: ConfirmRequest, *, dispatch: bool) -> PublicResult:
+        """Answer a refused, failed or deduplicated action (Comm-Data-Store
+        override_outbound_action). yes: a successor with the same request,
+        through the same gate as any send minus the two judgments the agent
+        has just overruled -- the stale_context question and the intent-lock
+        dedupe; the calendar dependency still holds. Repeating it returns the
+        same successor. no: recorded on the action, nothing sent."""
+        decision = request.decision
+        if decision is StaleContextDecision.REVISE:
+            raise refusal(
+                f"confirm refused: revise answers a stale_context question, and action {parent.action_id} "
+                "has none. To send different content, execute it as a new message."
+            )
+        if parent.state is ActionState.RECEIVED and decision is StaleContextDecision.YES:
+            # Left `received` by a failure nothing could record: nothing
+            # picks it up again, so end it here and send it as the successor.
+            # A row another caller has since prepared comes back unchanged.
+            parent = await self._store.reject(
+                parent.action_id, ActionState.RECEIVED, "superseded_by_override", "replaced by your override"
+            )
+        if answer(parent) != decision.value and not overridable(parent):
+            raise refusal(why_not_overridable(parent))
+        if decision is StaleContextDecision.YES and request.reason is None:
+            raise refusal(
+                f"confirm refused: sending action {parent.action_id} anyway needs a reason -- say in \"reason\" "
+                "why you still want to send it."
+            )
+        try:
+            answered = await self._store.override(
+                parent.action_id,
+                wakeup_event_id=request.wakeup_event_id,
+                actor=self._lease_owner,
+                reason=request.reason,
+                decision=decision.value,
+            )
+        except Exception as error:
+            refused = answer_refusal(parent.action_id, error)
+            if refused is None:
+                raise
+            raise refused from error
+        logger.warning(
+            "agent answered %s to action %s on wake %s: %s reason=%r",
+            decision.value,
+            parent.action_id,
+            parent.wakeup_event_id,
+            "not sent" if decision is StaleContextDecision.NO else f"successor {answered.action_id}",
+            request.reason,
+        )
+        if decision is StaleContextDecision.NO:
+            return action_result(answered)
+        return await self._drive_answered(answered, dispatch=dispatch)
+
+    async def _settled(
+        self,
+        action: OutboundActionRecord,
+        step: Callable[[OutboundActionRecord], Awaitable[PublicResult]],
+        *,
+        agent_facing: bool,
+    ) -> PublicResult:
+        """Run one step on a recorded action; whatever it raises becomes a
+        result, never an MCP tool error or a row nothing picks up again. A
+        started send never raises here (_dispatch_stage answers it from the
+        row), so anything that does sent nothing.
+
+        - Transient (errors.classify), with the agent waiting: the step runs
+          once more from the row as it now stands.
+        - A row nothing has started on is then ended `rejected` with the
+          error's words (Comm-Data-Store reject_outbound_action), which the
+          agent can override: a `received` row whenever the agent is
+          waiting, and a `dependency_wait` row (or one Restate prepares) only
+          for a refusal -- a background step that failed for any other
+          reason is left as it is, for Restate's next advance or the worker's
+          next cycle (the retry ceiling still ends it).
+        - Otherwise, or if that cannot be written: failed /
+          gateway_internal_error, naming the action, the row left as it is."""
+        try:
+            return await step(action)
+        except Exception as error:
+            kind = classify(error)
+            if agent_facing and kind is FailureKind.TRANSIENT:
+                logger.warning("action %s: %s; trying once more", action.action_id, error_text(error))
+                try:
+                    return await step(await self._require_action(action.action_id))
+                except Exception as again:
+                    error, kind = again, classify(again)
+            logger.error("action %s: %s error before any send; nothing was sent", action.action_id, kind.value, exc_info=error)
+            return await self._unsent(action, error, kind, agent_facing=agent_facing)
+
+    async def _unsent(
+        self,
+        action: OutboundActionRecord,
+        error: BaseException,
+        kind: FailureKind,
+        *,
+        agent_facing: bool,
+    ) -> PublicResult:
+        """_settled's answer for a step that failed before any send. The
+        database ends the row only if it is still exactly as read here (no
+        lock, attempt or live lease since); otherwise it is reported failed
+        like any row left as it was."""
+        try:
+            current = await self._require_action(action.action_id)
+            if (current.state is ActionState.RECEIVED and (agent_facing or kind is FailureKind.REFUSAL)) or (
+                current.state is ActionState.DEPENDENCY_WAIT and kind is FailureKind.REFUSAL
+            ):
+                words = error_text(error)
+                if kind is FailureKind.TRANSIENT:
+                    words += " (a passing database error, twice; an override retries it)"
+                rejected = await self._store.reject(current.action_id, current.state, _REJECTED_CODES[kind], words)
+                if rejected.state is ActionState.REJECTED:
+                    return action_result(rejected)
+        except Exception:
+            logger.error("action %s: its refusal could not be recorded", action.action_id, exc_info=True)
+        return PublicResult(
+            status=PublicStatus.FAILED,
+            action_id=action.action_id,
+            action_uid=action.action_uid,
+            provider_request_ref=None,
+            detail_code=GATEWAY_INTERNAL_ERROR,
+            detail=(
+                f"Not sent: the gateway hit an error before sending ({error_text(error)}). Nothing went out. "
+                "Execute the same request again to retry, or record needs_human."
+            ),
+        )
+
+    async def _latest_answer(self, action: OutboundActionRecord) -> OutboundActionRecord | None:
+        """The newest successor carrying this action's send after the agent's
+        yes (a failed override can be overridden in turn), if any."""
+        latest = None
+        while answered_by_successor(action):
+            successor = await self._store.successor(action.action_id)
+            if successor is None:
+                break
+            latest = action = successor
+        return latest
 
     async def _drive(
         self,
@@ -335,51 +619,68 @@ class OutboundActionService:
         confirm_stale: bool = False,
         dispatch: bool = True,
     ) -> PublicResult:
-        """The send gate every action passes: the in-flight lease, the
-        stale-context question (asked only of the agent), then the calendar
-        dependency and dispatch (or, with dispatch=False, prepare for Restate
-        without provider I/O)."""
-        held = await self._hold_in_flight(action, context)
-        if held is not None:
-            return held
+        """The send gate every action passes: the stale-context question
+        (asked only of the agent), then SafetyPreflight (recently answered,
+        the calendar dependency) and dispatch (or, with dispatch=False,
+        prepare for Restate without provider I/O)."""
         asked = await self._stale.check(action, context, agent_facing=agent_facing, confirm=confirm_stale, dispatch=dispatch)
         if asked is not None:
             return asked
         if not dispatch:
-            return await self._preflight_without_dispatch(action, context)
+            return await self._preflight_without_dispatch(action, context, agent_facing=agent_facing)
 
         async def _preflight_fallback() -> PublicResult:
-            return await self._preflight(action, context)
+            return await self._preflight(action, context, agent_facing=agent_facing)
 
         return await self._dispatch_stage(action, context, otherwise=_preflight_fallback)
 
     async def _drive_answered(self, successor: OutboundActionRecord, *, dispatch: bool) -> PublicResult:
-        """A yes/revise successor executes its own saved record, like any
-        action, through the same gate as the agent's execute."""
-        if successor.state is ActionState.COMPLETED:
-            return action_result(successor, repeated=True)
-        if successor.state is not ActionState.RECEIVED or not self._is_due(successor):
-            return action_result(successor)
-        context, context_detail, reason = await self._verified_context(successor)
-        if context is None:
-            return action_result(successor, detail=reason or context_detail)
-        return await self._drive(successor, context, agent_facing=True, dispatch=dispatch)
+        """A yes/revise/override successor executes its own saved record,
+        like any action, through the same gate as the agent's execute."""
+
+        async def answered(row: OutboundActionRecord) -> PublicResult:
+            if row.state is ActionState.COMPLETED:
+                return action_result(row, repeated=True)
+            if row.state is not ActionState.RECEIVED or not self._is_due(row):
+                return action_result(row)
+            context, context_detail, reason = await self._verified_context(row)
+            if context is None:
+                # The agent is waiting: a reload that fails is a refusal it
+                # reads (and may override), not a wait nobody sees.
+                raise ContextDerivationError(reason or context_detail)
+            return await self._drive(row, context, agent_facing=True, dispatch=dispatch)
+
+        return await self._settled(successor, answered, agent_facing=True)
 
     async def prepare(self, action_id: UUID) -> PublicResult:
-        """Prepare a persisted remediation successor without provider I/O."""
-        action = await self._require_action(action_id)
-        if action.state is not ActionState.RECEIVED or not self._is_due(action):
-            return action_result(action)
-        context, context_detail, reason = await self._verified_context(action)
-        if context is None:
-            return action_result(action, detail=reason or context_detail)
-        return await self._drive(action, context, dispatch=False)
+        """Prepare a persisted remediation successor without provider I/O
+        (Restate's coordinator, for a `received` row). A context reload that
+        fails answers persisted_context_unavailable, which the coordinator
+        waits on and reloads (it can fail for a while: wake 27321)."""
 
-    async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        async def received(action: OutboundActionRecord) -> PublicResult:
+            if action.state is not ActionState.RECEIVED or not self._is_due(action):
+                return action_result(action)
+            context, context_detail, reason = await self._verified_context(action)
+            if context is None:
+                return action_result(action, detail=reason, detail_code=context_detail)
+            return await self._drive(action, context, dispatch=False)
+
+        return await self._settled(await self._require_action(action_id), received, agent_facing=False)
+
+    async def _preflight_without_dispatch(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool = False) -> PublicResult:
+        try:
+            decision, row = await self._prepare_checked(action, context, agent_facing=agent_facing)
+        except ContactLockTimeoutError as busy:
+            if not agent_facing:
+                raise
+            return self._contact_busy(action, busy)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
-            return action_result(prepared, repeated=prepared.state is ActionState.COMPLETED)
+            assert row is not None
+            return action_result(row, repeated=row.state is ActionState.COMPLETED)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            assert row is not None
+            return self._refused(action, decision, row)
         return await self._apply_preflight_decision(action, decision)
 
     async def _dispatch_stage(
@@ -397,25 +698,14 @@ class OutboundActionService:
         DEPENDENCY_WAIT/PREPARED/RETRY_READY, but resume() is a public
         method with no such guarantee from other callers, so its historical
         "return the row as-is" fallback for any other state must not
-        silently become _preflight()). All three routes -- including
-        `otherwise` -- can reach _dispatch()'s adapter.invoke()/
-        adapter.poll() provider I/O, so all three are covered by the same
-        try/except below.
+        silently become _preflight()).
 
-        An exception here never escapes to the MCP caller as a raised error:
-        FastMCP wraps it as "Error executing tool outbound_action: ...", which
-        the CDS reconciler reads as proof nothing was sent.
-
-        - Once adapter.invoke() has started (_ProviderCallAttemptedError) the
-          provider may have the request: log at ERROR and return the row's
-          durable state (dispatching -> lease expiry -> reconcile).
-        - Before it, nothing was sent: log at ERROR and tell the caller so.
-          The row stays where it was left; executing the same request again
-          re-runs the send from there. Nothing is retried on the agent's
-          behalf -- it decides.
-
-        Context load/validation (everything in execute() before this call)
-        still raises.
+        Once adapter.invoke() has started (_ProviderCallAttemptedError) the
+        provider may have the request: log at ERROR and return the row's
+        durable state (dispatching -> lease expiry -> reconcile), or, if even
+        that read fails, a plain "not yet confirmed" -- never "not sent".
+        Anything raised before it sent nothing and goes to the caller's
+        _settled.
         """
         try:
             if action.state is ActionState.DEPENDENCY_WAIT:
@@ -431,59 +721,139 @@ class OutboundActionService:
                 action.action_id,
                 exc_info=attempted.__cause__,
             )
-            return action_result(await self._require_action(action.action_id))
-        except Exception as error:
-            logger.error(
-                "pre-send exception on wake %s action %s -- nothing was sent",
-                context.wakeup_event_id,
-                action.action_id,
-                exc_info=True,
-            )
-            lines = str(error).strip().splitlines()
-            reason = f"{type(error).__name__}: {lines[0][:200]}" if lines else type(error).__name__
-            return PublicResult(
-                status=PublicStatus.FAILED,
-                action_id=action.action_id,
-                action_uid=action.action_uid,
-                provider_request_ref=None,
-                detail_code="gateway_internal_error",
-                detail=(
-                    f"Not sent: the gateway hit an internal error before sending ({reason}). Nothing went out. "
-                    "Execute the same request again to retry, or record needs_human."
-                ),
-            )
-
-    async def _hold_in_flight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult | None:
-        """Another wake's send to this recipient still in flight: wait. Not a
-        judgment -- the row stays re-drivable and the worker's next resume()
-        re-runs this check. off: no probe call; shadow: log only."""
-        if self._traffic_mode == "off" or self._traffic_probe is None:
-            return None
-        detail = await in_flight_hold(
-            self._traffic_probe, recipient_key=context.prospect_id, action_id=context.action_id, logger=logger
-        )
-        if detail is None:
-            return None
-        if self._traffic_mode != "enforce":
-            logger.warning(
-                "traffic control shadow would-block: lease_held %s wake=%s recipient=%s",
-                detail,
-                context.wakeup_event_id,
-                context.prospect_id,
-            )
-            return None
-        held = action
-        if action.state is ActionState.RECEIVED:
-            # claim_outbound_action's live whitelist excludes 'received': a
-            # fresh row first moves through prepare_outbound_action_and_acquire_lock,
-            # the same call the READY path uses (Comm-Data-Store 067/068).
-            held = await self._store.prepare(context, action.state)
-            if held.state is ActionState.COMPLETED:
-                return action_result(held, repeated=True)
-        return action_result(held, detail_code="lease_held", detail=detail)
+            try:
+                return action_result(await self._require_action(action.action_id))
+            except Exception:
+                logger.error("action %s: its row could not be read back after dispatch", action.action_id, exc_info=True)
+                return action_result(dataclass_replace(action, state=ActionState.DISPATCHING))
 
     async def status(self, action_id: UUID) -> PublicResult:
-        return action_result(await self._require_action(action_id))
+        """The action as it stands -- or, once the agent's yes sent it as a
+        successor, that successor (never the override again)."""
+        action = await self._require_action(action_id)
+        latest = await self._latest_answer(action)
+        if latest is None:
+            return action_result(action)
+        return _as_answer_of(action, action_result(latest))
+
+    async def earlier_identical_sends(self, action_id: UUID) -> tuple[AlreadySent, ...]:
+        """Other actions that already delivered exactly this request (see
+        PostgresActionStore.earlier_identical_sends). Empty when the store
+        cannot tell: the lookup only adds to a refusal, it never blocks one."""
+        finder = getattr(self._store, "earlier_identical_sends", None)
+        if finder is None:
+            return ()
+        try:
+            rows = await finder(action_id)
+        except Exception:
+            logger.warning("earlier identical send lookup failed for %s", action_id, exc_info=True)
+            return ()
+        return tuple(AlreadySent.model_validate(row) for row in rows or ())
+
+    async def _prepare_checked(
+        self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool
+    ) -> tuple[PreflightDecision, OutboundActionRecord | None]:
+        """SafetyPreflight's decision for a row about to be prepared, and the
+        row it leaves: prepared when READY, rejected when REFUSED, None
+        otherwise (the caller applies a calendar decision).
+
+        A customer reply that answers a prospect is decided and prepared
+        inside one transaction holding the advisory lock of each of its
+        contact keys (PostgresActionStore.contact_serialized): a second
+        reply to the same person, from any lane or address, waits until
+        the first is recorded in flight, then sees it and is asked about
+        it. A key still locked after contact_lock_timeout_ms raises
+        ContactLockTimeoutError (nothing recorded); keys that cannot be read
+        send unserialized, like a failed lookup."""
+        evidence = await self._evidence_loader.load(context)
+        if not SafetyPreflight.counts_as_answer(action.action_role, action.intent_kind):
+            return await self._decided(self._store, action, context, evidence, None)
+        serialized = getattr(self._store, "contact_serialized", None)
+        if serialized is not None:
+            try:
+                async with serialized(action.action_id, lock_timeout_ms=self._contact_lock_timeout_ms) as store:
+                    answered = await self._answered(store, action, agent_facing=agent_facing)
+                    return await self._decided(store, action, context, evidence, answered)
+            except ContactSerializationUnavailableError:
+                logger.warning("contact keys unavailable for action %s; preparing it unserialized", action.action_id, exc_info=True)
+        answered = await self._answered(self._store, action, agent_facing=agent_facing)
+        return await self._decided(self._store, action, context, evidence, answered)
+
+    async def _answered(self, store: Any, action: OutboundActionRecord, *, agent_facing: bool) -> RecentlyAnsweredEvidence | None:
+        """Other wakes' replies to this person, or None when not asked
+        (SafetyPreflight.asks_recently_answered) or the lookup failed -- a
+        failed lookup never stops a send."""
+        if not SafetyPreflight.asks_recently_answered(
+            action.action_role,
+            action.intent_kind,
+            is_answer=action.retry_of_action_id is not None or action.remediation_reason is not None,
+            askable=agent_facing and action.state is ActionState.RECEIVED,
+        ):
+            return None
+        finder = getattr(store, "recently_answered", None)
+        if finder is None:
+            return None
+        try:
+            return _recently_answered_evidence(list(await finder(action.action_id, as_of=self._clock()) or ()))
+        except Exception:
+            logger.warning("recently-answered lookup failed for %s; the send proceeds", action.action_id, exc_info=True)
+            return None
+
+    async def _decided(
+        self,
+        store: Any,
+        action: OutboundActionRecord,
+        context: ActionContext,
+        evidence: PreflightEvidence,
+        answered: RecentlyAnsweredEvidence | None,
+    ) -> tuple[PreflightDecision, OutboundActionRecord | None]:
+        decision = SafetyPreflight.evaluate(context, evidence, answered)
+        if decision.outcome is PreflightOutcome.READY:
+            return decision, await store.prepare(context, action.state)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            words = recently_answered_detail(decision.recently_answered, now=self._clock())
+            return decision, await store.reject(action.action_id, action.state, decision.detail_code, words)
+        return decision, None
+
+    def _refused(self, action: OutboundActionRecord, decision: PreflightDecision, rejected: OutboundActionRecord) -> PublicResult:
+        """A REFUSED decision's result: the rejected row, naming the earlier
+        replies; or, when another caller moved the row first, the row as it
+        stands."""
+        if rejected.state is not ActionState.REJECTED:
+            return action_result(rejected)
+        first = decision.recently_answered[0]
+        logger.warning(
+            "recently answered: wake %s action %s refused; %s got action %s (%s) from wake %s at %s",
+            action.wakeup_event_id,
+            action.action_id,
+            first.recipient,
+            first.action_id,
+            first.reply_status,
+            first.wakeup_event_id,
+            first.sent_at,
+        )
+        return action_result(rejected).model_copy(update={"recently_answered": decision.recently_answered})
+
+    def _contact_busy(self, action: OutboundActionRecord, busy: ContactLockTimeoutError) -> PublicResult:
+        """The agent's reply waited past contact_lock_timeout_ms for another
+        reply to the same person: not sent, nothing recorded, retryable. Never
+        sent unchecked (two replies at once is the race this lock prevents),
+        and never ended `rejected` (its override would skip the check)."""
+        logger.warning("action %s: %s; refused, retryable", action.action_id, busy)
+        seconds = self._contact_lock_timeout_ms / 1000
+        return PublicResult(
+            status=PublicStatus.FAILED,
+            action_id=action.action_id,
+            action_uid=action.action_uid,
+            provider_request_ref=None,
+            retryable=True,
+            detail_code=CONTACT_REPLY_BUSY_DETAIL,
+            detail=(
+                f"Not sent: another reply to this person was being recorded and the gateway waited {seconds:g}s "
+                "for it. Nothing went out from this action. Execute the same request again in a few seconds: "
+                "if that reply already answers them, you will be shown it first."
+            ),
+        )
 
     async def action_operation(self, action_id: UUID) -> Operation | None:
         action = await self._store.get(action_id)
@@ -496,8 +866,12 @@ class OutboundActionService:
         """The worker (or Restate) advancing a saved action. Nobody can be
         asked here, and no answer means no send: with unshown newer context
         the action ends as a `stale_context_unasked` no-send; with nothing
-        newer the saved record is sent. The in-flight lease still applies."""
-        action = await self._require_action(action_id)
+        newer the saved record is sent. The in-flight lease still applies.
+        Only a refusal ends the row here (_settled): anything else is left
+        for the next advance."""
+        return await self._settled(await self._require_action(action_id), self._resume_due, agent_facing=False)
+
+    async def _resume_due(self, action: OutboundActionRecord) -> PublicResult:
         if not self._is_due(action):
             return action_result(action)
         context, context_detail, reason = await self._verified_context(action)
@@ -527,9 +901,6 @@ class OutboundActionService:
                 # staff warning -- never a silent dead end.
                 return await self._recovery.reload_retry(action, context_detail, reason)
             return await self._recovery.manual_review(action, context_detail, reason=reason)
-        held = await self._hold_in_flight(action, context)
-        if held is not None:
-            return held
         unasked = await self._stale.check(action, context, agent_facing=False)
         if unasked is not None:
             return unasked
@@ -543,14 +914,31 @@ class OutboundActionService:
         return await self._recovery.reconcile(action_id)
 
     async def exhaust(self, action_id: UUID) -> PublicResult:
-        """Close exhausted work without another provider invocation."""
+        """Close exhausted work without another provider invocation. A row
+        still `received` was never prepared: nothing was sent."""
+        action = await self._require_action(action_id)
+        if action.state is ActionState.RECEIVED:
+            return action_result(
+                await self._store.reject(
+                    action_id, ActionState.RECEIVED, _UNPREPARED_DETAIL, "it could not be prepared within the retry window"
+                )
+            )
         return await self._recovery.exhaust(action_id)
 
-    async def _preflight(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
-        """The calendar dependency, then dispatch (execute and confirm)."""
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+    async def _preflight(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool = False) -> PublicResult:
+        """SafetyPreflight (recently answered, the calendar dependency), then
+        dispatch (execute and confirm)."""
+        try:
+            decision, prepared = await self._prepare_checked(action, context, agent_facing=agent_facing)
+        except ContactLockTimeoutError as busy:
+            if not agent_facing:
+                raise
+            return self._contact_busy(action, busy)
+        if decision.outcome is PreflightOutcome.REFUSED:
+            assert prepared is not None
+            return self._refused(action, decision, prepared)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
+            assert prepared is not None
             if prepared.state is ActionState.COMPLETED:
                 return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:
@@ -565,9 +953,9 @@ class OutboundActionService:
             self._lease_owner,
             self._lease_seconds,
         )
-        decision = SafetyPreflight.evaluate(context, await self._evidence_loader.load(context))
+        decision, prepared = await self._prepare_checked(action, context, agent_facing=False)
         if decision.outcome is PreflightOutcome.READY:
-            prepared = await self._store.prepare(context, action.state)
+            assert prepared is not None
             if prepared.state is ActionState.COMPLETED:
                 return action_result(prepared, repeated=True)
             if prepared.state is ActionState.DEPENDENCY_WAIT:
@@ -863,7 +1251,7 @@ class OutboundActionService:
         record on the attempt (recovery.py) or show the agent (`detail`).
         None on any success."""
         try:
-            live = await self._context_loader.load(action.execute_request())
+            live = await self._context_loader.load(action.execute_request(), recorded_account=action.provider_account)
         except ContextDerivationError as error:
             reason = _bounded_reload_reason(error)
             logger.warning(
@@ -929,6 +1317,15 @@ class OutboundActionService:
 
     def _is_due(self, action: OutboundActionRecord) -> bool:
         return is_due(action, self._clock())
+
+
+def _as_answer_of(parent: OutboundActionRecord, result: PublicResult) -> PublicResult:
+    """The successor's result, named as the answer to the action the agent
+    asked about."""
+    if result.action_id == parent.action_id:
+        return result
+    note = f"Action {parent.action_id} was not sent itself; your answer sent it as action {result.action_id}."
+    return result.model_copy(update={"detail": f"{note} {result.detail}" if result.detail else note})
 
 
 class _ProviderCallAttemptedError(Exception):

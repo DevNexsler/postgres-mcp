@@ -79,3 +79,21 @@ async def test_warn_once_swallows_a_send_failure_without_raising() -> None:
     port = CliqStaffWarningPort(service)
 
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
+
+
+@pytest.mark.asyncio
+async def test_a_warning_the_gateway_records_rejected_is_logged_like_a_failed_one(caplog) -> None:
+    """A closed wake now records the warning rejected (a result, not a
+    raise): it must stay as visible as the raise was."""
+    from types import SimpleNamespace
+
+    from postgres_mcp.outbound_gateway.models import PublicStatus
+
+    service = AsyncMock()
+    service.execute.return_value = SimpleNamespace(status=PublicStatus.REJECTED, detail_code="wake_terminal")
+    port = CliqStaffWarningPort(service)
+
+    with caplog.at_level("ERROR"):
+        await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
+
+    assert any("was not posted: rejected wake_terminal" in record.getMessage() for record in caplog.records)

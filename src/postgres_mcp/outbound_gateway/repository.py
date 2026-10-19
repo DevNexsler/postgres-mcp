@@ -14,7 +14,6 @@ from postgres_mcp.sql import SafeSqlDriver
 from .models import ActionRole
 from .models import NewerActivity
 from .models import Operation
-from .traffic_control import InFlightAction
 
 if TYPE_CHECKING:
     from .context import ActionContext
@@ -23,16 +22,6 @@ if TYPE_CHECKING:
 # states still has an in-flight lease on its recipient. Everything else
 # (completed, stale, rejected, definitive_failed, dead_letter,
 # manual_review) is terminal or parked and does not hold the lease.
-NON_TERMINAL_STATES = (
-    "received",
-    "dependency_wait",
-    "prepared",
-    "dispatching",
-    "provider_accepted",
-    "unknown",
-    "reconciling",
-    "retry_ready",
-)
 
 
 @dataclass(frozen=True)
@@ -78,8 +67,13 @@ class ConversationSnapshot:
 
 @dataclass(frozen=True)
 class AliasResolution:
+    """The wake's personal aliases (hub aliases left out: Comm-Data-Store
+    outbound_alias_is_hub, the one hub rule) and the one outbound-action
+    subject they name, if they name exactly one. Several subjects are
+    merged by the database when it takes the intent lock (migration 251)."""
+
     canonical_subject: str | None
-    ambiguous: bool = False
+    personal_aliases: tuple[str, ...] = ()
 
 
 class ContextRepository(Protocol):
@@ -92,10 +86,6 @@ class ContextRepository(Protocol):
         aliases: tuple[str, ...],
         property_scope: str,
     ) -> AliasResolution: ...
-
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]: ...
 
     async def newer_context(
         self,
@@ -189,59 +179,27 @@ class OutboundGatewayRepository:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
+            WITH personal AS (
+                SELECT DISTINCT alias
+                FROM unnest({}::text[]) AS given(alias)
+                WHERE NOT outbound_alias_is_hub(alias)
+            ), subjects AS (
+                SELECT DISTINCT bound.canonical_subject
+                FROM outbound_action_subject_aliases AS bound
+                JOIN personal ON personal.alias = bound.alias_key
+                WHERE bound.scope_key IN ('', {})
+            )
             SELECT
-                count(DISTINCT canonical_subject)::integer AS subject_count,
-                min(canonical_subject) AS canonical_subject
-            FROM outbound_action_subject_aliases
-            WHERE alias_key = ANY({})
-              AND scope_key IN ('', {})
+                (SELECT coalesce(array_agg(alias ORDER BY alias), ARRAY[]::text[]) FROM personal) AS personal_aliases,
+                (SELECT min(canonical_subject) FROM subjects HAVING count(*) = 1) AS canonical_subject
             """,
             [list(aliases), property_scope],
         )
-        if not rows:
-            return AliasResolution(canonical_subject=None)
-        cells = rows[0].cells
+        cells = rows[0].cells if rows else {}
         return AliasResolution(
             canonical_subject=cells.get("canonical_subject"),
-            ambiguous=int(cells.get("subject_count") or 0) > 1,
+            personal_aliases=tuple(cells.get("personal_aliases") or ()),
         )
-
-    async def in_flight_actions(
-        self, recipient_key: str, exclude_action_id: UUID
-    ) -> list[InFlightAction]:
-        rows = await SafeSqlDriver.execute_param_query(
-            self._driver,
-            """
-            SELECT
-                action_id,
-                operation,
-                state,
-                created_at,
-                left(coalesce(arguments::text,''), 120) AS preview
-            FROM outbound_actions
-            WHERE subject_key = {}
-              AND action_id <> {}
-              -- The wake's own other actions are its agent's work, not
-              -- someone else's send racing this one (CDS migration 204).
-              AND wakeup_event_id IS DISTINCT FROM (
-                  SELECT own.wakeup_event_id FROM outbound_actions AS own
-                  WHERE own.action_id = {}
-              )
-              AND state = ANY({})
-            ORDER BY created_at
-            """,
-            [recipient_key, exclude_action_id, exclude_action_id, list(NON_TERMINAL_STATES)],
-        )
-        return [
-            InFlightAction(
-                action_id=UUID(str(row.cells["action_id"])),
-                operation=str(row.cells["operation"]),
-                state=str(row.cells["state"]),
-                created_at=row.cells["created_at"],
-                preview=str(row.cells.get("preview") or ""),
-            )
-            for row in rows or []
-        ]
 
     async def newer_context(
         self,
@@ -286,10 +244,21 @@ class OutboundGatewayRepository:
           phone, a post in that Cliq chat, a message in that TenantCloud
           thread), and another wake's gateway send to the same subject that
           started dispatch.
-        - Never this wake's own sends, the source message or its duplicates,
+        - Never this turn's own sends, the source message or its duplicates,
           certified-older Zillow scrapes, or Nigel's automated cron alerts.
 
-        waive_shown leaves out what this wake's agent was already shown for
+        One Hermes turn is one agent. CDS steers a person's later messages
+        into the turn already running for them, so one turn answers several
+        wakes, and every wake delivered into it carries that turn's
+        (webui_session_id, webui_stream_id). A send by ANY of those wakes is
+        the agent's own work, never news to another of them; a wake that was
+        not steered is a turn of its own, exactly as before. Inbound
+        messages still count (a steered message may not have reached the
+        agent yet when it sends). Wakes 27457-27459 (2026-10-01): "2+4",
+        "tell me a short story" and "9+4" in one turn; the story sent for
+        27458 made 27459's "13" stale twice, and it went out 3.5 min late.
+
+        waive_shown leaves out what this turn's agent was already shown for
         this recipient (migration 192), by identity (the shown-refs ledger,
         unrelated to CDS person identity above).
 
@@ -323,6 +292,21 @@ class OutboundGatewayRepository:
                 SELECT coalesce(event.webui_accepted_at, event.created_at) AS at
                 FROM hermes_wakeup_events AS event, p
                 WHERE event.id = p.wake
+            ), turn AS (
+                -- The agent: this wake and every wake delivered into the same
+                -- Hermes turn (CDS steering). A wake that was not steered is
+                -- a turn of its own.
+                SELECT p.wake AS wakeup_event_id FROM p
+                UNION
+                SELECT other.id
+                FROM hermes_wakeup_events AS this
+                JOIN hermes_wakeup_events AS other
+                  ON other.webui_session_id = this.webui_session_id
+                 AND other.webui_stream_id = this.webui_stream_id
+                CROSS JOIN p
+                WHERE this.id = p.wake
+                  AND this.webui_session_id IS NOT NULL
+                  AND this.webui_stream_id IS NOT NULL
             ), identity AS (
                 -- CDS's own identity resolution for this wake (the same
                 -- envelope the agent reads). When resolved, "newer" is
@@ -349,11 +333,11 @@ class OutboundGatewayRepository:
                 FROM outbound_actions AS action
                 CROSS JOIN LATERAL unnest(action.stale_context_shown_refs) AS shown(ref), p
                 WHERE p.waive_shown
-                  AND action.wakeup_event_id = p.wake
+                  AND action.wakeup_event_id IN (SELECT turn.wakeup_event_id FROM turn)
                   AND action.subject_key = p.subject
                   AND action.state = 'stale'
             ), own_send AS (
-                -- This wake's own sends are its agent's work, not news.
+                -- This turn's own sends are its agent's work, not news.
                 -- Providers spell the id differently in the ledger and in
                 -- messages ("tenantcloud-message:1" vs
                 -- "tenantcloud:thread-message:1", "a%20b" vs "a_b"): compare
@@ -363,8 +347,8 @@ class OutboundGatewayRepository:
                     nullif(regexp_replace(replace(regexp_replace(
                         own.provider_message_id, '^.*:', ''), '%20', ''),
                         '[^0-9A-Za-z]', '', 'g'), '') AS message_key
-                FROM outbound_actions AS own, p
-                WHERE own.wakeup_event_id = p.wake
+                FROM outbound_actions AS own
+                WHERE own.wakeup_event_id IN (SELECT turn.wakeup_event_id FROM turn)
             ), candidate AS (
                 SELECT
                     message.id,
@@ -630,9 +614,9 @@ class OutboundGatewayRepository:
                     LIMIT 1
                 ), false)
             ), sent_action AS (
-                -- No resolved identity: today's fallback, unchanged -- another
-                -- wake's gateway send to this subject that started dispatch
-                -- (it may not be ingested back as a message yet).
+                -- No resolved identity: today's fallback -- another turn's
+                -- gateway send to this subject that started dispatch (it may
+                -- not be ingested back as a message yet).
                 SELECT
                     ledger.action_id,
                     ledger.operation,
@@ -644,14 +628,16 @@ class OutboundGatewayRepository:
                 CROSS JOIN identity
                 WHERE identity.entity_uuid IS NULL
                   AND ledger.subject_key = p.subject
-                  AND ledger.wakeup_event_id IS DISTINCT FROM p.wake
+                  AND NOT EXISTS (
+                      SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
+                  )
                   AND ledger.created_at > watermark.at
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
                   AND (ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed')
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), identity_sent AS (
                 -- Identity resolved: any gateway send belonging to another
-                -- wake CDS resolved to the same person -- whatever its
+                -- turn's wake CDS resolved to the same person -- whatever its
                 -- operation, channel or source -- counts, whether or not it
                 -- has been ingested back as a message yet. Only a state that
                 -- means sent or may have been sent; a definitive failure
@@ -667,6 +653,9 @@ class OutboundGatewayRepository:
                 CROSS JOIN watermark
                 WHERE ledger.created_at > watermark.at
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
+                  )
                   AND ledger.state = ANY(ARRAY['completed', 'dispatching', 'unknown', 'reconciling', 'provider_accepted'])
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), found AS (
