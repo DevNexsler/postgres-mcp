@@ -2012,27 +2012,9 @@ def test_quo_provider_calls_wait_as_long_as_quo_waits_for_its_carrier():
 
 
 @pytest.mark.parametrize("operation", [Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST])
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("@Laura", "{@831516013}"),
-        ("@Joycelyn @Gunther @Rafael", "{@886906165} {@845641266} {@928702883}"),
-        ("@Dan Park", "{@720844989}"),
-        ("@jOyCeLyN sMiTh!", "{@886906165}!"),
-        ("@Nigel Pine / @Rafael Boundurant", "{@918334727} / {@928702883}"),
-        ("laura@pfg.io", "laura@pfg.io"),
-        ("x@Laura.com @Laura.example", "x@Laura.com @Laura.example"),
-        ("{@831516013} {@Laura}", "{@831516013} {@Laura}"),
-        ("@Unknown @Laurance @Laura2 @Laura_name", "@Unknown @Laurance @Laura2 @Laura_name"),
-        ("(@Laura), @Dan!", "({@831516013}), {@720844989}!"),
-    ],
-)
-def test_cliq_staff_mentions_preserve_payload_identity(operation, text, expected):
+@pytest.mark.parametrize("text", ["{@100000001} please check", "{@200000002} {@300000003}", "@Laura laura@example.invalid"])
+def test_cliq_preserves_agent_authored_mentions_without_name_rewriting(operation, text):
     original = context(operation, arguments=MappingProxyType({"text": text}))
-    adapter = CliqAdapter(operation)
-    request = adapter.build_request(original, ACTION_UID)
-    assert request.arguments["text"] == expected
+    request = CliqAdapter(operation).build_request(original, ACTION_UID)
+    assert request.arguments["text"] == text
     assert original.arguments["text"] == text
-    assert original.payload_hash == "a" * 64
-    assert request.arguments["idempotency_key"] == f"cliq-wake:7:internal_notification:{operation.value}"
-    assert adapter.build_request(original, ACTION_UID) == request

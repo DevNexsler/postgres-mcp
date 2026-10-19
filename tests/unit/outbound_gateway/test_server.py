@@ -824,3 +824,13 @@ async def test_thread_offloaded_adapter_delegates_reconcile_and_sync_methods():
     assert inner.parse_receipt_calls == [("ctx", "obs")]
     assert receipt == "receipt"
     assert reconciled == "reconcile-result"
+
+
+@pytest.mark.asyncio
+async def test_public_tool_teaches_cliq_tags_from_verified_user_ids():
+    mcp = create_server(AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False))
+    tool = next(tool for tool in await mcp.list_tools() if tool.name == "outbound_action")
+    assert "{@<user_id>}" in tool.description
+    assert "sender.participant_key" in tool.description
+    assert "resolve_cliq_staff_dm" in tool.description
+    assert "chat/channel IDs" in tool.description
