@@ -47,3 +47,13 @@ def test_a_text_without_from_phone_stores_exactly_as_before():
     assert request_arguments(QuoSmsArguments(to_phone="+12015756789", text="hi", from_phone="+17579972130")) == {
         "to_phone": "+12015756789", "text": "hi", "from_phone": "+17579972130",
     }
+
+
+def test_sor_property_reference_participates_in_request_identity():
+    first = _email(property_ref={"building_id": 7, "unit_id": 12})
+    same = _email(property_ref={"building_id": 7, "unit_id": 12})
+    other_unit = _email(property_ref={"building_id": 7, "unit_id": 13})
+    assert same_request(first, same)
+    assert not same_request(first, other_unit)
+    assert not same_request(first, _email())
+    assert request_arguments(first.arguments)["property_ref"] == {"building_id": 7, "unit_id": 12}

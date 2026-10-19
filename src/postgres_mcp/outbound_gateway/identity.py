@@ -22,7 +22,7 @@ from .models import Operation
 # when omitted, so every existing action keeps its stored arguments and
 # payload hash.
 LATER_OPTIONAL_ARGUMENTS = frozenset(
-    {"subject", "cc", "title", "duration_minutes", "location", "attendees", "attachments", "from_phone"}
+    {"subject", "cc", "title", "duration_minutes", "location", "attendees", "attachments", "from_phone", "property_ref"}
 )
 
 

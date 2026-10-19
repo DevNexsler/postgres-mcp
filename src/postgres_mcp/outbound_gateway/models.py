@@ -297,7 +297,32 @@ class EmailAttachment(StrictModel):
         return len(base64.b64decode(self.content_base64))
 
 
-class EmailArguments(StrictModel):
+class SorPropertyReference(StrictModel):
+    """Caller-resolved SOR inventory identity; labels are never identifiers."""
+
+    building_id: int = Field(gt=0, strict=True, description="Buildings.id from SOR inventory; never a TenantCloud ID or Factbook UUID.")
+    unit_id: int | None = Field(default=None, gt=0, strict=True, description="Building Units.id from the same SOR building, when this action concerns one unit.")
+
+
+PROPERTY_REFERENCE_GUIDANCE = (
+    'Optional arguments.property_ref is {"building_id": <SOR Buildings.id>, '
+    '"unit_id": <SOR Building Units.id or null>}. Use upstream property_identity '
+    "when available; otherwise resolve building/unit through SOR inventory before "
+    "property-specific work. SOR owns addresses/aliases and Building Units.Buildings_id "
+    "links unit to building. Factbook inventory_building_id/inventory_unit_id are linked "
+    "SOR IDs. Pass both IDs for one unit; omit when unresolved. Never invent IDs from "
+    "address text. This reference controls locking, not the displayed location."
+)
+
+
+class PropertyArguments(StrictModel):
+    property_ref: SorPropertyReference | None = Field(
+        default=None,
+        description=PROPERTY_REFERENCE_GUIDANCE,
+    )
+
+
+class EmailArguments(PropertyArguments):
     to_address: str
     text: str
     # Optional: the subject defaults to "Re: <the wake's subject>". cc
@@ -354,7 +379,7 @@ class EmailArguments(StrictModel):
         return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
 
 
-class QuoSmsArguments(StrictModel):
+class QuoSmsArguments(PropertyArguments):
     to_phone: str
     text: str
     # The line to send from, by its number (context.RoutingPolicy.
@@ -400,7 +425,7 @@ class CliqArguments(StrictModel):
         return normalize_public_text(value, field="text", minimum=1, maximum=10_000)
 
 
-class CalendarCreateArguments(StrictModel):
+class CalendarCreateArguments(PropertyArguments):
     calendar_id: str
     description: str | None = None
     # Optional event details. Defaults suit a tour: "Tour — <prospect>", 30
@@ -438,7 +463,7 @@ class CalendarCreateArguments(StrictModel):
         return normalize_public_text(value, field="description", minimum=0, maximum=10_000)
 
 
-class CalendarUpdateArguments(StrictModel):
+class CalendarUpdateArguments(PropertyArguments):
     calendar_id: str
     event_url: str | None = None
     etag: str | None = None
@@ -494,7 +519,7 @@ class CalendarUpdateArguments(StrictModel):
         return normalize_public_text(value, field="description", minimum=0, maximum=10_000)
 
 
-class CalendarDeleteArguments(StrictModel):
+class CalendarDeleteArguments(PropertyArguments):
     calendar_id: str
     event_url: str | None = None
     etag: str | None = None

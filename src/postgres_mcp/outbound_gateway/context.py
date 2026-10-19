@@ -31,6 +31,7 @@ from .models import IntentKind
 from .models import LeadStatusArguments
 from .models import MaintenanceCreateArguments
 from .models import MaintenanceStatusArguments
+from .models import SorPropertyReference
 from .models import Operation
 from .models import QuoSmsArguments
 from .models import RequestRefusedError
@@ -40,7 +41,6 @@ from .repository import WakeEventRecord
 
 ACTION_NAMESPACE = UUID("ed6fcf85-39e7-5cdf-9fb8-ccca32a62e8d")
 INTERNAL_ACTION_NAMESPACE = UUID("9af724c8-470b-54be-a4cc-e77a159b49ae")
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _SYSTEM_EMAIL_LOCAL_PARTS = frozenset({"mailer-daemon", "no-reply", "noreply", "do-not-reply", "donotreply", "postmaster"})
 _ZILLOW_PROVIDER_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
@@ -61,20 +61,6 @@ _TENANTCLOUD_OPERATIONS = frozenset(
 # Messages to staff, keyed on their recipient (see load()). Cliq is staff only.
 _STAFF_ROLES = frozenset({ActionRole.INTERNAL_NOTIFICATION, ActionRole.INTERNAL_REPLY})
 _CLIQ_OPERATIONS = frozenset({Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST})
-_ADDRESS_WORDS = {
-    "n": "north",
-    "s": "south",
-    "e": "east",
-    "w": "west",
-    "st": "street",
-    "rd": "road",
-    "ave": "avenue",
-    "blvd": "boulevard",
-    "dr": "drive",
-    "ln": "lane",
-    "ct": "court",
-}
-
 
 class ContextDerivationError(RequestRefusedError):
     pass
@@ -93,7 +79,6 @@ class RoutingPolicy:
     email_account_by_provider: Mapping[str, str]
     calendar_by_profile: Mapping[str, str]
     cliq_target_by_intent: Mapping[str, str]
-    property_aliases: Mapping[str, str]
     conversation_aliases: Mapping[str, str]
     calendar_account_by_profile: Mapping[str, str] = dataclass_field(default_factory=dict)
     # Numeric Cliq channel id -> AES channel_unique_name. Only consulted for
@@ -155,11 +140,6 @@ class ActionContext:
 
 def normalize_string(value: str) -> str:
     return normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
-
-
-def normalize_property_key(value: str | None) -> str:
-    tokens = _NON_ALNUM.sub(" ", normalize_string(value or "").casefold()).split()
-    return " ".join(_ADDRESS_WORDS.get(token, token) for token in tokens)
 
 
 def normalize_phone(value: str | None) -> str | None:
@@ -263,10 +243,13 @@ class ActionContextLoader:
         # still records it, even with no allowlist gating it anymore.
         provider = "tenantcloud" if request.operation in _TENANTCLOUD_OPERATIONS else self._provider(record, raw, message)
         property_label = self._property_label(record, envelope, raw, message)
-        property_scope = normalize_property_key(property_label)
-        property_id = self._policy.property_aliases.get(property_scope)
-        if property_scope and property_id is None:
-            property_id = f"property:{property_scope.replace(' ', '-')}"
+        property_ref = getattr(request.arguments, "property_ref", None)
+        if property_ref is None and envelope.get("property_identity") is not None:
+            property_ref = SorPropertyReference.model_validate(envelope["property_identity"])
+        building_id = f"sor:building:{property_ref.building_id}" if property_ref else None
+        unit_id = f"sor:unit:{property_ref.unit_id}" if property_ref and property_ref.unit_id is not None else None
+        property_id = f"{building_id}:unit:{property_ref.unit_id}" if unit_id else building_id
+        property_scope = property_id or ""
         if request.operation is Operation.TENANTCLOUD_MAINTENANCE_CREATE:
             assert isinstance(request.arguments, MaintenanceCreateArguments)
             property_id = str(request.arguments.property_id)
@@ -399,8 +382,7 @@ class ActionContextLoader:
         }
         property_source: str | None = None
         if requires_property and property_id is None:
-            # No stable property anywhere on the wake, and no routing-policy
-            # alias covers it either. This used to hard-fail every
+            # No SOR property reference supplied. This used to hard-fail every
             # propertyless showing action -- a Quo or plain-SMS wake could
             # never do a calendar create/update/delete, and the refusal
             # pointed the agent at intent_kind inquiry_reply, which forbids
@@ -491,10 +473,10 @@ class ActionContextLoader:
             "cross_channel_duplicate_message_ids": list(cross_channel_duplicate_message_ids),
             "certified_older_message_ids": list(certified_older_message_ids),
         }
+        if building_id is not None:
+            canonical_context_data["building_id"] = building_id
+            canonical_context_data["unit_id"] = unit_id
         if property_source is not None:
-            # Only present when property_id is a fallback, not a verified
-            # label/alias -- so a wake WITH a resolvable property keeps
-            # exactly the canonical_context this loader produced before.
             canonical_context_data["property_source"] = property_source
         if request.operation in _TENANTCLOUD_OPERATIONS:
             canonical_context_data.update(

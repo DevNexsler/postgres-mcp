@@ -281,7 +281,7 @@ class PostgresActionStore:
                 context.action_id,
                 expected_state.value,
                 context.prospect_id,
-                context.property_id or context.property_label or "",
+                context.property_id or "",
                 lock_intent,
                 slot,
                 list(context.aliases),

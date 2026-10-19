@@ -47,6 +47,7 @@ from .models import ActionRole
 from .models import AlreadySent
 from .models import ConfirmRequest
 from .models import ExecuteRequest
+from .models import PROPERTY_REFERENCE_GUIDANCE
 from .models import Operation
 from .models import OutboundRequest
 from .models import PublicResult
@@ -97,11 +98,6 @@ DEFAULT_EMAIL_SENDER_DOMAINS = {"nigel-zoho": "pfg.io"}
 DEFAULT_EMAIL_CC_BY_SOURCE = {
     "zillow": "management@pfg.io",
     "hotpads": "management@pfg.io",
-}
-DEFAULT_PROPERTY_ALIASES = {
-    "138 bullman street 144 a": "building:bullman-st",
-    "144 bullman street": "building:bullman-st",
-    "16 north main street 16": "building:16-n-main",
 }
 DEFAULT_ENABLED_OPERATIONS = frozenset({Operation.EMAIL_SEND})
 
@@ -426,7 +422,7 @@ def create_server(
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "
             "different one is a new action. Ids are integers where the provider uses "
-            "numbers. Operations (? = optional):\n" + operation_catalog()
+            "numbers. " + PROPERTY_REFERENCE_GUIDANCE + " Operations (? = optional):\n" + operation_catalog()
         ),
         structured_output=True,
     )
@@ -803,10 +799,6 @@ async def build_runtime() -> GatewayRuntime:
         cliq_channel_unique_names_by_id=_json_mapping(
             "OUTBOUND_CLIQ_CHANNEL_UNIQUE_NAMES_JSON",
             {},
-        ),
-        property_aliases=_json_mapping(
-            "OUTBOUND_PROPERTY_ALIASES_JSON",
-            DEFAULT_PROPERTY_ALIASES,
         ),
         conversation_aliases=_json_mapping("OUTBOUND_CONVERSATION_ALIASES_JSON", {}),
     )
