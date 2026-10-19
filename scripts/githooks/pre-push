@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Shared clone hook: independent of the pushing checkout's age.
+set -Eeuo pipefail
+
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
+gate="${common}/hooks/postgres-mcp-merge-gate.py"
+if [[ ! -f "${gate}" ]]; then
+  echo "installed landing gate missing; reinstall with python3 scripts/merge_gate.py install" >&2
+  exit 2
+fi
+exec "${POSTGRES_MCP_MERGE_GATE_PYTHON:-python3}" "${gate}" pre-push "$@"
