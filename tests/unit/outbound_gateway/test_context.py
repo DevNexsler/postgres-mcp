@@ -108,11 +108,6 @@ def policy():
         },
         calendar_by_profile={"appointment-setter": "nigel"},
         cliq_target_by_intent={"lead_alert": "tenant-leads"},
-        property_aliases={
-            "138 bullman street 144 a": "building:bullman-st",
-            "144 bullman street": "building:bullman-st",
-            "16 north main street 16": "building:16-n-main",
-        },
         conversation_aliases={
             "zillow:zrm-thread-44": "conversation:zillow-amanda-bullman",
             "hotpads:zrm-thread-44": "conversation:zillow-amanda-bullman",
@@ -884,7 +879,7 @@ async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
 
     assert context.property_label == "138 Bullman St #144-A"
-    assert context.property_id == "building:bullman-st"
+    assert context.canonical_context["property_source"] == "unresolved"
 
 
 @pytest.mark.asyncio
@@ -907,7 +902,7 @@ async def test_zillow_information_about_subject_derives_listing_address():
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
 
     assert context.property_label == "138 Bullman St #144-A"
-    assert context.property_id == "building:bullman-st"
+    assert context.canonical_context["property_source"] == "unresolved"
 
 
 @pytest.mark.asyncio
@@ -1391,10 +1386,12 @@ async def test_duplicate_provider_and_property_aliases_converge():
         ),
         canonical_subject="prospect:amanda",
     )
-    first = await ActionContextLoader(first_repo, policy()).load(request())
-    second = await ActionContextLoader(second_repo, policy()).load(request())
+    resolved = request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "hello",
+                                  "property_ref": {"building_id": 7, "unit_id": 12}})
+    first = await ActionContextLoader(first_repo, policy()).load(resolved)
+    second = await ActionContextLoader(second_repo, policy()).load(resolved)
     assert first.prospect_id == second.prospect_id == "prospect:amanda"
-    assert first.property_id == second.property_id == "building:bullman-st"
+    assert first.property_id == second.property_id == "sor:building:7:unit:12"
     assert first.conversation_id == second.conversation_id
 
 
@@ -2141,10 +2138,8 @@ async def test_propertyless_calendar_fallback_never_collides_across_different_wa
 
 
 @pytest.mark.asyncio
-async def test_calendar_mutation_with_a_known_property_keeps_the_prior_canonical_context_shape():
-    """Parity: a wake WITH a resolvable property must not gain the new
-    property_source key -- canonical_context (and so payload_hash) for a
-    wake that already worked is byte-identical to before this fallback."""
+async def test_calendar_mutation_with_a_sor_reference_records_resolved_provenance():
+    """Resolved SOR identity keeps fallback provenance out of new actions."""
     event = record(raw_payload={"provider": "zillow", "thread_id": "zrm-thread-44"})
     context = await ActionContextLoader(FakeRepository(event), policy()).load(
         request(
@@ -2152,10 +2147,10 @@ async def test_calendar_mutation_with_a_known_property_keeps_the_prior_canonical
             operation="calendar.update",
             intent_kind="showing_update",
             appointment_slot="2026-07-17T14:30:00Z",
-            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"'},
+            arguments={"calendar_id": "nigel", "event_url": _EXAMPLE_EVENT_URL, "etag": '"etag-1"', "property_ref": {"building_id": 7, "unit_id": 12}},
         )
     )
-    assert context.property_id == "building:bullman-st"
+    assert context.property_id == "sor:building:7:unit:12"
     assert "property_source" not in context.canonical_context
 
 
@@ -2350,3 +2345,33 @@ async def test_a_text_recorded_on_a_line_outside_the_map_is_never_re_derived_ont
         "line. Nothing was sent. Lines it can send from: +16107095575, +17579972130, +14846260220. Execute it "
         "as a new message with one of them as from_phone."
     )
+
+
+@pytest.mark.asyncio
+async def test_sor_property_reference_converges_labels_and_separates_units():
+    references = []
+    for label, unit in [("first address spelling", 12), ("another spelling", 12), ("another spelling", 13)]:
+        wake = record(envelope={"message": {"property": label}})
+        call = request(arguments={"to_address": "lead@example.test", "text": "hello",
+                                  "property_ref": {"building_id": 7, "unit_id": unit}})
+        references.append(await ActionContextLoader(FakeRepository(wake), policy()).load(call))
+    assert references[0].property_id == references[1].property_id
+    assert references[0].property_id != references[2].property_id
+    assert references[0].canonical_context["building_id"] == "sor:building:7"
+    assert references[0].canonical_context["unit_id"] == "sor:unit:12"
+    assert references[0].property_label == "first address spelling"
+
+
+@pytest.mark.asyncio
+async def test_address_label_alone_never_becomes_property_identity():
+    loaded = await ActionContextLoader(FakeRepository(record()), policy()).load(request(intent_kind="inquiry_reply", appointment_slot=None))
+    assert loaded.property_id is None
+
+
+@pytest.mark.asyncio
+async def test_upstream_sor_property_reference_is_consumed_without_address_matching():
+    wake = record(envelope={"property_identity": {"building_id": 7, "unit_id": 12},
+                            "message": {"property": "display label"}})
+    loaded = await ActionContextLoader(FakeRepository(wake), policy()).load(request())
+    assert loaded.canonical_context["building_id"] == "sor:building:7"
+    assert loaded.canonical_context["unit_id"] == "sor:unit:12"

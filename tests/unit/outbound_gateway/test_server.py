@@ -21,7 +21,6 @@ from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_CC_BY_SOURCE
 from postgres_mcp.outbound_gateway.server import DEFAULT_EMAIL_SENDER_DOMAINS
-from postgres_mcp.outbound_gateway.server import DEFAULT_PROPERTY_ALIASES
 from postgres_mcp.outbound_gateway.server import TENANTCLOUD_ORIGIN
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import _bearer_headers
@@ -44,8 +43,6 @@ def test_default_email_routing_matches_nigel_account_and_zillow_copy_policy():
         "zillow": "management@pfg.io",
         "hotpads": "management@pfg.io",
     }
-    assert DEFAULT_PROPERTY_ALIASES["138 bullman street 144 a"] == "building:bullman-st"
-    assert DEFAULT_PROPERTY_ALIASES["144 bullman street"] == "building:bullman-st"
 
 
 def test_provider_bearer_headers_are_environment_only_and_optional(monkeypatch):

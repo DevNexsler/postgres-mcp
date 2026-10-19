@@ -86,7 +86,6 @@ POLICY = RoutingPolicy(
     email_account_by_provider={},
     calendar_by_profile={},
     cliq_target_by_intent={},
-    property_aliases={},
     conversation_aliases={},
     email_default_account="nigel-zoho",
     # Only to reproduce the line wake 27300 was answered on (2026-08-27); the

@@ -674,3 +674,18 @@ async def test_transition_to_provider_accepted_without_readback_shape_leaves_evi
     assert "provider_message_id" not in params[8]
     assert result.provider_evidence_kind is None
     assert result.provider_readback_evidence == {}
+
+
+@pytest.mark.asyncio
+async def test_lock_scope_uses_property_identity_and_never_display_address():
+    scopes = []
+
+    async def execute(_driver, query, params):
+        scopes.append(params[3])
+        return [Row(action_row("prepared"))]
+
+    store = PostgresActionStore(object())
+    with patch("postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query", AsyncMock(side_effect=execute)):
+        await store.prepare(replace(context(), property_id=None, property_label="display address"), ActionState.RECEIVED)
+        await store.prepare(replace(context(), property_id="sor:building:7:unit:12"), ActionState.RECEIVED)
+    assert scopes == ["", "sor:building:7:unit:12"]

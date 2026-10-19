@@ -2658,3 +2658,18 @@ async def test_when_the_provider_cannot_say_reconcile_proceeds_from_the_saved_re
     assert result.status is PublicStatus.SENT
     assert adapter.calls == [("poll", "req-1"), ("reconcile",)]
 
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_saved_property_identity_after_sor_migration():
+    store = FakeStore(row(ActionState.PREPARED, action_uid=ACTION_UID, payload_hash="f" * 64,
+                          canonical_context={"property_id": "building:legacy"}))
+
+    class InspectSavedProperty(FakeAdapter):
+        def build_request(self, ctx, action_uid):
+            assert ctx.property_id == "building:legacy"
+            assert ctx.canonical_context["property_id"] == "building:legacy"
+            return super().build_request(ctx, action_uid)
+
+    result = await service(store, InspectSavedProperty(_accepted_observation())).resume(ACTION_ID)
+    assert result.status is PublicStatus.SENT

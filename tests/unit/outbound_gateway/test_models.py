@@ -879,6 +879,6 @@ def test_the_catalog_teaches_from_phone_as_required():
     """from_phone is optional in the model only so stored texts still parse;
     the agent must always name it, so the catalog must not mark it "?"."""
     line = next(line for line in operation_catalog().splitlines() if line.startswith("quo.sms.send:"))
-    assert "arguments {to_phone, text, from_phone}" in line
+    assert "arguments {property_ref?, to_phone, text, from_phone}" in line
     assert "from_phone?" not in line
     assert "from_phone (E.164) is the line to send from, always required" in line
