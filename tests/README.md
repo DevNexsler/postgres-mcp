@@ -36,7 +36,10 @@ git push origin main
 Land PRs by merging locally and pushing, never with `gh pr merge` or the GitHub
 merge button: a server-side merge runs no hook. Install the hook once per clone
 with `python3 scripts/merge_gate.py install`. A run over a dirty tree, or with
-any pytest argument, records nothing.
+any pytest argument or nonempty `PYTEST_ADDOPTS`, records nothing. A tree change
+during the run refuses attestation. The installer copies the gate beside the
+shared hook, so pushes from older worktrees remain protected. Reinstall after
+updating the hook or gate. A missing installed copy blocks pushes until repaired.
 
 ## Test Structure
 

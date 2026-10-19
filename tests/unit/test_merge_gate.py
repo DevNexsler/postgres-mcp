@@ -198,3 +198,54 @@ def test_landing_policy_is_local_only_and_the_runner_runs_the_ci_suite():
     assert "uv run pytest" in (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
     assert 'uv run pytest "$@"' in RUNNER.read_text(encoding="utf-8")
     assert os.access(HOOK, os.X_OK) and os.access(RUNNER, os.X_OK)
+
+
+def test_environment_selection_does_not_attest_a_full_suite(clone: Path, tmp_path: Path):
+    """Real pytest can return success without executing a failing test."""
+    _commit(clone, ".gitignore", "__pycache__/\n.pytest_cache/\n", "Ignore pytest cache")
+    _commit(clone, "test_failure.py", "def test_failure():\n    assert False\n", "Failing test")
+    bin_dir = tmp_path / "real-pytest-bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(f'#!/bin/sh\nshift\nshift\nexec "{sys.executable}" -m pytest "$@"\n')
+    uv.chmod(0o755)
+    result = _run(
+        clone,
+        str(clone / "scripts/run_test_suite.sh"),
+        env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "PYTEST_ADDOPTS": "--collect-only"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "1 test collected" in result.stdout
+    assert _push(clone).returncode != 0
+
+
+def test_runner_refuses_to_attest_a_different_tree(clone: Path, tmp_path: Path):
+    _commit(clone, "repository.py", "before\n", "Before run")
+    bin_dir = tmp_path / "tree-changing-bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text('#!/bin/sh\nprintf "after\\n" > repository.py\ngit add repository.py\ngit commit -qm "Change during tests"\n')
+    uv.chmod(0o755)
+    result = _run(clone, str(clone / "scripts/run_test_suite.sh"), env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+    assert result.returncode != 0
+    assert _push(clone).returncode != 0
+
+
+def test_installed_hook_protects_an_older_worktree(clone: Path, tmp_path: Path):
+    _git(clone, "checkout", "-q", "-b", "legacy")
+    _git(clone, "rm", "-qr", "scripts")
+    _git(clone, "commit", "-qm", "Legacy tree without gate")
+    old_tree = tmp_path / "legacy-worktree"
+    _git(clone, "worktree", "add", "-q", str(old_tree), "-b", "legacy-writer")
+    result = _push(old_tree, "HEAD:main")
+    assert result.returncode != 0
+    assert "refusing to push" in result.stderr
+
+
+def test_missing_installed_gate_fails_closed(clone: Path):
+    gate_copy = Path(_git(clone, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks/postgres-mcp-merge-gate.py"
+    gate_copy.unlink(missing_ok=True)
+    _commit(clone, "repository.py", "unverified\n", "Unverified")
+    result = _push(clone)
+    assert result.returncode != 0
+    assert "installed landing gate" in result.stderr

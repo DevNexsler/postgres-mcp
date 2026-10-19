@@ -12,7 +12,12 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${root}"
 
 scope=full
-if [[ "$#" -gt 0 ]]; then
+if [[ "$#" -gt 0 || -n "${PYTEST_ADDOPTS:-}" ]]; then
+  scope=focused
+fi
+
+tested_tree="$(git rev-parse HEAD^{tree})"
+if [[ -n "$(git status --porcelain)" ]]; then
   scope=focused
 fi
 
@@ -22,6 +27,6 @@ status=$?
 set -e
 
 if [[ "${status}" -eq 0 && "${scope}" == "full" ]]; then
-  "${POSTGRES_MCP_MERGE_GATE_PYTHON:-python3}" "${root}/scripts/merge_gate.py" record --tier pytest --scope full
+  "${POSTGRES_MCP_MERGE_GATE_PYTHON:-python3}" "${root}/scripts/merge_gate.py" record --tier pytest --scope full --tree "${tested_tree}"
 fi
 exit "${status}"

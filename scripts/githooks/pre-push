@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# The landing gate's git side (#3965): refuse to advance `main` with a tree
-# `scripts/run_test_suite.sh` never proved. Install with
-# `scripts/merge_gate.py install`.
+# Shared clone hook: independent of the pushing checkout's age.
 set -Eeuo pipefail
 
-root="$(git rev-parse --show-toplevel)"
-gate="${root}/scripts/merge_gate.py"
-# core.hooksPath is clone-wide while the hooks are per-worktree, so a checkout
-# cut before the gate landed reaches this only through a stale path. It has no
-# gate to run and must not be wedged by one.
-[[ -f "${gate}" ]] || exit 0
-
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
+gate="${common}/hooks/postgres-mcp-merge-gate.py"
+if [[ ! -f "${gate}" ]]; then
+  echo "installed landing gate missing; reinstall with python3 scripts/merge_gate.py install" >&2
+  exit 2
+fi
 exec "${POSTGRES_MCP_MERGE_GATE_PYTHON:-python3}" "${gate}" pre-push "$@"
