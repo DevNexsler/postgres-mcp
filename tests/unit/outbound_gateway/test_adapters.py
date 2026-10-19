@@ -2009,3 +2009,12 @@ def test_quo_provider_calls_wait_as_long_as_quo_waits_for_its_carrier():
     config = quo_server_config()
     assert config.timeout_seconds == 30.0
     assert config.allowed_tools == frozenset({"send_message", "list_messages", "get_message"})
+
+
+@pytest.mark.parametrize("operation", [Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST])
+@pytest.mark.parametrize("text", ["{@100000001} please check", "{@200000002} {@300000003}", "@Laura laura@example.invalid"])
+def test_cliq_preserves_agent_authored_mentions_without_name_rewriting(operation, text):
+    original = context(operation, arguments=MappingProxyType({"text": text}))
+    request = CliqAdapter(operation).build_request(original, ACTION_UID)
+    assert request.arguments["text"] == text
+    assert original.arguments["text"] == text
