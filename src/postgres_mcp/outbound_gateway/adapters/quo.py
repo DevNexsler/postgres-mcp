@@ -198,6 +198,19 @@ class QuoSmsAdapter:
             return common
         payload = result.structured_content
         ref = request_ref(payload)
+        # Only the POST boundary can assert this; a failed history read says
+        # nothing about acceptance of the original send. Do not inspect nested
+        # message content for error evidence.
+        envelope = next(json_objects(payload if payload is not None else result.text), {})
+        if effect_call and envelope.get("before_provider_request") is True and isinstance(envelope.get("error"), str):
+            return ProviderObservation(
+                ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
+                "provider_unavailable_before_provider_request",
+                provider_request_ref=ref,
+                category="provider_unavailable",
+                retryable=True,
+                evidence={"kind": "failed_before_provider_request"},
+            )
         for item in json_objects(payload if payload is not None else result.text):
             message_id = cls._message_id(item)
             status = str(item.get("status") or "").casefold()
