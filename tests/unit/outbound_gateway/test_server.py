@@ -416,6 +416,23 @@ def test_focused_server_tool_description_mentions_suggest():
     assert "suggest" in (tools[0].description or "")
 
 
+@pytest.mark.asyncio
+async def test_public_tool_teaches_staff_and_customer_recipes_independently_of_wake_source():
+    mcp = create_server(AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False))
+    [tool] = await mcp.list_tools()
+    description = tool.description or ""
+    assert "Choose role and intent by recipient purpose, independently of transport or wake source" in description
+    assert "even when triggered by a prospect's message" in description
+    assert "text anyone" not in description
+    assert "email anyone" not in description
+    for operation in ("email.send", "quo.sms.send"):
+        lines = [line for line in description.splitlines() if line.startswith(f"{operation}:")]
+        assert any(
+            'action_role "internal_notification", intent_kind "manual_review_alert"' in line and "staff coordination" in line for line in lines
+        )
+        assert any('action_role "prospect_reply", intent_kind "inquiry_reply"' in line and "customer reply" in line for line in lines)
+
+
 def test_focused_server_tool_description_teaches_the_stale_context_confirm_answer():
     service = AsyncMock()
     mcp = create_server(service, FeaturePolicy(writes_enabled=True, kill_switch=False))
