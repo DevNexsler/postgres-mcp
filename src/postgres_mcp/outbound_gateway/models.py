@@ -705,47 +705,59 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
 }
 
 
-# How an agent calls each operation: the role and intent it goes with, and
-# what it is for. The tool description is generated from this and from
-# ARGUMENT_MODELS, so every profile sees the same exact request shapes and
-# they cannot drift from what the gateway accepts.
-OPERATION_USAGE: dict[Operation, tuple[ActionRole, IntentKind, str]] = {
+# Request recipes are selected by recipient purpose, not just transport.
+# The tool description is generated from these and ARGUMENT_MODELS, so
+# customer replies and staff coordination each get their own accepted shape.
+OPERATION_USAGE: dict[Operation, tuple[tuple[ActionRole, IntentKind, str], ...]] = {
     Operation.EMAIL_SEND: (
-        ActionRole.PROSPECT_REPLY,
-        IntentKind.INQUIRY_REPLY,
-        "email anyone; sent from Nigel's mailbox; management@pfg.io is cc'd on customer emails "
-        "unless you pass cc (use [] for none); attachments is a list of "
-        "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
+        (
+            ActionRole.PROSPECT_REPLY,
+            IntentKind.INQUIRY_REPLY,
+            "customer reply by email; sent from Nigel's mailbox; management@pfg.io is cc'd on customer emails "
+            "unless you pass cc (use [] for none); attachments is a list of "
+            "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
+        ),
+        (
+            ActionRole.INTERNAL_NOTIFICATION,
+            IntentKind.MANUAL_REVIEW_ALERT,
+            "staff coordination by email, including updates about a prospect; sent from Nigel's mailbox; "
+            "pass cc explicitly (use [] for none); attachments is a list of "
+            "{filename, mime_type, content_base64}, at most 10 files and 10 MiB in total",
+        ),
     ),
     Operation.QUO_SMS_SEND: (
-        ActionRole.PROSPECT_REPLY,
-        IntentKind.INQUIRY_REPLY,
-        "text anyone (to_phone E.164); from_phone (E.164) is the line to send from, always required",
+        (
+            ActionRole.PROSPECT_REPLY,
+            IntentKind.INQUIRY_REPLY,
+            "customer reply by SMS (to_phone E.164); from_phone (E.164) is the line to send from, always required",
+        ),
+        (
+            ActionRole.INTERNAL_NOTIFICATION,
+            IntentKind.MANUAL_REVIEW_ALERT,
+            "staff coordination by SMS, including updates about a prospect (to_phone E.164); "
+            "from_phone (E.164) is the line to send from, always required",
+        ),
     ),
-    Operation.CLIQ_CHAT_POST: (ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),
+    Operation.CLIQ_CHAT_POST: ((ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),),
     Operation.CLIQ_CHANNEL_POST: (
-        ActionRole.INTERNAL_NOTIFICATION,
-        IntentKind.MANUAL_REVIEW_ALERT,
-        "post to a Cliq channel (lead_alert for a new lead)",
+        (ActionRole.INTERNAL_NOTIFICATION, IntentKind.MANUAL_REVIEW_ALERT, "post to a Cliq channel (lead_alert for a new lead)"),
     ),
-    Operation.CALENDAR_CREATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),
-    Operation.CALENDAR_UPDATE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),
-    Operation.CALENDAR_DELETE: (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),
+    Operation.CALENDAR_CREATE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),),
+    Operation.CALENDAR_UPDATE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),),
+    Operation.CALENDAR_DELETE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),),
     Operation.TENANTCLOUD_MESSAGE_SEND: (
-        ActionRole.PROSPECT_REPLY,
-        IntentKind.INQUIRY_REPLY,
-        f"reply in a TenantCloud thread; text at most {TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters",
+        (
+            ActionRole.PROSPECT_REPLY,
+            IntentKind.INQUIRY_REPLY,
+            f"reply in a TenantCloud thread; text at most {TENANTCLOUD_MESSAGE_MAX_CHARACTERS} characters",
+        ),
     ),
-    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_LEAD_STATUS, "mark a lead working"),
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: ((ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_LEAD_STATUS, "mark a lead working"),),
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: (
-        ActionRole.PROVIDER_MUTATION,
-        IntentKind.TENANTCLOUD_MAINTENANCE_CREATE,
-        "open a maintenance request",
+        (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_MAINTENANCE_CREATE, "open a maintenance request"),
     ),
     Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: (
-        ActionRole.PROVIDER_MUTATION,
-        IntentKind.TENANTCLOUD_MAINTENANCE_STATUS,
-        "status 1 New, 2 In progress, 3 Resolved",
+        (ActionRole.PROVIDER_MUTATION, IntentKind.TENANTCLOUD_MAINTENANCE_STATUS, "status 1 New, 2 In progress, 3 Resolved"),
     ),
 }
 
@@ -756,19 +768,15 @@ REQUIRED_OF_NEW_REQUESTS = frozenset({"from_phone"})
 
 
 def operation_catalog() -> str:
-    """One line per operation: the exact role, intent and argument names
-    (optional ones marked ?), drawn from the argument models themselves."""
+    """One line per recipient-purpose recipe, with exact role, intent and
+    argument names (optional ones marked ?), drawn from argument models."""
     lines = []
     for operation, model in ARGUMENT_MODELS.items():
-        role, intent, purpose = OPERATION_USAGE[operation]
         fields = ", ".join(
-            name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?"
-            for name, field in model.model_fields.items()
+            name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?" for name, field in model.model_fields.items()
         )
-        lines.append(
-            f'{operation.value}: action_role "{role.value}", intent_kind "{intent.value}", '
-            f"arguments {{{fields}}} -- {purpose}"
-        )
+        for role, intent, purpose in OPERATION_USAGE[operation]:
+            lines.append(f'{operation.value}: action_role "{role.value}", intent_kind "{intent.value}", arguments {{{fields}}} -- {purpose}')
     return "\n".join(lines)
 
 

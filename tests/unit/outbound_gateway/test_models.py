@@ -862,17 +862,21 @@ def test_every_catalog_line_is_a_request_the_gateway_accepts(operation):
     a line that the parser rejects would teach agents a broken request."""
     from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS, OPERATION_USAGE, REQUIRED_OF_NEW_REQUESTS, operation_catalog
 
-    role, intent, _purpose = OPERATION_USAGE[operation]
-    payload = {
-        "op": "execute", "wakeup_event_id": 1, "action_role": role.value, "operation": operation.value,
-        "intent_kind": intent.value, "arguments": SAMPLE_ARGUMENTS[operation],
-    }
-    if operation in {Operation.CALENDAR_CREATE, Operation.CALENDAR_UPDATE}:
-        payload["appointment_slot"] = "2026-09-28T10:00:00-04:00"
-    assert parse_outbound_request(payload).operation is operation
-    line = next(line for line in operation_catalog().splitlines() if line.startswith(f"{operation.value}:"))
-    for name, field in ARGUMENT_MODELS[operation].model_fields.items():
-        assert (name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?") in line
+    for role, intent, purpose in OPERATION_USAGE[operation]:
+        payload = {
+            "op": "execute",
+            "wakeup_event_id": 1,
+            "action_role": role.value,
+            "operation": operation.value,
+            "intent_kind": intent.value,
+            "arguments": SAMPLE_ARGUMENTS[operation],
+        }
+        if operation in {Operation.CALENDAR_CREATE, Operation.CALENDAR_UPDATE}:
+            payload["appointment_slot"] = "2026-09-28T10:00:00-04:00"
+        assert parse_outbound_request(payload).operation is operation
+        line = next(line for line in operation_catalog().splitlines() if line.startswith(f"{operation.value}:") and line.endswith(purpose))
+        for name, field in ARGUMENT_MODELS[operation].model_fields.items():
+            assert (name if field.is_required() or name in REQUIRED_OF_NEW_REQUESTS else f"{name}?") in line
 
 
 def test_the_catalog_teaches_from_phone_as_required():

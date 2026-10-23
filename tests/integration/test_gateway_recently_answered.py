@@ -2,7 +2,8 @@
 """PostgresActionStore.recently_answered and contact_serialized against
 PostgreSQL, over Comm-Data-Store's own contact identity and "answered"
 functions (migration 269, vendored verbatim in
-fixtures/cds_contact_identity_269.sql).
+fixtures/cds_contact_identity_269.sql), and the trigger-key matcher from
+migration 270 (fixtures/cds_prospect_replies_match_trigger_keys_270.sql).
 
 - Amy McDermott, 2026-10-07/09: TenantCloud lead 2512395. Wake 27994 emailed
   her the viewing windows (action 95d784bf) for message 854668; 27 hours later
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
 import time
 from dataclasses import replace
@@ -42,6 +44,7 @@ from datetime import timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import docker
@@ -50,17 +53,33 @@ import pytest
 import pytest_asyncio
 from psycopg.types.json import Jsonb
 
+from postgres_mcp.outbound_gateway.context import ActionContextLoader
 from postgres_mcp.outbound_gateway.context import DerivedTarget
+from postgres_mcp.outbound_gateway.context import RoutingPolicy
+from postgres_mcp.outbound_gateway.models import ActionRole
 from postgres_mcp.outbound_gateway.models import ActionState
+from postgres_mcp.outbound_gateway.models import ExecuteRequest
+from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
 from postgres_mcp.outbound_gateway.models import parse_outbound_request
 from postgres_mcp.outbound_gateway.preflight import RECENTLY_ANSWERED_DETAIL
+from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
+from postgres_mcp.outbound_gateway.preflight import PreflightEvidence
+from postgres_mcp.outbound_gateway.preflight import PreflightOutcome
+from postgres_mcp.outbound_gateway.preflight import SafetyPreflight
+from postgres_mcp.outbound_gateway.repository import AliasResolution
+from postgres_mcp.outbound_gateway.repository import ConversationSnapshot
+from postgres_mcp.outbound_gateway.repository import WakeEventRecord
+from postgres_mcp.outbound_gateway.server import FeaturePolicy
+from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.service import CONTACT_REPLY_BUSY_DETAIL
 from postgres_mcp.outbound_gateway.service import OutboundActionService
+from postgres_mcp.outbound_gateway.service import _recently_answered_evidence  # pyright: ignore[reportPrivateUsage] -- exercise the service boundary
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
 from postgres_mcp.sql import DbConnPool
 from postgres_mcp.sql import SqlDriver
 
+TRIGGER_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cds_prospect_replies_match_trigger_keys_270.sql"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cds_contact_identity_269.sql"
 UTC = timezone.utc
 
@@ -133,7 +152,7 @@ SCHEMA = """
     CREATE TABLE hermes_wakeup_events (id bigint PRIMARY KEY, message_id bigint);
     CREATE TABLE outbound_actions (
         action_id uuid PRIMARY KEY, wakeup_event_id bigint NOT NULL, action_role text NOT NULL,
-        operation text NOT NULL DEFAULT 'email.send', intent_kind text NOT NULL, appointment_slot timestamptz,
+        source_message_id bigint, operation text NOT NULL DEFAULT 'email.send', intent_kind text NOT NULL, appointment_slot timestamptz,
         provenance text NOT NULL DEFAULT 'customer', state text NOT NULL, completion_kind text,
         detail_code text NOT NULL DEFAULT 'received', recipient_scope jsonb NOT NULL, arguments jsonb NOT NULL,
         created_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz, provider_accepted_at timestamptz,
@@ -152,9 +171,9 @@ SCHEMA = """
     ) RETURNS SETOF outbound_actions LANGUAGE sql AS $$
         INSERT INTO outbound_actions (action_id, wakeup_event_id, action_role, operation, intent_kind,
             appointment_slot, state, recipient_scope, arguments, payload_hash, canonical_context,
-            canonical_scope, provider_account, routing_policy_version)
+            canonical_scope, provider_account, routing_policy_version, source_message_id)
         VALUES (md5('v1:wakeup:' || p_wake || ':role:' || p_role)::uuid, p_wake, p_role, p_operation, p_intent,
-            p_slot, 'received', p_recipient, p_arguments, p_hash, p_context, p_scope, p_account, p_policy)
+            p_slot, 'received', p_recipient, p_arguments, p_hash, p_context, p_scope, p_account, p_policy, p_source_message)
         ON CONFLICT (action_id) DO UPDATE SET action_id = EXCLUDED.action_id
         RETURNING *
     $$;
@@ -191,6 +210,7 @@ async def conn(database):
     async with await psycopg.AsyncConnection.connect(database, autocommit=True) as connection:
         await connection.execute(SCHEMA)
         await connection.execute(FIXTURE.read_text())  # pyright: ignore[reportCallIssue, reportArgumentType] -- a checked-in SQL file
+        await connection.execute(TRIGGER_FIXTURE.read_text())  # pyright: ignore[reportCallIssue, reportArgumentType] -- checked-in SQL fixture
         yield connection
 
 
@@ -273,6 +293,189 @@ async def amy(conn) -> None:
 
 
 AMY_AS_OF = at("2026-10-09 01:06:44")
+
+
+# --- Courtney: staff accepted 50 ms after a new customer question -------------
+
+COURTNEY_RELAY = "courtney@convo.zillow.com"
+QUESTION_TIME = at("2026-10-23 15:42:26.000")
+INCIDENT_TIME = at("2026-10-23 15:45:35.357")
+DEPOSIT_QUESTION = "what would the deposit be to move in"
+
+
+async def catalog_context(conn, wake_id, operation, purpose, recipient):
+    """Build the request from what an agent actually sees, then derive real
+    context. The legacy universal recipe is a deliberate negative control:
+    on the old catalog it reproduces the staff-as-customer incident."""
+    mcp = create_server(AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False))
+    [tool] = await mcp.list_tools()
+    recipes = [line for line in tool.description.splitlines() if line.startswith(f"{operation.value}:")]
+    recipe = next((line for line in recipes if f"-- {purpose}" in line), recipes[0])
+    match = re.search(r'action_role "([^"]+)", intent_kind "([^"]+)"', recipe)
+    assert match is not None
+    arguments = {"text": "Showing coordination"}
+    if operation is Operation.QUO_SMS_SEND:
+        arguments.update(to_phone=recipient, from_phone="+16105550100")
+    else:
+        arguments.update(to_address=recipient, cc=[])
+    request = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": wake_id,
+            "operation": operation.value,
+            "action_role": match[1],
+            "intent_kind": match[2],
+            "arguments": arguments,
+        }
+    )
+    assert isinstance(request, ExecuteRequest)
+    cursor = await conn.execute(
+        "SELECT m.id, m.sent_at, m.body FROM messages m JOIN hermes_wakeup_events w ON w.message_id = m.id WHERE w.id = %s",
+        (wake_id,),
+    )
+    message_id, sent_at, body = await cursor.fetchone()
+    record = WakeEventRecord(
+        wakeup_event_id=wake_id,
+        event_source="zoho_mail",
+        source_event_id=str(wake_id),
+        event_created_at=sent_at,
+        message_id=message_id,
+        canonical_message_id=None,
+        message_source="zoho_mail",
+        source_message_id=str(message_id),
+        message_sent_at=sent_at,
+        message_updated_at=sent_at,
+        subject="Showing",
+        body=body,
+        user_account_id="nigel-zoho",
+        channel_id=44,
+        source_channel_id="courtney-thread",
+        channel_type="email",
+        channel_name="INBOX",
+        sender_participant_id=5001,
+        participant_type="email_address",
+        participant_key=COURTNEY_RELAY,
+        display_name="Courtney",
+        envelope={},
+        raw_payload={},
+    )
+    repository = AsyncMock()
+    repository.load_wake_event.return_value = record
+    repository.load_conversation_snapshot.return_value = ConversationSnapshot(message_id, message_id, sent_at)
+    repository.resolve_canonical_subject.return_value = AliasResolution("prospect:courtney", (f"email:{COURTNEY_RELAY}",))
+    policy = RoutingPolicy(
+        version="test",
+        email_account_by_provider={"zoho_mail": "nigel-zoho"},
+        email_default_account="nigel-zoho",
+        calendar_by_profile={},
+        cliq_target_by_intent={},
+        conversation_aliases={},
+        quo_sending_lines={"+16105550100": "test-line"},
+    )
+    return await ActionContextLoader(repository, policy).load(request)
+
+
+async def courtney_history(conn, store, operation, purpose, provenance, offset_ms, *, repeated=False):
+    await message(conn, 888866, "zoho_mail", at("2026-10-23 15:33:39"), 5001, "I'm going to 21 now", identifier=COURTNEY_RELAY)
+    await message(conn, 888897, "zoho_mail", QUESTION_TIME, 5001, DEPOSIT_QUESTION, identifier=COURTNEY_RELAY)
+    if repeated:
+        await message(conn, 888811, "zoho_mail", at("2026-10-23 15:09:07"), 5001, " WHAT would the deposit BE to move in  ")
+    await wake(conn, 29389, 888866)
+    await wake(conn, 29390, 888866)
+    await wake(conn, 29394, 888897)
+    # Genuine earlier customer email remains in every counterfactual.
+    await action(conn, uid(100), 29389, COURTNEY_RELAY, at("2026-10-23 15:40:44.917"), text="Showing offer")
+    # Neither destination appears in the trigger's keys. Customer controls
+    # must still match through those keys, across SMS / email destinations.
+    recipient = "+19085550199" if operation is Operation.QUO_SMS_SEND else "coordination@example.com"
+    context = await catalog_context(conn, 29390, operation, purpose, recipient)
+    recorded = await store.create_or_load(context)
+    accepted_at = QUESTION_TIME + timedelta(milliseconds=offset_ms)
+    await conn.execute(
+        """UPDATE outbound_actions SET state = 'completed', completion_kind = 'sent',
+           detail_code = 'provider_receipt_verified', provenance = %s,
+           created_at = '2026-10-23 15:42:24.908+00', provider_accepted_at = %s, completed_at = %s
+           WHERE action_id = %s""",
+        (provenance, accepted_at, accepted_at + timedelta(milliseconds=4), recorded.action_id),
+    )
+    next_context = await catalog_context(conn, 29394, Operation.EMAIL_SEND, "customer reply", COURTNEY_RELAY)
+    next_action = await store.create_or_load(next_context)
+    rows = await store.recently_answered(next_action.action_id, as_of=INCIDENT_TIME)
+    decision = SafetyPreflight.evaluate(
+        next_context,
+        PreflightEvidence(CalendarDependencyState.NOT_REQUIRED),
+        _recently_answered_evidence(rows),
+    )
+    cursor = await conn.execute(
+        "SELECT action_role, intent_kind, prospect_reply_status(a) FROM outbound_actions a WHERE action_id = %s",
+        (recorded.action_id,),
+    )
+    classification = await cursor.fetchone()
+    return context, recorded, rows, decision, classification
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [Operation.QUO_SMS_SEND, Operation.EMAIL_SEND])
+@pytest.mark.parametrize("provenance", ["customer", "operator_remediation"])
+@pytest.mark.parametrize("offset_ms", [-50, 0, 50])
+@pytest.mark.parametrize("purpose", ["staff coordination", "customer reply"])
+async def test_catalog_recipient_purpose_reaches_persisted_classification_and_preflight(conn, store, operation, provenance, offset_ms, purpose):
+    context, recorded, rows, decision, classification = await courtney_history(conn, store, operation, purpose, provenance, offset_ms)
+    staff = purpose == "staff coordination"
+    is_new = staff or offset_ms < 0
+    assert rows and all(row["trigger_is_new_question"] is is_new for row in rows), rows
+    assert decision.outcome is (PreflightOutcome.READY if is_new else PreflightOutcome.REFUSED)
+    if staff:
+        assert classification == ("internal_notification", "manual_review_alert", None)
+        assert recorded.action_role is context.action_role is ActionRole.INTERNAL_NOTIFICATION
+        assert context.prospect_id == f"internal:{context.target.target_id}"
+        assert context.aliases == ()
+        assert [row["action_id"] for row in rows] == [uid(100)]
+    else:
+        assert classification == ("prospect_reply", "inquiry_reply", "answered")
+        assert context.aliases and context.prospect_id == "prospect:courtney"
+        assert rows[0]["action_id"] == recorded.action_id
+        assert rows[0]["recipient"] == context.target.target_id
+        if not is_new:
+            assert decision.detail_code == RECENTLY_ANSWERED_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_legacy_staff_as_customer_recipe_reproduces_incident_without_subject_or_channel_comparison(conn, store):
+    # Force the customer recipe on the same coordination destination. This
+    # proves why old polluted rows still need separately audited remediation.
+    _, recorded, rows, decision, classification = await courtney_history(
+        conn,
+        store,
+        Operation.QUO_SMS_SEND,
+        "customer reply",
+        "operator_remediation",
+        50,
+    )
+    assert classification[2] == "answered"
+    assert rows[0]["action_id"] == recorded.action_id
+    assert rows[0]["sent_at"] == at("2026-10-23 15:42:26.050")
+    assert decision.outcome is PreflightOutcome.REFUSED
+    assert decision.detail_code == RECENTLY_ANSWERED_DETAIL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [Operation.QUO_SMS_SEND, Operation.EMAIL_SEND])
+async def test_staff_exclusion_does_not_exempt_same_sender_repeated_body(conn, store, operation):
+    _, recorded, rows, decision, _ = await courtney_history(
+        conn,
+        store,
+        operation,
+        "staff coordination",
+        "operator_remediation",
+        50,
+        repeated=True,
+    )
+    assert [row["action_id"] for row in rows] == [uid(100)]
+    assert recorded.action_id not in {row["action_id"] for row in rows}
+    assert not rows[0]["trigger_is_new_question"]
+    assert decision.outcome is PreflightOutcome.REFUSED
+    assert decision.detail_code == RECENTLY_ANSWERED_DETAIL
 
 
 # --- the incidents ------------------------------------------------------------
