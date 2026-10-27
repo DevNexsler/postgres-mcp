@@ -65,6 +65,8 @@ STORE_METHODS = (
     "successor",
     "get",
     "schedule_next_attempt",
+    "create_escalation",
+    "set_delivery_paused",
 )
 ADAPTER_METHODS = ("build_request", "invoke", "poll", "parse_receipt", "reconcile")
 LOADER_METHODS = ("load", "suggest_targets")
@@ -380,6 +382,17 @@ def _this_call(events: tuple[Any, ...]) -> tuple[Any, ...]:
     return events
 
 
+def _schedule_without_delay(event: Any) -> Any:
+    """A recorded schedule_next_attempt call with its delay blanked out."""
+    args = event[2]
+    if isinstance(args, tuple) and len(args) == 2 and args[0] == "tuple":
+        values = list(args[1])
+        if len(values) == 4:
+            values[2] = None
+        return values
+    return args
+
+
 def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     legacy_rest: tuple[Any, ...],
     current_rest: tuple[Any, ...],
@@ -458,6 +471,27 @@ def _declared(  # noqa: PLR0911, PLR0912 -- one branch per declared difference
     # The legacy re-answered the question, or reported the parent "not sent".
     if _call(current, "store.successor"):
         return "answered_action_reports_its_successor"
+    # The gateway's own staff escalation about a failed action is created
+    # through CDS's escalation function (migration 279), which admits it on
+    # an ended wake; the legacy had no escalate() at all.
+    if _call(current, "store.create_escalation"):
+        return "staff_escalation_has_its_own_create"
+    # A provider known to be down pauses the row's delivery clock (circuit
+    # open, TenantCloud auth down) and a recovered one closes the pause --
+    # bookkeeping the legacy did not keep; what follows is compared as usual.
+    if _call(current, "store.set_delivery_paused"):
+        return "delivery_clock_pauses_while_the_provider_is_down"
+    # Every wait now comes from the one retry policy (retry_config.py):
+    # the same reschedule of the same row in the same state for the same
+    # reason, waiting what the policy says -- jittered, and capped at
+    # OUTBOUND_RETRY_MAX_SECONDS -- where the legacy waited its own fixed
+    # ladder. Nothing else about the call may differ.
+    if (
+        _call(legacy, "store.schedule_next_attempt")
+        and _call(current, "store.schedule_next_attempt")
+        and _schedule_without_delay(legacy) == _schedule_without_delay(current)
+    ):
+        return "retry_wait_comes_from_the_retry_policy"
     # FIX 3: a TenantCloud auth rejection proven pre-dispatch
     # (tenantcloud_auth_rejected_before_dispatch / category=provider_authentication)
     # now waits out the outage -- schedule_next_attempt with no claim() --

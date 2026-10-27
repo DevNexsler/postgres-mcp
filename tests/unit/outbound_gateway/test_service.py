@@ -49,6 +49,7 @@ from postgres_mcp.outbound_gateway.preflight import CalendarDependencyState
 from postgres_mcp.outbound_gateway.provider_client import McpProviderClient
 from postgres_mcp.outbound_gateway.provider_client import McpServerConfig
 from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 from postgres_mcp.outbound_gateway.tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -214,6 +215,13 @@ class FakeStore:
             self.current = row()
         return self.current
 
+    async def create_escalation(self, ctx, failed_action_id):
+        """Comm-Data-Store create_outbound_delivery_escalation (migration 279)."""
+        self.calls.append(("create_escalation", failed_action_id))
+        if self.current is None:
+            self.current = row()
+        return self.current
+
     async def prepare(self, ctx, expected_state):
         self.calls.append(("prepare", expected_state))
         self.current = replace(self.current, state=ActionState.PREPARED, action_uid=ACTION_UID)
@@ -296,6 +304,22 @@ class FakeStore:
             provider_account=parent.provider_account,
             routing_policy_version=parent.routing_policy_version,
         )
+        return self.current
+
+    async def set_delivery_paused(self, action_id, paused, *, now=None):
+        """Comm-Data-Store set_outbound_delivery_paused: open a pause (if none
+        is open) or close it, adding its length to delivery_paused_seconds."""
+        self.calls.append(("pause", paused))
+        now = now or NOW
+        since = self.current.delivery_paused_since
+        if paused and since is None:
+            self.current = replace(self.current, delivery_paused_since=now)
+        elif not paused and since is not None:
+            self.current = replace(
+                self.current,
+                delivery_paused_seconds=self.current.delivery_paused_seconds + (now - since).total_seconds(),
+                delivery_paused_since=None,
+            )
         return self.current
 
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code):
@@ -413,6 +437,31 @@ class FakeProbe:
     async def newer_context(self, context, *, limit, waive_shown, as_of=None):
         self.calls.append(("newer_context", context.prospect_id, context.action_id))
         return [self.newer] if self.newer is not None else []
+
+
+@pytest.mark.asyncio
+async def test_escalate_creates_its_row_through_the_escalation_function_then_sends_like_execute():
+    """The gateway's own staff escalation about a failed action is created
+    with create_outbound_delivery_escalation (which CDS admits on an ended
+    wake), never create_or_load -- and is otherwise the same send."""
+    failed = UUID("152dd448-594d-58a3-b06f-229c8a0e06c2")
+    accepted = ProviderObservation(
+        ProviderDisposition.ACCEPTED,
+        "provider_accepted",
+        provider_request_ref="req-1",
+        message_id="mail-1",
+        accepted_at=NOW,
+        evidence={"kind": "provider_message_id"},
+    )
+    store = FakeStore()
+    adapter = FakeAdapter(accepted)
+
+    result = await service(store, adapter).escalate(failed, request())
+
+    assert result.status is PublicStatus.SENT
+    assert store.calls[0] == ("create_escalation", failed)
+    assert not any(call[0] == "create" for call in store.calls)
+    assert sum(1 for call in adapter.calls if call == ("invoke",)) == 1
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1171,8 @@ async def test_open_provider_circuit_defers_without_provider_call():
     assert result.detail_code == "provider_circuit_open"
     assert adapter.calls == []
     assert ("schedule", ActionState.PREPARED, 120, "provider_circuit_open") in store.calls
+    # The provider is known to be down: the row's delivery clock is paused.
+    assert ("pause", True) in store.calls
 
 
 @pytest.mark.asyncio
@@ -1151,13 +1202,17 @@ async def test_tenantcloud_auth_wait_reschedules_without_spending_the_retry_budg
     assert store.current.state is ActionState.RETRY_READY
     assert not any(call[0] == "claim" for call in store.calls)
     assert adapter.calls == []
-    assert ("schedule", ActionState.RETRY_READY, 60, "tenantcloud_auth_wait") in store.calls
+    # The provider's auth is down: the row's delivery clock is paused and it
+    # waits on the retry policy's first step.
+    assert ("pause", True) in store.calls
+    assert store.current.delivery_paused_since == NOW
+    assert ("schedule", ActionState.RETRY_READY, RetryPolicy().backoff_seconds(0, jitter_key=str(ACTION_ID)), "tenantcloud_auth_wait") in store.calls
 
 
 @pytest.mark.asyncio
 async def test_tenantcloud_auth_wait_grows_then_falls_through_to_the_ordinary_path_at_the_ceiling():
-    """The backoff grows from 60s towards 5 minutes as the outage persists,
-    and once the 2h ceiling passes the row rejoins the ordinary
+    """The wait grows on the retry policy's backoff over the pause so far,
+    and once the staleness ceiling passes the row rejoins the ordinary
     claim()/dispatch path -- today's ordinary ladder to exhaustion."""
     waited = tenantcloud_row(
         ActionState.RETRY_READY,
@@ -1166,12 +1221,16 @@ async def test_tenantcloud_auth_wait_grows_then_falls_through_to_the_ordinary_pa
         attempt_count=1,
         next_attempt_at=NOW,
         created_at=NOW - timedelta(minutes=25),
+        delivery_paused_since=NOW - timedelta(minutes=25),
     )
     store = FakeStore(waited)
     result = await tenantcloud_service(store, FakeAdapter()).resume(ACTION_ID)
     assert result.status is PublicStatus.PENDING
     assert not any(call[0] == "claim" for call in store.calls)
-    assert ("schedule", ActionState.RETRY_READY, 180, "tenantcloud_auth_wait") in store.calls
+    assert ("pause", True) not in store.calls  # already open
+    grown = RetryPolicy().backoff_seconds(25 * 60, jitter_key=str(ACTION_ID))
+    assert grown > RetryPolicy().backoff_seconds(0, jitter_key=str(ACTION_ID))
+    assert ("schedule", ActionState.RETRY_READY, grown, "tenantcloud_auth_wait") in store.calls
 
     past_ceiling = tenantcloud_row(
         ActionState.RETRY_READY,
@@ -1179,7 +1238,7 @@ async def test_tenantcloud_auth_wait_grows_then_falls_through_to_the_ordinary_pa
         error_category="provider_authentication",
         attempt_count=1,
         next_attempt_at=NOW,
-        created_at=NOW - timedelta(hours=2, seconds=1),
+        created_at=NOW - timedelta(seconds=RetryPolicy().staleness_ceiling_seconds + 1),
     )
     store = FakeStore(past_ceiling)
     adapter = FakeAdapter(
@@ -2628,7 +2687,7 @@ async def test_pending_wait_past_its_ceiling_rejoins_the_ordinary_retry_budget()
     still PENDING long after it should plausibly still be running rejoins
     the ordinary claim()-then-schedule path, so it still eventually reaches
     a person instead of waiting on the pending ladder forever."""
-    old_created_at = NOW - timedelta(hours=7)
+    old_created_at = NOW - timedelta(seconds=RetryPolicy().staleness_ceiling_seconds + 1)
     store = FakeStore(
         _identity_matched_row(
             ActionState.UNKNOWN, action_uid=ACTION_UID, provider_request_ref="req-1", created_at=old_created_at

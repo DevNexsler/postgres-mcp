@@ -24,7 +24,7 @@ What "same final outcome" means here, and what counts as a difference:
                        nothing about this change touches it)
   DEFINITIVE_FAILED -- the sequence reaches a definitive provider rejection
                        (retry_policy.is_definitive_rejection), or elapsed
-                       time from created_at crosses RETRY_CEILING_SECONDS
+                       time from created_at crosses the retry policy's deadline
                        (one hour) with no acceptance yet
   STILL_RETRYING    -- the recorded sequence ends (no more attempts) while
                        still inside the one-hour ceiling and never accepted
@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -68,7 +69,7 @@ from postgres_mcp.outbound_gateway.adapters.base import ProviderDisposition  # n
 from postgres_mcp.outbound_gateway.adapters.base import ProviderObservation  # noqa: E402
 from postgres_mcp.outbound_gateway.idempotency_policy import reinvoke_safety  # noqa: E402
 from postgres_mcp.outbound_gateway.models import Operation  # noqa: E402
-from postgres_mcp.outbound_gateway.retry_policy import RETRY_CEILING_SECONDS  # noqa: E402
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicyConfig  # noqa: E402
 from postgres_mcp.outbound_gateway.retry_policy import RetryOutcome  # noqa: E402
 from postgres_mcp.outbound_gateway.retry_policy import decide_for_observation  # noqa: E402
 
@@ -218,6 +219,14 @@ def _observation_from_attempt(attempt: dict[str, Any]) -> ProviderObservation | 
     )
 
 
+# The policy the gateway would load from this environment (retry_config.py).
+_POLICIES = RetryPolicyConfig.from_env(os.environ)
+
+
+def _policy_for(row: dict[str, Any]):
+    return _POLICIES.for_operation(Operation(row["operation"]))
+
+
 def _parse_ts(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -256,16 +265,15 @@ def replay_action(row: dict[str, Any]) -> dict[str, Any]:
             continue
         elapsed = (_parse_ts(attempt["created_at"]) - created_at).total_seconds()
         decision = decide_for_observation(
-            attempt_count=int(attempt["attempt_number"]) or 1,
-            elapsed_seconds=elapsed,
+            policy=_policy_for(row),
+            deliverable_elapsed_seconds=elapsed,
             observation=observation,
-            ceiling_seconds=RETRY_CEILING_SECONDS,
         )
         if decision.outcome is RetryOutcome.STOP_DEFINITIVE:
             new_outcome = "DEFINITIVE_FAILED"
             warn_staff = decision.warn_staff
             is_rejection = observation.disposition is ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE
-            stop_cause = "definitive provider rejection" if is_rejection else "past the one-hour ceiling"
+            stop_cause = "definitive provider rejection" if is_rejection else "past the delivery deadline"
             new_reason = f"attempt {attempt['attempt_number']} at {elapsed:.0f}s: {stop_cause}"
             break
 
@@ -284,11 +292,12 @@ def replay_action(row: dict[str, Any]) -> dict[str, Any]:
         last_attempt_elapsed = (
             (_parse_ts(attempts[-1]["created_at"]) - created_at).total_seconds() if attempts else 0.0
         )
-        if old_outcome == "DEFINITIVE_FAILED" and new_outcome == "STILL_RETRYING" and last_attempt_elapsed < RETRY_CEILING_SECONDS:
+        deadline = _policy_for(row).deadline_seconds
+        if old_outcome == "DEFINITIVE_FAILED" and new_outcome == "STILL_RETRYING" and last_attempt_elapsed < deadline:
             category = "EXPECTED_ATTEMPT_CAP_VS_CEILING"
             reason = (
                 f"old system parked this at {old_state} via the legacy attempt-count cap; "
-                f"the full recorded history only reached {last_attempt_elapsed:.0f}s (< {RETRY_CEILING_SECONDS}s "
+                f"the full recorded history only reached {last_attempt_elapsed:.0f}s (< {deadline}s "
                 "ceiling), so the new elapsed-time policy would still be retrying -- exactly this "
                 "branch's intended change (delivery_workflow.py's advance())"
             )

@@ -20,8 +20,27 @@ from postgres_mcp.outbound_gateway.delivery_workflow import build_restate_app
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.models import PublicStatus
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 
 ACTION_ID = UUID("4cbac369-48c6-5b62-95e9-41f50259e732")
+POLICY = RetryPolicy()
+
+
+def pausing(store, row, now):
+    """Give an AsyncMock store CDS's set_outbound_delivery_paused: open a
+    pause at `now` (if none is open) or close it into the running total."""
+
+    def set_paused(_action_id, paused):
+        since = getattr(row, "delivery_paused_since", None)
+        if paused and since is None:
+            row.delivery_paused_since = now()
+        elif not paused and since is not None:
+            row.delivery_paused_seconds = getattr(row, "delivery_paused_seconds", 0.0) + (now() - since).total_seconds()
+            row.delivery_paused_since = None
+        return row
+
+    store.set_delivery_paused.side_effect = set_paused
+    return store
 
 
 def action(state: ActionState, *, attempts: int = 0):
@@ -39,12 +58,15 @@ def action(state: ActionState, *, attempts: int = 0):
 @pytest.mark.asyncio
 async def test_auth_outage_waits_without_consuming_provider_attempt() -> None:
     row = action(ActionState.PREPARED, attempts=2)
-    store = AsyncMock()
+    now = datetime(2026, 9, 14, 16, 0, tzinfo=timezone.utc)
+    store = pausing(AsyncMock(), row, lambda: now)
     store.get.return_value = row
     service = AsyncMock()
     auth = AsyncMock()
+    # A wait the provider asked for is honored when it is longer than the
+    # policy's.
     auth.ensure_ready.return_value = AuthResult(AuthState.TRANSPORT_FAILURE, retry_after_seconds=30)
-    coordinator = OutboundDeliveryCoordinator(store=store, service=service, auth=auth, max_attempts=5)
+    coordinator = OutboundDeliveryCoordinator(store=store, service=service, auth=auth, clock=lambda: now)
 
     result = await coordinator.advance(ACTION_ID)
 
@@ -57,6 +79,7 @@ async def test_auth_outage_waits_without_consuming_provider_attempt() -> None:
         "retry_after_seconds": 30,
     }
     assert row.attempt_count == 2
+    assert row.delivery_paused_since == now
     service.resume.assert_not_called()
     service.reconcile.assert_not_called()
 
@@ -94,7 +117,8 @@ async def test_tenantcloud_login_state_never_holds_a_non_tenantcloud_send(operat
 @pytest.mark.asyncio
 async def test_tenantcloud_send_still_waits_for_login() -> None:
     row = action(ActionState.PREPARED)
-    store = AsyncMock()
+    now = datetime(2026, 9, 14, 16, 0, tzinfo=timezone.utc)
+    store = pausing(AsyncMock(), row, lambda: now)
     store.get.return_value = row
     service = AsyncMock()
     auth = AsyncMock()
@@ -104,13 +128,14 @@ async def test_tenantcloud_send_still_waits_for_login() -> None:
         service=service,
         auth=auth,
         operations=frozenset({Operation.CLIQ_CHAT_POST, Operation.TENANTCLOUD_MESSAGE_SEND}),
+        clock=lambda: now,
     )
 
     result = await coordinator.advance(ACTION_ID)
 
     assert result.phase is DeliveryPhase.WAIT
     assert result.detail_code == "tenantcloud_auth_login_required"
-    assert result.retry_after_seconds == 300
+    assert result.retry_after_seconds == POLICY.backoff_seconds(0, jitter_key=str(ACTION_ID))
     service.resume.assert_not_called()
 
 
@@ -173,7 +198,7 @@ async def test_unavailable_persisted_context_waits_without_hot_loop() -> None:
     assert result == DeliveryResult(
         DeliveryPhase.WAIT,
         "persisted_context_unavailable",
-        300,
+        POLICY.backoff_seconds(0, jitter_key=str(ACTION_ID)),
     )
     store.get.assert_awaited_once_with(ACTION_ID)
 
@@ -600,7 +625,7 @@ async def test_a_context_reload_manual_review_waits_instead_of_parking_inside_th
 
     assert result.phase is DeliveryPhase.WAIT
     assert result.detail_code == "persisted_context_unavailable"
-    assert result.retry_after_seconds == 300
+    assert result.retry_after_seconds == POLICY.backoff_seconds(6, jitter_key=str(ACTION_ID))
 
 
 @pytest.mark.asyncio

@@ -211,12 +211,35 @@ class PostgresActionStore:
             "provider_observation": cells.get("provider_observation"),
         }
 
-    async def create_or_load(self, context: ActionContext) -> OutboundActionRecord:
+    @staticmethod
+    def _create_params(context: ActionContext) -> list[Any]:
         recipient_scope = {
             "kind": context.target.kind,
             "target_id": context.target.target_id,
             "verified": context.target.verified,
         }
+        return [
+            context.action_role.value,
+            context.operation.value,
+            context.intent_kind,
+            context.appointment_slot,
+            context.payload_hash,
+            _json(context.canonical_context),
+            context.source_message_id,
+            _json(context.canonical_scope),
+            _json(recipient_scope),
+            context.provider_account,
+            context.routing_policy_version,
+            # Non-TenantCloud operations get context.arguments back
+            # unchanged. TenantCloud operations are enriched with
+            # desired_state/target_reference/idempotency_key so
+            # migration 118's acceptance guard (which reads these
+            # straight off outbound_actions.arguments) can compare
+            # against them later -- see tenantcloud_shared.py.
+            _json(tenantcloud_persisted_arguments(context)),
+        ]
+
+    async def create_or_load(self, context: ActionContext) -> OutboundActionRecord:
         return await self._one(
             """
             SELECT * FROM create_or_load_outbound_action(
@@ -224,27 +247,30 @@ class PostgresActionStore:
                 {}::jsonb, {}, {}, {}::jsonb
             )
             """,
-            [
-                context.wakeup_event_id,
-                context.action_role.value,
-                context.operation.value,
-                context.intent_kind,
-                context.appointment_slot,
-                context.payload_hash,
-                _json(context.canonical_context),
-                context.source_message_id,
-                _json(context.canonical_scope),
-                _json(recipient_scope),
-                context.provider_account,
-                context.routing_policy_version,
-                # Non-TenantCloud operations get context.arguments back
-                # unchanged. TenantCloud operations are enriched with
-                # desired_state/target_reference/idempotency_key so
-                # migration 118's acceptance guard (which reads these
-                # straight off outbound_actions.arguments) can compare
-                # against them later -- see tenantcloud_shared.py.
-                _json(tenantcloud_persisted_arguments(context)),
-            ],
+            [context.wakeup_event_id, *self._create_params(context)],
+        )
+
+    async def create_escalation(self, context: ActionContext, failed_action_id: UUID) -> OutboundActionRecord:
+        """The gateway's staff escalation about ``failed_action_id``, created
+        on that action's wake (Comm-Data-Store migration 279). CDS checks the
+        failed action and admits this one row past the ended-wake and
+        TenantCloud-ownership guards; it refuses anything else."""
+        return await self._one(
+            """
+            SELECT * FROM create_outbound_delivery_escalation(
+                {}, {}, {}, {}, {}, {}, {}, {}::jsonb, {}, {}::jsonb,
+                {}::jsonb, {}, {}, {}::jsonb
+            )
+            """,
+            [failed_action_id, context.wakeup_event_id, *self._create_params(context)],
+        )
+
+    async def set_delivery_paused(self, action_id: UUID, paused: bool) -> OutboundActionRecord:
+        """Open (True) or close (False) the action's provider-down pause
+        (Comm-Data-Store migration 279). Idempotent either way."""
+        return await self._one(
+            "SELECT * FROM set_outbound_delivery_paused({}, {})",
+            [action_id, paused],
         )
 
     async def prepare(self, context: ActionContext, expected_state: ActionState) -> OutboundActionRecord:
@@ -828,7 +854,9 @@ class PostgresActionStore:
             [action_id, expected_state.value, delay_seconds, detail_code],
         )
 
-    async def list_work(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]:
+    async def list_work(
+        self, limit: int, max_attempts: int, *, max_attempts_by_operation: Mapping[str, int] | None = None
+    ) -> list[tuple[UUID, ActionState]]:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -840,15 +868,17 @@ class PostgresActionStore:
             )
               AND (lease_owner IS NULL OR lease_expires_at <= now())
               AND next_attempt_at <= now()
-              AND attempt_count < {}
+              AND attempt_count < coalesce(({}::jsonb ->> operation)::int, {})
             ORDER BY updated_at, action_id
             LIMIT {}
             """,
-            [max_attempts, limit],
+            [_json(dict(max_attempts_by_operation or {})), max_attempts, limit],
         )
         return [(UUID(str(row.cells["action_id"])), ActionState(str(row.cells["state"]))) for row in rows or []]
 
-    async def list_exhausted(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]:
+    async def list_exhausted(
+        self, limit: int, max_attempts: int, *, max_attempts_by_operation: Mapping[str, int] | None = None
+    ) -> list[tuple[UUID, ActionState]]:
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -860,11 +890,11 @@ class PostgresActionStore:
             )
               AND (lease_owner IS NULL OR lease_expires_at <= now())
               AND next_attempt_at <= now()
-              AND attempt_count >= {}
+              AND attempt_count >= coalesce(({}::jsonb ->> operation)::int, {})
             ORDER BY updated_at, action_id
             LIMIT {}
             """,
-            [max_attempts, limit],
+            [_json(dict(max_attempts_by_operation or {})), max_attempts, limit],
         )
         return [(UUID(str(row.cells["action_id"])), ActionState(str(row.cells["state"]))) for row in rows or []]
 
@@ -918,4 +948,6 @@ class PostgresActionStore:
             stale_context_shown_refs=tuple(str(ref) for ref in (cells.get("stale_context_shown_refs") or ())),
             stale_context_decision=cells.get("stale_context_decision"),
             created_at=cells.get("created_at"),
+            delivery_paused_seconds=float(cells.get("delivery_paused_seconds") or 0.0),
+            delivery_paused_since=cells.get("delivery_paused_since"),
         )

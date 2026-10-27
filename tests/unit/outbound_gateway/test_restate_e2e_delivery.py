@@ -47,8 +47,10 @@ from postgres_mcp.outbound_gateway.models import IntentKind
 from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.provider_client import McpCallResult
 from postgres_mcp.outbound_gateway.record import OutboundActionRecord
-from postgres_mcp.outbound_gateway.retry_policy import RETRY_CEILING_SECONDS
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 from postgres_mcp.outbound_gateway.service import OutboundActionService
+
+RETRY_CEILING_SECONDS = RetryPolicy().deadline_seconds
 
 ACTION_ID = UUID("a3b8596b-bd90-5da7-8f78-3f1c2c2c73a7")
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
@@ -121,10 +123,12 @@ class FakeStore:
     that would violate outbound_action_transition_allowed() fails here too,
     not just in prod."""
 
-    def __init__(self, initial: OutboundActionRecord) -> None:
+    def __init__(self, initial: OutboundActionRecord, *, clock: Any = None) -> None:
         self.current = initial
         # The agent's own resend, when a test plays one (see later_sent_sibling).
         self.recovered_by: UUID | None = None
+        # set_delivery_paused stamps pauses with this (the test's FakeClock).
+        self.clock = clock
 
     async def get(self, action_id: UUID) -> OutboundActionRecord | None:
         return self.current if self.current and self.current.action_id == action_id else None
@@ -180,6 +184,20 @@ class FakeStore:
             detail_code=observation.detail_code,
             error_category=observation.category,
         )
+        return self.current
+
+    async def set_delivery_paused(self, action_id: UUID, paused: bool) -> OutboundActionRecord:
+        """Comm-Data-Store set_outbound_delivery_paused (migration 279)."""
+        now = self.clock() if self.clock is not None else datetime.now(timezone.utc)
+        since = self.current.delivery_paused_since
+        if paused and since is None:
+            self.current = replace(self.current, delivery_paused_since=now)
+        elif not paused and since is not None:
+            self.current = replace(
+                self.current,
+                delivery_paused_seconds=self.current.delivery_paused_seconds + (now - since).total_seconds(),
+                delivery_paused_since=None,
+            )
         return self.current
 
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code) -> OutboundActionRecord:

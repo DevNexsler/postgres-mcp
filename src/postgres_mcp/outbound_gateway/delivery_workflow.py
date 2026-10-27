@@ -43,13 +43,16 @@ from .idempotency_policy import reinvoke_safety
 from .models import ActionState
 from .models import Operation
 from .models import PublicStatus
+from .retry_config import MAX_SINGLE_WAIT_SECONDS
+from .retry_config import RetryPolicyConfig
+from .retry_config import deliverable_elapsed_seconds
+from .retry_config import jitter_key
+from .retry_config import paused_seconds
+from .retry_config import wall_elapsed_seconds
 from .retry_policy import CONTEXT_RELOAD_WAIT_DETAILS
-from .retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
-from .retry_policy import RETRY_CEILING_SECONDS
+from .retry_policy import STALENESS_CEILING_DETAIL
 from .retry_policy import NoopStaffWarningPort
 from .retry_policy import StaffWarningPort
-from .retry_policy import ceiling_exceeded
-from .retry_policy import elapsed_step_backoff_seconds
 from .retry_policy import should_wait_for_context_reload
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
@@ -84,6 +87,9 @@ class AuthState(StrEnum):
 
 @dataclass(frozen=True)
 class AuthResult:
+    """``retry_after_seconds``: a wait the provider itself asked for (0: none).
+    The coordinator waits at least that long, otherwise on the retry policy."""
+
     state: AuthState
     retry_after_seconds: int = 0
 
@@ -127,6 +133,8 @@ class DeliveryStore(Protocol):
 
     async def later_sent_sibling(self, action_id: UUID) -> UUID | None: ...
 
+    async def set_delivery_paused(self, action_id: UUID, paused: bool) -> Any: ...
+
 
 class DeliveryService(Protocol):
     async def prepare(self, action_id: UUID) -> Any: ...
@@ -135,7 +143,7 @@ class DeliveryService(Protocol):
 
     async def reconcile(self, action_id: UUID) -> Any: ...
 
-    async def exhaust(self, action_id: UUID) -> Any: ...
+    async def exhaust(self, action_id: UUID, *, give_up_detail: str | None = None) -> Any: ...
 
 
 class AuthGate(Protocol):
@@ -196,7 +204,7 @@ class OutboundDeliveryCoordinator:
         max_ambiguous_attempts: int = 12,
         clock: Callable[[], datetime] | None = None,
         operations: frozenset[Operation] | None = None,
-        context_wait_ceiling_seconds: int = RETRY_CEILING_SECONDS,
+        retry_policies: RetryPolicyConfig | None = None,
         staff_warning: StaffWarningPort | None = None,
         staff_warning_grace_seconds: int = STAFF_WARNING_GRACE_SECONDS,
     ) -> None:
@@ -212,22 +220,18 @@ class OutboundDeliveryCoordinator:
         # to prevent.
         for operation in self._operations:
             reinvoke_safety(operation)
-        self._context_wait_ceiling_seconds = max(1, context_wait_ceiling_seconds)
+        # The one retry configuration (retry_config.py): every wait, the
+        # delivery deadline and the staleness ceiling, per operation.
+        self._policies = retry_policies or RetryPolicyConfig.from_env({})
         # Default is inert (NoopStaffWarningPort just logs): a caller that
         # wants the real Cliq notification passes
         # staff_warning.CliqStaffWarningPort(service). See retry_policy.py's
         # StaffWarningPort docstring for the exactly-one-per-action contract.
         self._staff_warning = staff_warning or NoopStaffWarningPort()
         self.staff_warning_grace_seconds = max(1, staff_warning_grace_seconds)
-        # NOT read by advance() (see its body): retry_policy.py's elapsed-time
-        # ceiling (context_wait_ceiling_seconds, above) is the one budget for
-        # every operation this coordinator serves, including the ambiguous-
-        # reconcile-loop protection action c3df14e3 (2026-09-25, an unknown
-        # TenantCloud send whose in-flight state held every later send to the
-        # same recipient -- lease_held) needed a count cap for. Kept only as
-        # constructor parameters for source compatibility with existing
-        # callers (tenantcloud_delivery_server.py); passing a non-default
-        # value here no longer changes advance()'s behavior.
+        # NOT read by advance(): the Restate path's budget is the policy's
+        # deadline, not a claim count (a reschedule here does not always take
+        # a claim). Kept for source compatibility with existing callers.
         self._max_attempts = max(1, max_attempts)
         self._max_ambiguous_attempts = max(self._max_attempts, max_ambiguous_attempts)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -249,6 +253,23 @@ class OutboundDeliveryCoordinator:
         return DeliveryResult(DeliveryPhase.WAIT, action.state.value, delay)
 
     async def advance(self, action_id: UUID) -> DeliveryResult:
+        """One idempotent step over durable CDS state. Every wait, the
+        deadline and the staleness ceiling come from the operation's
+        retry policy (retry_config.py):
+
+        - Past the staleness ceiling (wall clock since created_at) nothing is
+          sent: the row is closed and a person is told, provider up or not.
+        - While the provider's auth is not ready the clock is paused (CDS
+          records the pause on the row) and the row waits on the policy's
+          backoff over the pause so far. The circuit-open pause is recorded
+          the same way by service._dispatch.
+        - Once the provider is reachable the pause closes, and the deadline
+          counts only deliverable-but-failing time. The step that closes a
+          pause is always a real attempt, never the end (10/26: two
+          TenantCloud replies queued through an 11-hour outage were closed
+          the moment auth came back, because their one-hour budget ran on
+          wall-clock time).
+        """
         action = await self._store.get(action_id)
         if action is None:
             return DeliveryResult(DeliveryPhase.TERMINAL, "action_not_found")
@@ -261,51 +282,47 @@ class OutboundDeliveryCoordinator:
         if action.state not in (_AMBIGUOUS_STATES | _RESUMABLE_STATES):
             return DeliveryResult(DeliveryPhase.WAIT, "action_not_prepared", 5)
 
+        policy = self._policies.for_operation(action.operation)
+        now = self._clock()
+        if policy.staleness_exceeded(wall_elapsed_seconds(action, now)):
+            result = await self._service.exhaust(action_id, give_up_detail=STALENESS_CEILING_DETAIL)
+            return self._settle(result, policy) or await self.status(action_id)
+
         # Only TenantCloud operations need a TenantCloud login. Gating every
-        # Restate-routed send on it parked Cliq/email/SMS replies for 300 s
-        # whenever TenantCloud reported login_required (action c6d15f16).
+        # Restate-routed send on it parked Cliq/email/SMS replies whenever
+        # TenantCloud reported login_required (action c6d15f16).
         auth = (
             await self._auth.ensure_ready()
             if action.operation in TENANTCLOUD_OPERATIONS
             else AuthResult(AuthState.READY)
         )
         if auth.state is not AuthState.READY:
-            default_delay = {
-                AuthState.LOGIN_REQUIRED: 300,
-                AuthState.RUNNER_UNAVAILABLE: 30,
-                AuthState.TRANSPORT_FAILURE: 30,
-                AuthState.PROVIDER_FAILURE: 120,
-            }[auth.state]
+            if getattr(action, "delivery_paused_since", None) is None:
+                action = await self._store.set_delivery_paused(action_id, True)
+            pause_age = paused_seconds(action, now) - float(getattr(action, "delivery_paused_seconds", 0.0) or 0.0)
+            wait = policy.backoff_seconds(pause_age, jitter_key=jitter_key(action))
             return DeliveryResult(
                 DeliveryPhase.WAIT,
                 f"tenantcloud_auth_{auth.state.value}",
-                max(1, auth.retry_after_seconds or default_delay),
+                max(1, wait, auth.retry_after_seconds),
             )
+        just_recovered = getattr(action, "delivery_paused_since", None) is not None
+        if just_recovered:
+            action = await self._store.set_delivery_paused(action_id, False)
 
-        # retry_policy.py owns every retry/backoff/ceiling decision for every
-        # action this coordinator advances (by construction, only operations
-        # in ``self._operations`` -- Restate-routed ones). attempt_count is
-        # never read here: the legacy worker's 5/12 attempt caps
-        # (``self._max_attempts`` / ``self._max_ambiguous_attempts``, kept
-        # only for the non-Restate path in worker.py/service.py) do not apply
-        # once an operation is on Restate -- a send that answers slowly a
-        # handful of times must not get a smaller effective budget than one
-        # that answers instantly every time (see retry_policy.py's module
-        # docstring). The one ceiling is elapsed wall-clock time since the
-        # action's own created_at, bounded at
-        # ``self._context_wait_ceiling_seconds`` (RETRY_CEILING_SECONDS, one
-        # hour, by default). None (a hand-built record, or a store that
-        # predates created_at) is treated as "just created" -- same
-        # convention as service.py's TenantCloud auth-wait ceiling anchor.
-        action_created_at = getattr(action, "created_at", None)
-        elapsed = max(0.0, (self._clock() - action_created_at).total_seconds()) if action_created_at is not None else 0.0
-        exhausted = ceiling_exceeded(elapsed, ceiling_seconds=self._context_wait_ceiling_seconds)
+        elapsed = deliverable_elapsed_seconds(action, now)
+        # The first look after the provider comes back is always a real
+        # attempt, never the end: the deadline is for time spent failing,
+        # and this action has not had a chance to fail yet.
+        exhausted = policy.deadline_exceeded(elapsed) and not just_recovered
         if action.state is ActionState.RECEIVED:
-            # A received row past the ceiling was never prepared: exhaust()
+            # A received row past the deadline was never prepared: exhaust()
             # ends it rejected (nothing was sent) instead of preparing again.
             result = await self._service.exhaust(action_id) if exhausted else await self._service.prepare(action_id)
-            if result.status is PublicStatus.PENDING and result.detail_code in _CONTEXT_WAIT_DETAILS:
-                return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, CONTEXT_RELOAD_WAIT_SECONDS)
+            if result.status is PublicStatus.PENDING and result.detail_code in CONTEXT_RELOAD_WAIT_DETAILS:
+                return DeliveryResult(
+                    DeliveryPhase.WAIT, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+                )
         elif action.state in _AMBIGUOUS_STATES:
             result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
         elif exhausted:
@@ -315,47 +332,48 @@ class OutboundDeliveryCoordinator:
         if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
             return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
         if result.status is PublicStatus.FAILED and result.detail_code == GATEWAY_INTERNAL_ERROR:
-            # A step failed before any send and left the row as it was
-            # (service._settled ends a row in the background only for a
-            # refusal): a passing database error, most often. Ending the
-            # workflow here would leave that row with nobody to advance it
-            # -- every resubmission answers 409 for the retention window.
-            # Wait and try again under the same elapsed ceiling, which ends
-            # it (definitive_failed, or rejected if it was never prepared).
-            return DeliveryResult(DeliveryPhase.WAIT, result.detail_code, elapsed_step_backoff_seconds(elapsed))
+            # A step failed before any send and left the row as it was (a
+            # passing database error, most often). Ending the workflow here
+            # would leave the row with nobody to advance it. Wait and try
+            # again under the same deadline, which ends it.
+            return DeliveryResult(
+                DeliveryPhase.WAIT, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+            )
         if result.status is PublicStatus.MANUAL_REVIEW:
-            wait_detail = result.detail_code if result.detail_code in _CONTEXT_WAIT_DETAILS else getattr(result, "detail", None)
-            if wait_detail in _CONTEXT_WAIT_DETAILS and should_wait_for_context_reload(
-                wait_detail,
-                elapsed,
-                ceiling_seconds=self._context_wait_ceiling_seconds,
-            ):
-                # Generalizes the RECEIVED-only wait above to every state:
-                # real prod data (action 497fcaf8, calendar.update,
-                # 2026-09-28) shows this same detail code reaching
-                # manual_review from other branches too, well inside the
-                # retry ceiling, on an action that had not actually failed
-                # -- only its context reload had. Wait and let the next
-                # advance() try the reload again instead of parking it.
-                return DeliveryResult(DeliveryPhase.WAIT, wait_detail, CONTEXT_RELOAD_WAIT_SECONDS)
+            wait_detail = result.detail_code if result.detail_code in CONTEXT_RELOAD_WAIT_DETAILS else getattr(result, "detail", None)
+            if wait_detail in CONTEXT_RELOAD_WAIT_DETAILS and should_wait_for_context_reload(wait_detail, elapsed, policy):
+                # A context reload that raced a write is not a failure: wait
+                # and reload again (action 497fcaf8, calendar.update).
+                return DeliveryResult(
+                    DeliveryPhase.WAIT, wait_detail, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+                )
+        settled = self._settle(result, policy)
+        if settled is not None:
+            return settled
+        return await self.status(action_id)
+
+    @staticmethod
+    def _settle(result: Any, policy: Any) -> DeliveryResult | None:
+        """A finished step: complete, or terminal with the escalation the
+        policy owes. STALE is a deliberate no-send (freshness preflight), so
+        it never escalates. The escalation itself is not sent here: the
+        workflow waits out the grace period first (warn_unless_recovered)."""
+        if result.status in {PublicStatus.SENT, PublicStatus.DUPLICATE}:
+            return DeliveryResult(DeliveryPhase.COMPLETE, result.detail_code)
         if result.status in {
             PublicStatus.FAILED,
             PublicStatus.REJECTED,
             PublicStatus.STALE,
             PublicStatus.MANUAL_REVIEW,
         }:
-            # STALE is a deliberate no-send (freshness preflight), never a
-            # failure -- see PublicStatus's own docstring -- so it never
-            # warns. Everything else here is the workflow giving up for good:
-            # a definitive provider rejection, or retry_policy's ceiling. The
-            # warning itself is not sent here: the workflow waits out the
-            # grace period first (warn_unless_recovered).
-            return DeliveryResult(
-                DeliveryPhase.TERMINAL,
-                result.detail_code,
-                staff_warning=result.status is not PublicStatus.STALE,
-            )
-        return await self.status(action_id)
+            escalate = policy.escalate and result.status is not PublicStatus.STALE
+            if not escalate and result.status is not PublicStatus.STALE:
+                logger.warning(
+                    "outbound action gave up (%s) and its retry policy does not escalate; no staff escalation",
+                    result.detail_code,
+                )
+            return DeliveryResult(DeliveryPhase.TERMINAL, result.detail_code, staff_warning=escalate)
+        return None
 
     async def warn_unless_recovered(self, action_id: UUID, reason: str) -> None:
         """Warn staff about a failed action unless a later send of the same
@@ -409,11 +427,11 @@ class SecretAuthGate:
         try:
             await asyncio.to_thread(self._auth_factory().get_token)
         except self._login_required_errors:
-            return AuthResult(AuthState.LOGIN_REQUIRED, 300)
+            return AuthResult(AuthState.LOGIN_REQUIRED)
         except self._transport_errors:
-            return AuthResult(AuthState.TRANSPORT_FAILURE, 30)
+            return AuthResult(AuthState.TRANSPORT_FAILURE)
         except Exception:
-            return AuthResult(AuthState.RUNNER_UNAVAILABLE, 30)
+            return AuthResult(AuthState.RUNNER_UNAVAILABLE)
         return AuthResult(AuthState.READY)
 
 
@@ -562,7 +580,7 @@ def build_restate_app(coordinator: OutboundDeliveryCoordinator, *, workflow_name
             delay = outcome.get("retry_after_seconds")
             if type(delay) is not int or delay < 1:
                 raise restate.TerminalError("invalid delivery retry delay", status_code=500)
-            await ctx.sleep(timedelta(seconds=min(delay, 3600)), name=f"wait {step}")
+            await ctx.sleep(timedelta(seconds=min(delay, MAX_SINGLE_WAIT_SECONDS)), name=f"wait {step}")
             step += 1
         if outcome.get("staff_warning"):
             await ctx.sleep(

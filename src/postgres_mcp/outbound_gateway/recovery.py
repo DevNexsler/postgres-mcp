@@ -38,11 +38,9 @@ from .adapters.base import ProviderAdapter
 from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
 from .adapters.base import ProviderReceipt
+from .context import ActionContext
 from .idempotency_policy import ReinvokeSafety
 from .idempotency_policy import reinvoke_safety
-from .context import ActionContext
-from .metrics import PROVIDER_PENDING_WAIT_CEILING_SECONDS
-from .metrics import provider_pending_wait_seconds
 from .models import ActionState
 from .models import CompletionKind
 from .models import Operation
@@ -52,6 +50,9 @@ from .record import OutboundActionRecord
 from .record import action_result
 from .record import is_due
 from .record import require_action
+from .retry_config import RetryPolicyConfig
+from .retry_config import jitter_key
+from .retry_config import wall_elapsed_seconds
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -274,7 +275,13 @@ def _ceiling_fail(action: OutboundActionRecord, *, reason: str | None = None) ->
     )
 
 
-def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, restate_flagged: bool = False) -> Plan:
+def plan_exhaust(
+    action: OutboundActionRecord,
+    *,
+    reason: str | None = None,
+    restate_flagged: bool = False,
+    give_up_detail: str | None = None,
+) -> Plan:
     """Close work whose retry budget is spent, without another provider
     invocation: a durable acceptance completes; anything that may already
     be with the provider is parked for a person; a send that never left
@@ -292,7 +299,14 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, res
     becomes `definitive_failed` only when the existing reinvocation policy
     says provider deduplication makes a repeat safe. Other unknown outcomes
     keep dead_letter -> manual_review, without entering retry_ready. The
-    workflow still emits exactly one staff warning."""
+    workflow still emits exactly one staff warning.
+
+    `give_up_detail`: why the budget ended when it was not the ordinary
+    deadline (retry_policy.STALENESS_CEILING_DETAIL). It names the failure
+    only of a row that never reached a provider; anything that may have been
+    dispatched keeps `retry_budget_exhausted`, which CDS deliberately refuses
+    to let an agent override (migration 251: earlier attempts may have
+    landed)."""
     recovered = plan_recover_acceptance(action)
     if recovered is not None:
         return recovered
@@ -333,15 +347,16 @@ def plan_exhaust(action: OutboundActionRecord, *, reason: str | None = None, res
             )
         return _dead_letter_for_review(state, exhausted, review, has_lease=False)
     if state in {ActionState.PREPARED, ActionState.RETRY_READY}:
+        detail = give_up_detail if give_up_detail and action.dispatch_started_at is None else "retry_budget_exhausted"
         return (
             Claim(state),
             DefinitiveFail(
                 state,
                 ProviderObservation(
                     ProviderDisposition.DEFINITIVE_NON_ACCEPTANCE,
-                    "retry_budget_exhausted",
+                    detail,
                     provider_request_ref=action.provider_request_ref,
-                    category="retry_budget_exhausted",
+                    category=detail,
                     retryable=False,
                     evidence={"kind": "retry_budget"},
                 ),
@@ -412,6 +427,7 @@ class ActionRecovery:
         actor: str,
         lease_seconds: int,
         restate_operations: frozenset[Operation] = frozenset(),
+        retry_policies: RetryPolicyConfig | None = None,
     ):
         self._store = store
         self._provider_client = provider_client
@@ -429,11 +445,12 @@ class ActionRecovery:
         # existing tests, and any legacy-only wiring) keeps today's
         # dead_letter -> manual_review behavior exactly.
         self._restate_operations = restate_operations
+        self._policies = retry_policies or RetryPolicyConfig.from_env({})
 
     async def _apply(self, action: OutboundActionRecord, plan: Plan) -> OutboundActionRecord:
         return await apply_plan(self._store, action, plan, actor=self._actor, lease_seconds=self._lease_seconds)
 
-    async def exhaust(self, action_id: UUID) -> PublicResult:
+    async def exhaust(self, action_id: UUID, *, give_up_detail: str | None = None) -> PublicResult:
         """Close exhausted work -- but not blindly: an action whose outcome
         is still unknown or ambiguous (a send may already be with the
         provider) gets one last provider look first (wakes 27296/27297/27314
@@ -450,7 +467,12 @@ class ActionRecovery:
         return action_result(
             await self._apply(
                 action,
-                plan_exhaust(action, reason=reload_reason, restate_flagged=action.operation in self._restate_operations),
+                plan_exhaust(
+                    action,
+                    reason=reload_reason,
+                    restate_flagged=action.operation in self._restate_operations,
+                    give_up_detail=give_up_detail,
+                ),
             ),
             detail=reload_reason,
         )
@@ -574,7 +596,7 @@ class ActionRecovery:
         all: an ambiguous, still-possibly-in-flight action got parked
         irrevocably a few hundred milliseconds after being prepared, before
         the Restate coordinator's own elapsed-time ceiling
-        (retry_policy.RETRY_CEILING_SECONDS) ever had a chance to run out.
+        (the retry policy's deadline) ever had a chance to run out.
         For a Restate-flagged operation, resume() never calls
         ``manual_review()`` at all any more: once the coordinator's own
         ceiling is exceeded it stops calling resume() and calls exhaust()
@@ -621,20 +643,19 @@ class ActionRecovery:
 
     async def _pending_wait(self, action: OutboundActionRecord, observation: ProviderObservation) -> PublicResult:
         """The job is still running, not failed: look again later without
-        spending an attempt (no Claim), on the pending-wait ladder, up to its
-        several-hour ceiling -- PENDING must never burn toward the ordinary
-        5-attempt exhaustion budget the way a real ambiguous/failed outcome
-        does (wake 27321: the provider's own write landed well inside a
-        second of dispatch; a slow-but-alive job is not the same failure
-        class a stuck one is). Past the ceiling this rejoins the ordinary
-        claim()-then-schedule path, so a job that truly never finishes still
-        reaches a person eventually."""
-        elapsed = (self._clock() - action.created_at).total_seconds() if action.created_at is not None else 0.0
-        if elapsed < PROVIDER_PENDING_WAIT_CEILING_SECONDS:
+        spending an attempt (no Claim), on the retry policy's backoff, until
+        the policy's staleness ceiling -- PENDING must never burn the ordinary
+        attempt budget the way a real ambiguous/failed outcome does (wake
+        27321: a slow-but-alive job is not the failure class a stuck one is).
+        Past the ceiling this rejoins the ordinary claim()-then-schedule path,
+        so a job that truly never finishes still reaches a person."""
+        policy = self._policies.for_operation(action.operation)
+        elapsed = wall_elapsed_seconds(action, self._clock())
+        if not policy.staleness_exceeded(elapsed):
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
                 action.state,
-                provider_pending_wait_seconds(elapsed),
+                policy.backoff_seconds(elapsed, jitter_key=jitter_key(action)),
                 observation.detail_code,
             )
             return action_result(scheduled)

@@ -80,11 +80,16 @@ class OutboundActionRecord:
     # revise), NULL while unanswered.
     stale_context_shown_refs: tuple[str, ...] = ()
     stale_context_decision: str | None = None
-    # outbound_actions.created_at already exists (not previously read by this
-    # dataclass): the anchor for the TenantCloud auth-outage wait's 2h
-    # ceiling (service.py's _tenantcloud_auth_wait_pending). None on a
-    # hand-built record (most test fixtures): treated as "just created".
+    # outbound_actions.created_at: the anchor for the staleness ceiling and
+    # the delivery deadline (retry_config.py). None on a hand-built record
+    # (most test fixtures): treated as "just created".
     created_at: datetime | None = None
+    # Comm-Data-Store migration 279: time this action spent waiting on a
+    # provider known to be down (circuit open, auth not ready). Closed pauses
+    # accumulate in delivery_paused_seconds; delivery_paused_since is the
+    # start of a pause still open. The delivery deadline does not count them.
+    delivery_paused_seconds: float = 0.0
+    delivery_paused_since: datetime | None = None
 
     def execute_request(self) -> ExecuteRequest:
         # create_or_load() persists TenantCloud arguments enriched with
@@ -113,6 +118,10 @@ class OutboundActionRecord:
 
 class ActionStore(Protocol):
     async def create_or_load(self, context: ActionContext) -> OutboundActionRecord: ...
+
+    async def create_escalation(self, context: ActionContext, failed_action_id: UUID) -> OutboundActionRecord: ...
+
+    async def set_delivery_paused(self, action_id: UUID, paused: bool) -> OutboundActionRecord: ...
 
     async def prepare(
         self,

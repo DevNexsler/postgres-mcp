@@ -82,7 +82,7 @@ from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.provider_client import McpCallResult
 from postgres_mcp.outbound_gateway.provider_client import TransportErrorKind
 from postgres_mcp.outbound_gateway.record import OutboundActionRecord
-from postgres_mcp.outbound_gateway.retry_policy import RETRY_CEILING_SECONDS
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 
 from .test_adapters import TC_ACCEPTED
@@ -96,6 +96,7 @@ from .test_adapters import FakeTenantCloudMutations
 from .test_restate_e2e_delivery import FakeStore
 from .test_restate_e2e_delivery import RecordingStaffWarningPort
 
+RETRY_CEILING_SECONDS = RetryPolicy().deadline_seconds
 ACTION_UID = UUID("9ebddbf7-8fc8-5a4f-bba7-869ea7053521")
 CREATED_AT = datetime(2026, 9, 28, 22, 43, 0, tzinfo=timezone.utc)
 APPOINTMENT = datetime(2026, 9, 30, 14, 30, tzinfo=timezone.utc)

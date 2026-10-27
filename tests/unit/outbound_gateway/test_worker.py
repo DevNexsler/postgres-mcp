@@ -10,6 +10,7 @@ import pytest
 
 from postgres_mcp.outbound_gateway.models import ActionState
 from postgres_mcp.outbound_gateway.models import Operation
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicyConfig
 from postgres_mcp.outbound_gateway.state_machine import ALLOWED_TRANSITIONS
 from postgres_mcp.outbound_gateway.store import PostgresActionStore
 from postgres_mcp.outbound_gateway.worker import OutboundWorker
@@ -56,11 +57,17 @@ async def test_worker_exhausts_retry_budget_before_listing_due_work():
     store.list_exhausted.return_value = [(exhausted_id, ActionState.UNKNOWN)]
     store.list_work.return_value = []
     service = AsyncMock()
-    worker = OutboundWorker(store=store, service=service, batch_size=20, max_attempts=5)
+    policies = RetryPolicyConfig.from_env(
+        {"OUTBOUND_MAX_ATTEMPTS": "5", "OUTBOUND_RETRY_POLICY_JSON": '{"quo.sms.send": {"max_attempts": 2}}'}
+    )
+    worker = OutboundWorker(store=store, service=service, batch_size=20, retry_policies=policies)
 
     assert await worker.run_once() == 1
-    store.list_exhausted.assert_awaited_once_with(20, 5)
-    store.list_work.assert_awaited_once_with(20, 5)
+    caps = policies.max_attempts_by_operation()
+    assert caps["quo.sms.send"] == 2
+    assert caps["email.send"] == 5
+    store.list_exhausted.assert_awaited_once_with(20, 5, max_attempts_by_operation=caps)
+    store.list_work.assert_awaited_once_with(20, 5, max_attempts_by_operation=caps)
     service.exhaust.assert_awaited_once_with(exhausted_id)
     service.reconcile.assert_not_called()
     service.resume.assert_not_called()

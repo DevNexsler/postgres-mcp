@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from datetime import timezone
 from types import ModuleType
@@ -65,6 +66,7 @@ from .provider_client import McpServerConfig
 from .record import NEVER_ANOTHER_ROUTE
 from .record import OVERRIDE_RULE
 from .repository import OutboundGatewayRepository
+from .retry_config import RetryPolicyConfig
 from .service import DEFAULT_CONTACT_LOCK_TIMEOUT_MS
 from .service import OutboundActionService
 from .store import PostgresActionStore
@@ -119,6 +121,7 @@ class GatewayRuntime:
     observability: GatewayObservability
     tenantcloud_submitter: RestateWorkflowSubmitter | None = None
     restate_operations: frozenset[Operation] = frozenset()
+    retry_policies: RetryPolicyConfig = field(default_factory=lambda: RetryPolicyConfig.from_env({}))
 
 
 async def handle_outbound_action(
@@ -774,7 +777,20 @@ def _tenantcloud_adapters(enabled_operations: frozenset[Operation]) -> dict[Oper
     return {operation: adapter for operation in TENANTCLOUD_OPERATIONS}
 
 
+def load_retry_policies() -> RetryPolicyConfig:
+    """The gateway's one retry configuration (retry_config.py), validated
+    before anything else starts: a bad value raises and the process exits.
+    The effective policy for every operation is logged once."""
+    policies = RetryPolicyConfig.from_env(os.environ)
+    logger.info(
+        "outbound retry policy effective: %s",
+        json.dumps(policies.describe(), sort_keys=True, separators=(",", ":")),
+    )
+    return policies
+
+
 async def build_runtime() -> GatewayRuntime:
+    retry_policies = load_retry_policies()
     database_uri = os.environ.get("DATABASE_URI")
     if not database_uri:
         raise ValueError("DATABASE_URI is required")
@@ -878,8 +894,7 @@ async def build_runtime() -> GatewayRuntime:
         clock=lambda: datetime.now(timezone.utc),
         lease_owner=os.environ.get("OUTBOUND_GATEWAY_LEASE_OWNER", "outbound-gateway"),
         circuit_guard=observability,
-        retry_base_seconds=int(os.environ.get("OUTBOUND_RETRY_BASE_SECONDS", "5")),
-        retry_max_seconds=int(os.environ.get("OUTBOUND_RETRY_MAX_SECONDS", "900")),
+        retry_policies=retry_policies,
         traffic_mode=_traffic_mode(),
         traffic_probe=context_repository,
         # On: newer context is a stale_context question for the agent. Off
@@ -911,6 +926,7 @@ async def build_runtime() -> GatewayRuntime:
             else None
         ),
         restate_operations=_restate_operations(),
+        retry_policies=retry_policies,
     )
 
 
@@ -949,7 +965,7 @@ async def _work() -> None:
         store=runtime.store,
         service=runtime.service,
         batch_size=int(os.environ.get("OUTBOUND_WORKER_BATCH_SIZE", "20")),
-        max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
+        retry_policies=runtime.retry_policies,
         observability=runtime.observability,
         tenantcloud_submitter=runtime.tenantcloud_submitter,
         restate_operations=runtime.restate_operations,

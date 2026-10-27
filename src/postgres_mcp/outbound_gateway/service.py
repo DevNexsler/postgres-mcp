@@ -30,10 +30,7 @@ from .errors import FailureKind
 from .errors import classify
 from .errors import error_text
 from .identity import with_default_cc
-from .metrics import TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
 from .metrics import CircuitStatus
-from .metrics import bounded_backoff_seconds
-from .metrics import tenantcloud_auth_wait_seconds
 from .models import STALE_CONTEXT_DETAILS
 from .models import ActionState
 from .models import AlreadySent
@@ -63,7 +60,11 @@ from .record import overridable
 from .record import require_action
 from .record import why_not_overridable
 from .recovery import ActionRecovery
-from .retry_policy import elapsed_step_backoff_seconds
+from .retry_config import RetryPolicyConfig
+from .retry_config import deliverable_elapsed_seconds
+from .retry_config import jitter_key
+from .retry_config import paused_seconds
+from .retry_config import wall_elapsed_seconds
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
 from .stale_context import answer_refusal
@@ -199,35 +200,28 @@ _TENANTCLOUD_NO_SUCH_THREAD_DETAILS = frozenset({"tenantcloud_target_unavailable
 # A retryable TenantCloud rejection proven pre-dispatch (nothing was ever
 # written -- adapters/tenantcloud.py's _from_execution auth branch and
 # _from_reconciliation's authentication_unavailable branch, both provably
-# before any write is attempted): waited out instead of burning the ordinary
-# 5-attempt budget (8 of 9 retry_budget_exhausted TenantCloud sends in 60
-# days were 6x this rejection inside ~90-150s, well within a single auth
-# outage that can run up to ~45 minutes). error_category survives every
-# schedule_next_attempt() reschedule (that call never touches it); detail_code
-# does not (each reschedule overwrites it), so error_category is the durable
-# signal across repeated wait cycles.
+# before any write is attempted): the provider's auth is down, so the row
+# waits it out with its delivery clock paused instead of burning the attempt
+# budget (8 of 9 retry_budget_exhausted TenantCloud sends in 60 days were 6x
+# this rejection inside ~90-150s). error_category survives every
+# schedule_next_attempt() reschedule; detail_code does not, so error_category
+# is the durable signal across repeated wait cycles.
 _TENANTCLOUD_AUTH_WAIT_DETAIL = "tenantcloud_auth_rejected_before_dispatch"
 _TENANTCLOUD_AUTH_WAIT_CATEGORY = "provider_authentication"
 
 
-def _tenantcloud_auth_wait_pending(action: OutboundActionRecord, now: datetime) -> bool:
+def _tenantcloud_auth_wait_pending(action: OutboundActionRecord, now: datetime, staleness_ceiling_seconds: int) -> bool:
     """True only for a TenantCloud row parked retry_ready by a provably
-    pre-dispatch auth rejection, still inside the 2h ceiling. Any action that
-    actually dispatched lands in dispatching/provider_accepted/unknown/
-    reconciling instead of retry_ready, or (if retryable) carries a
+    pre-dispatch auth rejection, still inside its staleness ceiling. Any
+    action that actually dispatched lands in dispatching/provider_accepted/
+    unknown/reconciling instead of retry_ready, or (if retryable) carries a
     different category -- so this can never fire for a send that reached the
     provider."""
     if action.operation not in TENANTCLOUD_OPERATIONS or action.state is not ActionState.RETRY_READY:
         return False
     if action.detail_code != _TENANTCLOUD_AUTH_WAIT_DETAIL and action.error_category != _TENANTCLOUD_AUTH_WAIT_CATEGORY:
         return False
-    elapsed = (now - action.created_at).total_seconds() if action.created_at is not None else 0.0
-    return elapsed < TENANTCLOUD_AUTH_WAIT_CEILING_SECONDS
-
-
-def _tenantcloud_auth_wait_delay(action: OutboundActionRecord, now: datetime) -> int:
-    elapsed = (now - action.created_at).total_seconds() if action.created_at is not None else 0.0
-    return tenantcloud_auth_wait_seconds(elapsed)
+    return wall_elapsed_seconds(action, now) < staleness_ceiling_seconds
 
 
 def _tenantcloud_no_such_thread_detail(context: ActionContext, observation: ProviderObservation) -> str | None:
@@ -290,8 +284,7 @@ class OutboundActionService:
         lease_seconds: int = 60,
         sleep: Sleeper = asyncio.sleep,
         circuit_guard: CircuitGuard | None = None,
-        retry_base_seconds: int = 5,
-        retry_max_seconds: int = 900,
+        retry_policies: RetryPolicyConfig | None = None,
         traffic_mode: str = "shadow",
         traffic_probe: Any | None = None,
         stale_confirm_enabled: bool = False,
@@ -324,13 +317,12 @@ class OutboundActionService:
         self._lease_seconds = lease_seconds
         self._sleep = sleep
         self._circuit_guard = circuit_guard or ClosedCircuitGuard()
-        self._retry_base_seconds = max(1, retry_base_seconds)
-        self._retry_max_seconds = max(self._retry_base_seconds, retry_max_seconds)
+        # The one retry configuration (retry_config.py), per operation.
+        self._policies = retry_policies or RetryPolicyConfig.from_env({})
         # Every operation OutboundDeliveryCoordinator advances -- see
         # ActionRecovery's own restate_operations docstring below. _schedule()
         # reads this too: a Restate-routed reschedule must never key its
-        # backoff on attempt_count (retry_policy.elapsed_step_backoff_seconds'
-        # docstring).
+        # backoff on attempt_count (see _schedule).
         self._restate_operations = restate_operations
         self._traffic_mode = traffic_mode
         # The newer-context query (stale_context.NewerContextProbe).
@@ -356,6 +348,7 @@ class OutboundActionService:
             actor=lease_owner,
             lease_seconds=lease_seconds,
             restate_operations=restate_operations,
+            retry_policies=self._policies,
         )
 
     @property
@@ -370,6 +363,17 @@ class OutboundActionService:
     async def execute(self, request: ExecuteRequest) -> PublicResult:
         return await self._execute(request, dispatch=True)
 
+    async def escalate(self, failed_action_id: UUID, request: ExecuteRequest) -> PublicResult:
+        """Post the gateway's own staff escalation about a failed action.
+
+        The same pipeline as execute(), except the row is created through
+        CDS's create_outbound_delivery_escalation(): an internal Cliq post on
+        the failed action's wake that CDS lets through after that wake has
+        ended (and after its TenantCloud claim closed), because it names a
+        failed action CDS can check. Not reachable from the agent-facing API:
+        server.py only ever calls execute()/enqueue()."""
+        return await self._execute(request, dispatch=True, escalation_of=failed_action_id)
+
     async def enqueue(self, request: ExecuteRequest) -> PublicResult:
         """Persist and preflight one action without provider I/O.
 
@@ -378,7 +382,7 @@ class OutboundActionService:
         """
         return await self._execute(request, dispatch=False)
 
-    async def _execute(self, request: ExecuteRequest, *, dispatch: bool) -> PublicResult:
+    async def _execute(self, request: ExecuteRequest, *, dispatch: bool, escalation_of: UUID | None = None) -> PublicResult:
         # Before anything reads the request: the default is part of what was
         # asked, so the hash, the identity and the stored arguments carry it.
         request = with_default_cc(request, self._email_default_cc)
@@ -396,7 +400,10 @@ class OutboundActionService:
             if self._matches_durable_subject_alias_promotion(existing, context):
                 action = existing
         if action is None:
-            action = await self._store.create_or_load(context)
+            if escalation_of is not None:
+                action = await self._store.create_escalation(context, escalation_of)
+            else:
+                action = await self._store.create_or_load(context)
         latest = await self._latest_answer(action)
         if latest is not None:
             # The same message again after the agent's yes (an override, or a
@@ -880,7 +887,7 @@ class OutboundActionService:
                 # Restate (delivery_workflow.OutboundDeliveryCoordinator) owns
                 # every retry/backoff/ceiling decision for this operation --
                 # it only ever calls resume() while its own elapsed-time
-                # ceiling has NOT yet passed (retry_policy.RETRY_CEILING_SECONDS),
+                # deadline has NOT yet passed (retry_config.RetryPolicy.deadline_seconds),
                 # switching to exhaust() once it has. Parking straight to
                 # manual_review() here -- unconditionally, with no wait --
                 # used to end an ambiguous, still-possibly-in-flight action
@@ -913,17 +920,22 @@ class OutboundActionService:
     async def reconcile(self, action_id: UUID) -> PublicResult:
         return await self._recovery.reconcile(action_id)
 
-    async def exhaust(self, action_id: UUID) -> PublicResult:
+    async def exhaust(self, action_id: UUID, *, give_up_detail: str | None = None) -> PublicResult:
         """Close exhausted work without another provider invocation. A row
-        still `received` was never prepared: nothing was sent."""
+        still `received` was never prepared: nothing was sent.
+        `give_up_detail`: why, when it was not the ordinary deadline (the
+        staleness ceiling) -- see recovery.plan_exhaust."""
         action = await self._require_action(action_id)
         if action.state is ActionState.RECEIVED:
             return action_result(
                 await self._store.reject(
-                    action_id, ActionState.RECEIVED, _UNPREPARED_DETAIL, "it could not be prepared within the retry window"
+                    action_id,
+                    ActionState.RECEIVED,
+                    give_up_detail or _UNPREPARED_DETAIL,
+                    "it could not be prepared within the retry window",
                 )
             )
-        return await self._recovery.exhaust(action_id)
+        return await self._recovery.exhaust(action_id, give_up_detail=give_up_detail)
 
     async def _preflight(self, action: OutboundActionRecord, context: ActionContext, *, agent_facing: bool = False) -> PublicResult:
         """SafetyPreflight (recently answered, the calendar dependency), then
@@ -996,28 +1008,36 @@ class OutboundActionService:
     async def _dispatch(self, action: OutboundActionRecord, context: ActionContext) -> PublicResult:
         adapter = self._adapter(context.operation)
         circuit = await self._circuit_guard.circuit_status(context.operation)
+        policy = self._policies.for_operation(context.operation)
+        now = self._clock()
         if circuit.is_open:
+            # The provider is known to be down: pause this row's delivery
+            # clock (the deadline does not count it) and look again when the
+            # circuit may have closed. No claim, so no attempt is spent.
+            paused = await self._pause(action)
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
-                action.state,
+                paused.state,
                 max(1, circuit.retry_after_seconds),
                 "provider_circuit_open",
             )
             return action_result(scheduled)
-        now = self._clock()
-        if _tenantcloud_auth_wait_pending(action, now):
-            # Same shape as the circuit-open branch above: reschedule without
-            # claim(), so this wait spends no attempt. Once the 2h ceiling
-            # passes, _tenantcloud_auth_wait_pending stops matching and this
-            # row falls straight through to the ordinary claim()/dispatch
-            # below -- today's behaviour.
+        if _tenantcloud_auth_wait_pending(action, now, policy.staleness_ceiling_seconds):
+            # The provider's auth is down: the same pause, waited out on the
+            # policy's backoff over the pause so far. Past the staleness
+            # ceiling this stops matching and the row falls through to the
+            # ordinary claim()/dispatch below.
+            paused = await self._pause(action)
+            pause_age = paused_seconds(paused, now) - paused.delivery_paused_seconds
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
-                action.state,
-                _tenantcloud_auth_wait_delay(action, now),
+                paused.state,
+                policy.backoff_seconds(pause_age, jitter_key=jitter_key(paused)),
                 "tenantcloud_auth_wait",
             )
             return action_result(scheduled)
+        if action.delivery_paused_since is not None:
+            action = await self._store.set_delivery_paused(action.action_id, False)
         claimed = await self._store.claim(action.action_id, action.state, self._lease_owner, self._lease_seconds)
         dispatching = await self._store.transition(
             claimed.action_id,
@@ -1183,30 +1203,31 @@ class OutboundActionService:
         action: OutboundActionRecord,
         detail_code: str,
     ) -> OutboundActionRecord:
+        policy = self._policies.for_operation(action.operation)
         if action.operation in self._restate_operations:
             # attempt_count is the legacy worker's own counter (bumped by
             # claim_outbound_action, Comm-Data-Store) -- a Restate-routed
             # reschedule does not reliably take a fresh claim between every
-            # schedule() call, so keying backoff on it here risks a flat,
-            # never-growing wait. See elapsed_step_backoff_seconds' docstring
-            # for the live symptom this fixed: 360 TenantCloud status-update
-            # reinvokes in one hour (one every ~10s, never doubling) instead
-            # of the ~15-20 a real 5s-to-300s-capped schedule reaches by the
-            # one-hour retry ceiling.
-            elapsed = max(0.0, (self._clock() - action.created_at).total_seconds()) if action.created_at is not None else 0.0
-            wait_seconds = elapsed_step_backoff_seconds(elapsed)
-        else:
-            wait_seconds = bounded_backoff_seconds(
-                action.attempt_count,
-                base_seconds=self._retry_base_seconds,
-                max_seconds=self._retry_max_seconds,
+            # schedule() call, so keying backoff on it risks a flat,
+            # never-growing wait (360 TenantCloud status-update reinvokes in
+            # one hour). Time spent deliverable-but-failing cannot go flat.
+            wait_seconds = policy.backoff_seconds(
+                deliverable_elapsed_seconds(action, self._clock()), jitter_key=jitter_key(action)
             )
+        else:
+            wait_seconds = policy.attempt_backoff_seconds(action.attempt_count, jitter_key=jitter_key(action))
         return await self._store.schedule_next_attempt(
             action.action_id,
             action.state,
             wait_seconds,
             detail_code,
         )
+
+    async def _pause(self, action: OutboundActionRecord) -> OutboundActionRecord:
+        """Open this row's provider-down pause, unless one is already open."""
+        if action.delivery_paused_since is not None:
+            return action
+        return await self._store.set_delivery_paused(action.action_id, True)
 
     def _adapter(self, operation: Operation) -> ProviderAdapter:
         adapter = self._adapters.get(operation)
