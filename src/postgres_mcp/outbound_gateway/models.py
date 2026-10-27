@@ -705,6 +705,17 @@ ARGUMENT_MODELS: dict[Operation, type[StrictModel]] = {
 }
 
 
+# Only Nigel's calendar is written (Dan, 2026-10-27; #4360). Staff copies
+# of an event are attendee copies that follow Nigel's event on their own.
+CALENDAR_WRITE_CONTRACT = 'calendar_id "nigel" only'
+CALENDAR_WRITE_GUIDANCE = (
+    "Calendar writes go only to Nigel's calendar (calendar_id \"nigel\"). Staff on the invite, Dan included, "
+    "hold attendee copies of Nigel's event that follow it automatically: never write a dan or dan-zoho copy "
+    "(refused, detail_code calendar_not_writable), and a copy still showing the old time just after a "
+    "receipted update is lag, not a failure."
+)
+
+
 # Request recipes are selected by recipient purpose, not just transport.
 # The tool description is generated from these and ARGUMENT_MODELS, so
 # customer replies and staff coordination each get their own accepted shape.
@@ -742,9 +753,17 @@ OPERATION_USAGE: dict[Operation, tuple[tuple[ActionRole, IntentKind, str], ...]]
     Operation.CLIQ_CHANNEL_POST: (
         (ActionRole.INTERNAL_NOTIFICATION, IntentKind.MANUAL_REVIEW_ALERT, "post to a Cliq channel (lead_alert for a new lead)"),
     ),
-    Operation.CALENDAR_CREATE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_CREATE, "create an event; also needs top-level appointment_slot"),),
-    Operation.CALENDAR_UPDATE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, "move or edit an event; also needs appointment_slot"),),
-    Operation.CALENDAR_DELETE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, "delete an event"),),
+    Operation.CALENDAR_CREATE: (
+        (
+            ActionRole.CALENDAR_MUTATION,
+            IntentKind.SHOWING_CREATE,
+            f"create an event; also needs top-level appointment_slot; {CALENDAR_WRITE_CONTRACT}",
+        ),
+    ),
+    Operation.CALENDAR_UPDATE: (
+        (ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_UPDATE, f"move or edit an event; also needs appointment_slot; {CALENDAR_WRITE_CONTRACT}"),
+    ),
+    Operation.CALENDAR_DELETE: ((ActionRole.CALENDAR_MUTATION, IntentKind.SHOWING_DELETE, f"delete an event; {CALENDAR_WRITE_CONTRACT}"),),
     Operation.TENANTCLOUD_MESSAGE_SEND: (
         (
             ActionRole.PROSPECT_REPLY,
@@ -1032,7 +1051,12 @@ class RequestRefusedError(ValueError):
     differently, or record needs_human. The tool answers it as an ordinary
     rejected result, not an MCP tool error, because hermes-agent counts tool
     errors toward a breaker that parks the gateway for every caller (#3463).
-    A gateway fault is never one of these."""
+    A gateway fault is never one of these.
+
+    detail_code is what the tool answers with: the generic request_refused,
+    unless a subclass names a more specific, stable reason."""
+
+    detail_code = "request_refused"
 
 
 class OverrideRequest(StrictModel):

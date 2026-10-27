@@ -8,6 +8,8 @@ from typing import Mapping
 from uuid import UUID
 
 from ..context import ActionContext
+from ..context import CalendarNotWritableError
+from ..context import calendar_not_writable_detail
 from ..models import Operation
 from ..provider_client import McpCallResult
 from ..provider_client import McpProviderClient
@@ -40,8 +42,13 @@ class CalendarAdapter:
     def validate(self, context: ActionContext) -> None:
         if context.operation not in {Operation.CALENDAR_CREATE, Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE}:
             raise ValueError("calendar adapter requires a calendar operation")
-        if context.target.kind != "calendar" or context.target.target_id not in self._accounts:
-            raise ValueError("calendar account is not configured")
+        if context.target.kind != "calendar":
+            raise ValueError("calendar adapter requires a calendar target")
+        if context.target.target_id not in self._accounts:
+            # Admission (context.py) refuses these before anything is
+            # recorded. A row that still reaches here is a refusal too, never
+            # a fault: retrying cannot make the calendar writable (#4360).
+            raise CalendarNotWritableError(calendar_not_writable_detail(context.target.target_id, self._accounts))
         if context.operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE} and (
             not context.calendar_event_uid or not context.calendar_event_url or not context.calendar_event_etag
         ):
