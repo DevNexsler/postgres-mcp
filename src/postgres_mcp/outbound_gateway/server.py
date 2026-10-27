@@ -399,7 +399,14 @@ def create_server(
         name="outbound_action",
         description=(
             "Execute or inspect one durable outbound email, Quo, Cliq, calendar, or "
-            "TenantCloud action. You choose the target id (to_address, to_phone, "
+            "TenantCloud action. For Cliq tags in arguments.text, use {@<user_id>}. "
+            "For a person in message/conversation context, use sender.participant_key "
+            "from a zoho_cliq message with participant_type=user. For staff absent "
+            "from context, query CDS: SELECT person_key, person_name FROM "
+            "public.resolve_cliq_staff_dm('<staff name>'); person_key is the user_id. "
+            "Resolve one matching person before tagging; chat/channel IDs identify "
+            "destinations, not users. Text is sent exactly as supplied. "
+            "You choose the target id (to_address, to_phone, "
             "channel_or_chat_id, calendar_id, thread_id, lead_id, etc.) as part of "
             "arguments -- it is never derived from wakeup_event_id for you. Use suggest "
             "({\"op\": \"suggest\", \"wakeup_event_id\"}) to ask what the wake implies "
