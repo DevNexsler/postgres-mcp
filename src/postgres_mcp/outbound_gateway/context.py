@@ -11,6 +11,7 @@ from datetime import timezone
 from hashlib import sha256
 from types import MappingProxyType
 from typing import Any
+from typing import Iterable
 from typing import Mapping
 from unicodedata import normalize
 from uuid import UUID
@@ -64,6 +65,34 @@ _CLIQ_OPERATIONS = frozenset({Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_P
 
 class ContextDerivationError(RequestRefusedError):
     pass
+
+
+class CalendarNotWritableError(ContextDerivationError):
+    """A calendar write to a calendar the gateway has no write account for.
+
+    Only Nigel's calendar is written (Dan, 2026-10-27). Staff on an invite,
+    Dan included, hold attendee copies of Nigel's event (same uid, organizer
+    nigel@pfg.io) that their calendar provider moves when Nigel's moves, so
+    a write to one of those copies is never needed. Agents read both
+    calendars and sent a second calendar.update to Dan's copy (wakes 28838,
+    29019, 29652); the gateway accepted it and the adapter then faulted it
+    at dispatch, about 17 times, until the retry budget ran out (#4360).
+    Refused before anything is recorded: nothing to retry, nothing sent."""
+
+    detail_code = "calendar_not_writable"
+
+
+def calendar_not_writable_detail(calendar_id: str, writable: Iterable[str]) -> str:
+    names = sorted(set(writable))
+    allowed = " or ".join(f'"{name}"' for name in names) if names else "none is configured"
+    return (
+        f'calendar "{calendar_id}" is not writable. Nothing was sent: the gateway writes only '
+        f"Nigel's calendar (calendar_id {allowed}). Staff on the invite, Dan included, hold attendee copies "
+        "of Nigel's event (same uid, organizer nigel@pfg.io) that follow it automatically, so never write "
+        "their copy, and a copy that still shows the old time right after a receipted update is lag, not a "
+        "failure. To change an event, update Nigel's copy (its event_url and etag from Nigel's calendar). "
+        "If Nigel's calendar has no copy of the event, record needs_human."
+    )
 
 
 @dataclass(frozen=True)
@@ -897,6 +926,9 @@ class ActionContextLoader:
                 raise ContextDerivationError(str(exc)) from exc
             return DerivedTarget(kind.value, target_value, True), target_value
         assert isinstance(request.arguments, (CalendarCreateArguments, CalendarUpdateArguments, CalendarDeleteArguments))
+        writable = self._policy.calendar_by_profile.values()
+        if request.arguments.calendar_id not in writable:
+            raise CalendarNotWritableError(calendar_not_writable_detail(request.arguments.calendar_id, writable))
         profile = "appointment-setter"
         configured_calendar = self._policy.calendar_by_profile.get(profile, "")
         account = self._policy.calendar_account_by_profile.get(profile, configured_calendar)

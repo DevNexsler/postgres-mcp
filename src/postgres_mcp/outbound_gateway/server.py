@@ -43,11 +43,12 @@ from .errors import error_text
 from .evidence import DatabasePreflightEvidenceLoader
 from .metrics import GatewayObservability
 from .metrics import render_prometheus
+from .models import CALENDAR_WRITE_GUIDANCE
+from .models import PROPERTY_REFERENCE_GUIDANCE
 from .models import ActionRole
 from .models import AlreadySent
 from .models import ConfirmRequest
 from .models import ExecuteRequest
-from .models import PROPERTY_REFERENCE_GUIDANCE
 from .models import Operation
 from .models import OutboundRequest
 from .models import PublicResult
@@ -295,7 +296,7 @@ def _failure(error: Exception, op: str) -> dict[str, Any]:
         return {
             "status": PublicStatus.REJECTED.value,
             "retryable": False,
-            "detail_code": "request_refused",
+            "detail_code": error.detail_code if isinstance(error, RequestRefusedError) else "request_refused",
             "detail": str(error) if isinstance(error, RequestRefusedError) else error_text(error),
         }
     logger.exception("outbound_action %s failed", op)
@@ -426,7 +427,8 @@ def create_server(
             "\"action_role\", \"operation\", \"intent_kind\", \"arguments\": {...}}}. "
             "The identical request again is the same action (never a second send); a "
             "different one is a new action. Ids are integers where the provider uses "
-            "numbers. " + PROPERTY_REFERENCE_GUIDANCE + " Operations (? = optional):\n" + operation_catalog()
+            "numbers. " + PROPERTY_REFERENCE_GUIDANCE + " " + CALENDAR_WRITE_GUIDANCE
+            + " Operations (? = optional):\n" + operation_catalog()
         ),
         structured_output=True,
     )
