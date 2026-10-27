@@ -30,8 +30,9 @@ async def test_warn_once_posts_a_cliq_channel_internal_notification() -> None:
         recipient="+15555550100",
     )
 
-    service.execute.assert_awaited_once()
-    (request,) = service.execute.await_args.args
+    service.escalate.assert_awaited_once()
+    (failed_action_id, request) = service.escalate.await_args.args
+    assert failed_action_id == ACTION_ID
     assert isinstance(request, ExecuteRequest)
     assert request.wakeup_event_id == 27123
     assert request.action_role is ActionRole.INTERNAL_NOTIFICATION
@@ -54,7 +55,7 @@ async def test_warn_once_is_idempotent_on_action_id() -> None:
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
 
-    service.execute.assert_awaited_once()
+    service.escalate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -64,7 +65,8 @@ async def test_warn_once_uses_the_configured_target_channel() -> None:
 
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
 
-    (request,) = service.execute.await_args.args
+    (failed_action_id, request) = service.escalate.await_args.args
+    assert failed_action_id == ACTION_ID
     assert isinstance(request.arguments, CliqArguments)
     assert request.arguments.channel_or_chat_id == "ops-alerts"
 
@@ -75,7 +77,7 @@ async def test_warn_once_swallows_a_send_failure_without_raising() -> None:
     coordinator's advance() step -- a broken Cliq post is not grounds to
     retry (or re-warn about) the already-failed customer action."""
     service = AsyncMock()
-    service.execute.side_effect = RuntimeError("cliq unavailable")
+    service.escalate.side_effect = RuntimeError("cliq unavailable")
     port = CliqStaffWarningPort(service)
 
     await port.warn_once(ACTION_ID, None, "reason", wakeup_event_id=1, operation=Operation.EMAIL_SEND, recipient="a@example.com")
@@ -90,7 +92,7 @@ async def test_a_warning_the_gateway_records_rejected_is_logged_like_a_failed_on
     from postgres_mcp.outbound_gateway.models import PublicStatus
 
     service = AsyncMock()
-    service.execute.return_value = SimpleNamespace(status=PublicStatus.REJECTED, detail_code="wake_terminal")
+    service.escalate.return_value = SimpleNamespace(status=PublicStatus.REJECTED, detail_code="wake_terminal")
     port = CliqStaffWarningPort(service)
 
     with caplog.at_level("ERROR"):

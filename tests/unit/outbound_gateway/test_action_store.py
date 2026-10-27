@@ -217,7 +217,29 @@ async def test_store_work_query_includes_expired_dispatch_without_unlocking_it()
     assert "next_attempt_at <= now()" in calls[0][0]
     assert "attempt_count <" in calls[0][0]
     assert "FOR UPDATE SKIP LOCKED" not in calls[0][0]
-    assert calls[0][1] == [5, 20]
+    assert calls[0][1] == ["{}", 5, 20]
+
+
+@pytest.mark.asyncio
+async def test_store_work_queries_cap_attempts_per_operation_with_the_default_as_fallback():
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return []
+
+    store = PostgresActionStore(object())
+    caps = {"quo.sms.send": 3}
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        await store.list_work(20, 5, max_attempts_by_operation=caps)
+        await store.list_exhausted(20, 5, max_attempts_by_operation=caps)
+
+    for query, params in calls:
+        assert "coalesce((" in query and "->> operation)::int" in query
+        assert params == ['{"quo.sms.send":3}', 5, 20]
 
 
 @pytest.mark.asyncio

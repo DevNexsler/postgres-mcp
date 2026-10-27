@@ -46,8 +46,7 @@ from postgres_mcp.outbound_gateway.record import NEVER_ANOTHER_ROUTE
 from postgres_mcp.outbound_gateway.record import OVERRIDE_RULE
 from postgres_mcp.outbound_gateway.repository import AliasResolution
 from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
-from postgres_mcp.outbound_gateway.retry_policy import CONTEXT_RELOAD_WAIT_SECONDS
-from postgres_mcp.outbound_gateway.retry_policy import RETRY_CEILING_SECONDS
+from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 from postgres_mcp.outbound_gateway.server import FeaturePolicy
 from postgres_mcp.outbound_gateway.server import create_server
 from postgres_mcp.outbound_gateway.server import handle_outbound_action
@@ -717,20 +716,21 @@ async def test_restate_prepare_that_fails_for_any_other_reason_waits_and_leaves_
 @pytest.mark.asyncio
 async def test_restate_waits_on_a_context_reload_of_a_received_row_and_ends_it_at_the_ceiling():
     """The reload's own words are the result's detail; the wait keys on its
-    detail_code (persisted_context_unavailable), so it is a 5-minute wait,
-    not a 1-second spin, and the elapsed ceiling ends the row rejected."""
+    detail_code (persisted_context_unavailable) and follows the retry
+    policy's backoff, and the deadline ends the row rejected."""
     service, store, _adapter = harness()
     await recorded_parent(store, created_at=stale_tests.EXECUTED_AT)
     service._context_loader.load = AsyncMock(side_effect=ContextDerivationError("verified target could not be derived"))
 
     waiting = await coordinator_for(store, service).advance(BLOCKED)
-    late = coordinator_for(store, service, clock=lambda: stale_tests.EXECUTED_AT + timedelta(seconds=RETRY_CEILING_SECONDS + 1))
+    policy = RetryPolicy()
+    late = coordinator_for(store, service, clock=lambda: stale_tests.EXECUTED_AT + timedelta(seconds=policy.deadline_seconds + 1))
     ended = await late.advance(BLOCKED)
 
     assert (waiting.phase, waiting.detail_code, waiting.retry_after_seconds) == (
         DeliveryPhase.WAIT,
         "persisted_context_unavailable",
-        CONTEXT_RELOAD_WAIT_SECONDS,
+        policy.backoff_seconds(0, jitter_key=str(BLOCKED)),
     )
     assert ended.phase is DeliveryPhase.TERMINAL
     assert (store.rows[BLOCKED].state, store.rows[BLOCKED].detail_code) == (ActionState.REJECTED, "prepare_retry_exhausted")

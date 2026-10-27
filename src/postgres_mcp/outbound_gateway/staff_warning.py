@@ -9,24 +9,27 @@ target normalization for free: it is not a second notification mechanism,
 it is the SAME ``OutboundActionService.execute()`` every other send in this
 gateway goes through.
 
-Never recurses: this calls ``service.execute()`` directly (the synchronous
-legacy dispatch path), never ``service.enqueue()`` + a Restate submission --
+Posted on the failed action's own wake through ``service.escalate()``, which
+creates the row with CDS's ``create_outbound_delivery_escalation()``
+(migration 279). That wake has usually ended by the time a send gives up --
+and a TenantCloud wake's claim has closed -- so an ordinary row there is
+refused (``wake_terminal``, or ``guard_tenantcloud_outbound_action_ownership``:
+10/27, the escalations for Mary Haas's and Charles Serpone's dropped replies
+both died this way). CDS lets this row through because it names a failed
+action CDS can check, one escalation per failed action; an agent has no way to
+create one.
+
+Never recurses: ``service.escalate()`` dispatches synchronously (the legacy
+dispatch path), never ``service.enqueue()`` + a Restate submission --
 so even if ``cliq.channel.post`` is itself a flagged Restate operation
 (``OUTBOUND_RESTATE_OPERATIONS``), a warning send is never advanced by
 ``OutboundDeliveryCoordinator`` and can never trigger a second warn_once call
 about itself.
 
-Idempotency granularity: the gateway derives an internal_notification
-action's id from ``(wakeup_event_id, action_role)`` alone (ordinal is always
-0 -- see context.py) -- there is no lower-level identity for "the Nth
-internal notification on this wake" to key a warning on today. This port is
-therefore idempotent per WAKE, not per failed action id: two different
-actions failing on the same wake collapse into the one warning send the
-ledger already recorded for that wake (the second call is read back as the
-same completed/duplicate action, so it never double-texts a customer or
-re-posts to Cliq -- see warn_once's docstring). Splitting that identity
-further needs a change to the action-id derivation itself, which is out of
-this change's scope.
+Idempotency: one escalation per failed action. The text names the failed
+action_id, so CDS's create-or-load identity (same wake, role and arguments)
+returns the same row on a replay, and migration 279 refuses a second
+escalation row for the same failed action outright.
 """
 
 from __future__ import annotations
@@ -106,7 +109,7 @@ class CliqStaffWarningPort:
             # The legacy synchronous path (never Restate) -- see the module
             # docstring for why that is what makes this incapable of
             # recursing into a second warning about itself.
-            result = await self._service.execute(request)
+            result = await self._service.escalate(action_id, request)
             if getattr(result, "status", None) in _NOT_POSTED:
                 # A refusal is a result now, not a raise (a closed wake
                 # records the warning rejected): keep it as visible as the

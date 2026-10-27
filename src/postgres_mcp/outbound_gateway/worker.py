@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from collections.abc import Mapping
 from typing import Any
 from typing import Protocol
 from uuid import UUID
 
 from .models import ActionState
 from .models import Operation
+from .retry_config import RetryPolicyConfig
 from .service import OutboundActionService
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
@@ -18,9 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 class WorkerStore(Protocol):
-    async def list_work(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]: ...
+    async def list_work(
+        self, limit: int, max_attempts: int, *, max_attempts_by_operation: Mapping[str, int] | None = None
+    ) -> list[tuple[UUID, ActionState]]: ...
 
-    async def list_exhausted(self, limit: int, max_attempts: int) -> list[tuple[UUID, ActionState]]: ...
+    async def list_exhausted(
+        self, limit: int, max_attempts: int, *, max_attempts_by_operation: Mapping[str, int] | None = None
+    ) -> list[tuple[UUID, ActionState]]: ...
 
     async def get(self, action_id: UUID) -> Any: ...
 
@@ -36,7 +42,7 @@ class OutboundWorker:
         store: WorkerStore,
         service: OutboundActionService,
         batch_size: int = 20,
-        max_attempts: int = 5,
+        retry_policies: RetryPolicyConfig | None = None,
         observability=None,
         on_error: Callable[[UUID, str, Exception], None] | None = None,
         tenantcloud_submitter: TenantCloudSubmitter | None = None,
@@ -45,7 +51,11 @@ class OutboundWorker:
         self._store = store
         self._service = service
         self._batch_size = max(1, min(batch_size, 100))
-        self._max_attempts = max(1, min(max_attempts, 100))
+        # The legacy path's attempt cap, per operation, from the one retry
+        # configuration (retry_config.py).
+        policies = retry_policies or RetryPolicyConfig.from_env({})
+        self._max_attempts = policies.default.max_attempts
+        self._max_attempts_by_operation = policies.max_attempts_by_operation()
         self._observability = observability
         self._on_error = on_error or self._default_error
         self._tenantcloud_submitter = tenantcloud_submitter
@@ -80,10 +90,9 @@ class OutboundWorker:
             action = await self._store.get(action_id)
             if action is not None and action.operation in self._restate_operations:
                 # Restate (delivery_workflow.py's OutboundDeliveryCoordinator)
-                # owns every retry/backoff/ceiling decision for this
-                # operation -- retry_policy.py's one-hour elapsed ceiling,
-                # not this worker's count-based 5/12-attempt cap
-                # (list_work/list_exhausted). Falling through to
+                # owns every retry/backoff/deadline decision for this
+                # operation -- the retry policy's deadline, not this worker's
+                # count-based attempt cap (list_work/list_exhausted). Falling through to
                 # self._service.reconcile()/.exhaust() here would drive the
                 # SAME row through the legacy count-based path concurrently
                 # with (and much faster than) the workflow's own ceiling,
@@ -113,10 +122,14 @@ class OutboundWorker:
             self._on_error(action_id, operation, exc)
 
     async def run_once(self) -> int:
-        exhausted = await self._store.list_exhausted(self._batch_size, self._max_attempts)
+        exhausted = await self._store.list_exhausted(
+            self._batch_size, self._max_attempts, max_attempts_by_operation=self._max_attempts_by_operation
+        )
         for action_id, _state in exhausted:
             await self._run_isolated(action_id, "exhaust")
-        work = await self._store.list_work(self._batch_size, self._max_attempts)
+        work = await self._store.list_work(
+            self._batch_size, self._max_attempts, max_attempts_by_operation=self._max_attempts_by_operation
+        )
         for action_id, state in work:
             if state in {
                 ActionState.UNKNOWN,

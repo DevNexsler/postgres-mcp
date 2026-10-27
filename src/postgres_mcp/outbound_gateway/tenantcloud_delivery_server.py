@@ -32,8 +32,8 @@ async def _serve() -> None:
         store=runtime.store,
         service=runtime.service,
         auth=build_tenantcloud_auth_gate(),
-        max_attempts=int(os.environ.get("OUTBOUND_MAX_ATTEMPTS", "5")),
         operations=TENANTCLOUD_OPERATIONS | _restate_operations(),
+        retry_policies=runtime.retry_policies,
         staff_warning=CliqStaffWarningPort(
             runtime.service,
             target_channel=os.environ.get("OUTBOUND_STAFF_WARNING_CHANNEL", DEFAULT_STAFF_WARNING_CHANNEL),
