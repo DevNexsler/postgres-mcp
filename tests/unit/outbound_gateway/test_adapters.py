@@ -2101,3 +2101,55 @@ def test_cliq_preserves_agent_authored_mentions_without_name_rewriting(operation
     request = CliqAdapter(operation).build_request(original, ACTION_UID)
     assert request.arguments["text"] == text
     assert original.arguments["text"] == text
+
+
+def test_cliq_thread_creation_forwards_parent_and_retains_thread_receipt():
+    arguments = {"text": "🟠 Unit · SOR 123", "thread_message_id": "1793138871358_307080186942", "thread_title": "Unit · SOR 123"}
+    ctx = context(Operation.CLIQ_CHANNEL_POST, arguments=arguments)
+    adapter = CliqAdapter(Operation.CLIQ_CHANNEL_POST)
+    request = adapter.build_request(ctx, ACTION_ID)
+    assert request.tool == "cliq_channel_bot_post"
+    assert request.arguments["thread_message_id"] == "1793138871358_307080186942"
+    assert request.arguments["thread_title"] == "Unit · SOR 123"
+    assert request.arguments["post_in_parent"] is False
+    result = completed(
+        "cliq_channel_bot_post",
+        {
+            "status": "sent",
+            "provider_message_id": "child-1",
+            "thread_information": {"chat_id": "CT_123_456-T-789", "parent_message_id": "1793138871358_307080186942"},
+        },
+    )
+    observation = adapter._parse(result)
+    receipt = adapter.parse_receipt(ctx, observation)
+    assert receipt is not None
+    assert receipt.evidence["thread_information"]["chat_id"] == "CT_123_456-T-789"
+
+def test_cliq_thread_creation_requires_proven_thread_metadata_and_channel_target():
+    adapter = CliqAdapter(Operation.CLIQ_CHANNEL_POST)
+    ctx = context(Operation.CLIQ_CHANNEL_POST, arguments={"text": "Update", "thread_message_id": "1793138871358_307080186942"})
+    observation = adapter._parse(completed("cliq_channel_bot_post", {"status": "sent", "provider_message_id": "flat-message"}))
+    assert adapter.parse_receipt(ctx, observation) is None
+    wrong_target = context(Operation.CLIQ_CHANNEL_POST, arguments=ctx.arguments, target=DerivedTarget("cliq_chat", "CT_123", True))
+    with pytest.raises(ValueError, match=r"thread.*channel"):
+        adapter.build_request(wrong_target, ACTION_ID)
+
+def test_cliq_thread_identity_is_available_in_durable_status_and_replay_results():
+    from postgres_mcp.outbound_gateway.models import ActionState
+    from postgres_mcp.outbound_gateway.models import CompletionKind
+    from postgres_mcp.outbound_gateway.record import action_result
+
+    from .test_service import row
+
+    thread = {"chat_id": "CT_123_456-T-789", "parent_message_id": "1793138871358_307080186942"}
+    saved = row(
+        ActionState.COMPLETED,
+        operation=Operation.CLIQ_CHANNEL_POST,
+        provider_message_id="thread-child",
+        completion_kind=CompletionKind.SENT,
+        provider_receipt={"evidence": {"thread_information": thread}},
+    )
+    for repeated in (False, True):
+        result = action_result(saved, repeated=repeated)
+        assert result.thread_information.model_dump() == thread
+        assert result.provider_message_id == "thread-child"

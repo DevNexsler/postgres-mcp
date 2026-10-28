@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from postgres_mcp.outbound_gateway.identity import request_arguments
 from postgres_mcp.outbound_gateway.models import CalendarCreateArguments
 from postgres_mcp.outbound_gateway.models import CalendarDeleteArguments
 from postgres_mcp.outbound_gateway.models import CalendarUpdateArguments
@@ -768,7 +769,8 @@ def test_slot_still_required_for_showing_offer():
     ],
 )
 def test_tenantcloud_text_loses_its_emoji_so_the_whole_reply_arrives(sent, stored):
-    from postgres_mcp.outbound_gateway.models import MaintenanceCreateArguments, TenantCloudMessageArguments
+    from postgres_mcp.outbound_gateway.models import MaintenanceCreateArguments
+    from postgres_mcp.outbound_gateway.models import TenantCloudMessageArguments
 
     assert TenantCloudMessageArguments(thread_id=1270770, text=sent).text == stored
     created = MaintenanceCreateArguments(
@@ -860,7 +862,10 @@ SAMPLE_ARGUMENTS = {
 def test_every_catalog_line_is_a_request_the_gateway_accepts(operation):
     """The tool description tells every profile how to call each operation;
     a line that the parser rejects would teach agents a broken request."""
-    from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS, OPERATION_USAGE, REQUIRED_OF_NEW_REQUESTS, operation_catalog
+    from postgres_mcp.outbound_gateway.models import ARGUMENT_MODELS
+    from postgres_mcp.outbound_gateway.models import OPERATION_USAGE
+    from postgres_mcp.outbound_gateway.models import REQUIRED_OF_NEW_REQUESTS
+    from postgres_mcp.outbound_gateway.models import operation_catalog
 
     for role, intent, purpose in OPERATION_USAGE[operation]:
         payload = {
@@ -886,3 +891,27 @@ def test_the_catalog_teaches_from_phone_as_required():
     assert "arguments {property_ref?, to_phone, text, from_phone}" in line
     assert "from_phone?" not in line
     assert "from_phone (E.164) is the line to send from, always required" in line
+
+
+def test_cliq_thread_contract_retains_parent_and_keeps_legacy_request_identity():
+    legacy = CliqArguments(channel_or_chat_id="maintenance", text="Update")
+    assert request_arguments(legacy) == {"channel_or_chat_id": "maintenance", "text": "Update"}
+    thread = CliqArguments(
+        channel_or_chat_id="maintenance", text="Update", thread_message_id="1793138871358%20307080186942", thread_title="🟠 Unit · SOR 123"
+    )
+    assert thread.thread_message_id == "1793138871358_307080186942"
+    assert request_arguments(thread)["thread_title"] == "🟠 Unit · SOR 123"
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"thread_title": "Orphan"},
+        {"thread_message_id": " "},
+        {"thread_message_id": "not-a-provider-id"},
+        {"post_in_parent": False},
+        {"thread_message_id": "1793138871358_307080186942", "post_in_parent": "false"},
+    ],
+)
+def test_cliq_thread_contract_rejects_ambiguous_or_malformed_fields(fields):
+    with pytest.raises(ValidationError):
+        CliqArguments(channel_or_chat_id="maintenance", text="Update", **fields)

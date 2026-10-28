@@ -301,7 +301,9 @@ class SorPropertyReference(StrictModel):
     """Caller-resolved SOR inventory identity; labels are never identifiers."""
 
     building_id: int = Field(gt=0, strict=True, description="Buildings.id from SOR inventory; never a TenantCloud ID or Factbook UUID.")
-    unit_id: int | None = Field(default=None, gt=0, strict=True, description="Building Units.id from the same SOR building, when this action concerns one unit.")
+    unit_id: int | None = Field(
+        default=None, gt=0, strict=True, description="Building Units.id from the same SOR building, when this action concerns one unit."
+    )
 
 
 PROPERTY_REFERENCE_GUIDANCE = (
@@ -413,6 +415,36 @@ class QuoSmsArguments(PropertyArguments):
 class CliqArguments(StrictModel):
     channel_or_chat_id: str
     text: str
+    thread_message_id: str | None = None
+    thread_title: str | None = Field(default=None, max_length=200)
+    reply_to: str | None = None
+    post_in_parent: bool | None = Field(default=None, strict=True)
+
+    @field_validator("thread_message_id", "reply_to", mode="before")
+    @classmethod
+    def normalize_message_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not re.fullmatch(r"\d{13,}(?:_| |%20)\d+", value.strip(), re.IGNORECASE):
+            raise ValueError("thread/reply message ID must be a provider message ID")
+        return re.sub(r"%20| ", "_", value.strip(), flags=re.IGNORECASE)
+
+    @field_validator("thread_title", mode="before")
+    @classmethod
+    def normalize_thread_title(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return normalize_public_text(value, field="thread_title", minimum=1, maximum=200)
+
+    @model_validator(mode="after")
+    def validate_thread_fields(self) -> CliqArguments:
+        if self.thread_title is not None and self.thread_message_id is None:
+            raise ValueError("thread_title requires thread_message_id")
+        if self.thread_message_id and (self.channel_or_chat_id.startswith("CT_") or self.channel_or_chat_id.isdecimal()):
+            raise ValueError("thread creation requires a named channel target")
+        if self.post_in_parent is not None and not self.thread_message_id and "-T-" not in self.channel_or_chat_id:
+            raise ValueError("post_in_parent requires thread creation or an existing thread chat ID")
+        return self
 
     @field_validator("channel_or_chat_id", mode="before")
     @classmethod
@@ -751,7 +783,11 @@ OPERATION_USAGE: dict[Operation, tuple[tuple[ActionRole, IntentKind, str], ...]]
     ),
     Operation.CLIQ_CHAT_POST: ((ActionRole.INTERNAL_REPLY, IntentKind.INTERNAL_REPLY, "reply in the Cliq chat that woke you"),),
     Operation.CLIQ_CHANNEL_POST: (
-        (ActionRole.INTERNAL_NOTIFICATION, IntentKind.MANUAL_REVIEW_ALERT, "post to a Cliq channel (lead_alert for a new lead)"),
+        (
+            ActionRole.INTERNAL_NOTIFICATION, IntentKind.MANUAL_REVIEW_ALERT,
+            "post to a Cliq channel (lead_alert for a new lead); thread_message_id creates a thread from an existing root, "
+            "thread_title is optional, post_in_parent defaults to false. Sent/status results retain thread_information.chat_id for replies",
+        ),
     ),
     Operation.CALENDAR_CREATE: (
         (
@@ -1107,11 +1143,18 @@ class RecentlyAnswered(StrictModel):
     reply_status: str | None = None
 
 
+class CliqThreadInformation(StrictModel):
+    chat_id: str = Field(pattern=r"^CT_.+-T-\d+$")
+    parent_message_id: str
+
+
 class PublicResult(StrictModel):
     status: PublicStatus
     action_id: UUID
     action_uid: UUID | None
     provider_request_ref: str | None
+    provider_message_id: str | None = None
+    thread_information: CliqThreadInformation | None = None
     # True only for needs_confirmation: the agent may answer with op=confirm.
     # Every other result keeps the historical False.
     retryable: bool = False
