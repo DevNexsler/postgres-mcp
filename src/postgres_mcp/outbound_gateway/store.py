@@ -273,6 +273,14 @@ class PostgresActionStore:
             [action_id, paused],
         )
 
+    async def set_delivery_deadline(self, action_id: UUID, deadline_at: datetime) -> OutboundActionRecord:
+        """Stamp when this gateway will have given up on the action
+        (Comm-Data-Store migration 282). A settled row is returned unchanged."""
+        return await self._one(
+            "SELECT * FROM set_outbound_delivery_deadline({}, {})",
+            [action_id, deadline_at],
+        )
+
     async def prepare(self, context: ActionContext, expected_state: ActionState) -> OutboundActionRecord:
         slot = context.appointment_slot.isoformat() if context.appointment_slot else ""
         if context.action_role is ActionRole.PROSPECT_REPLY:
@@ -950,4 +958,5 @@ class PostgresActionStore:
             created_at=cells.get("created_at"),
             delivery_paused_seconds=float(cells.get("delivery_paused_seconds") or 0.0),
             delivery_paused_since=cells.get("delivery_paused_since"),
+            delivery_deadline_at=cells.get("delivery_deadline_at"),
         )

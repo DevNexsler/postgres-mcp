@@ -271,3 +271,74 @@ async def test_without_the_pause_the_same_outage_would_have_dropped_the_reply():
 
     assert result.phase is DeliveryPhase.TERMINAL
     assert sends(facade) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_give_up_time_is_stamped_on_the_row_and_extended_through_the_outage():
+    """CDS migration 282: the wake reconciler reads the gateway's give-up time
+    off the row instead of a copy of the old one-hour budget. Through the
+    7-hour auth outage it is stamped on every wait, only ever moves later
+    while the clock is paused, and is never already past when the gateway is
+    still waiting -- so a reconciler pass two (or six) hours in sees a send
+    still being worked, not a stuck one."""
+    coordinator, store, clock, _warning, facade, _auth = harness(outage_hours=7)
+    observed: list[tuple[Any, Any, Any]] = []
+
+    for _ in range(4000):
+        result = await coordinator.advance(TC_MESSAGE_ID)
+        if result.phase in (DeliveryPhase.COMPLETE, DeliveryPhase.TERMINAL):
+            break
+        observed.append((clock.now, store.current.delivery_deadline_at, store.current.delivery_paused_since))
+        clock.advance(result.retry_after_seconds)
+    else:
+        raise AssertionError("workflow did not terminate")
+
+    assert sends(facade) == 1
+    paused_waits = [(now, deadline) for now, deadline, since in observed if since is not None]
+    assert len(paused_waits) > 5
+    # The first wait already looks past the old one-hour copy's horizon.
+    assert paused_waits[0][1] >= CREATED_AT + timedelta(hours=1)
+    for now, deadline in paused_waits:
+        assert deadline is not None and deadline > now
+    deadlines = [deadline for _now, deadline in paused_waits]
+    assert deadlines == sorted(deadlines)
+    # Six hours into the outage the stamp is still at least an hour out.
+    late = [deadline for now, deadline in paused_waits if now >= CREATED_AT + timedelta(hours=6)]
+    assert late and all(deadline >= CREATED_AT + timedelta(hours=7) for deadline in late)
+
+
+@pytest.mark.asyncio
+async def test_an_open_circuit_stamps_the_extended_give_up_time_through_the_service():
+    """The circuit-open pause (service._dispatch's schedule_next_attempt path)
+    stamps the same way as the coordinator's auth wait."""
+    coordinator, store, clock, _warning, facade, _auth = harness(outage_hours=0, circuit_open_hours=3)
+    stamped_while_open: list[tuple[Any, Any]] = []
+
+    for _ in range(4000):
+        result = await coordinator.advance(TC_MESSAGE_ID)
+        if result.phase in (DeliveryPhase.COMPLETE, DeliveryPhase.TERMINAL):
+            break
+        if store.current.delivery_paused_since is not None:
+            stamped_while_open.append((clock.now, store.current.delivery_deadline_at))
+        clock.advance(result.retry_after_seconds)
+
+    assert sends(facade) == 1
+    assert stamped_while_open
+    assert all(deadline is not None and deadline > now + timedelta(minutes=59) for now, deadline in stamped_while_open)
+    assert max(deadline for _now, deadline in stamped_while_open) >= CREATED_AT + timedelta(hours=3)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stamp_never_blocks_the_retry(caplog: pytest.LogCaptureFixture):
+    """The stamp is for the reconciler; delivery does not depend on it."""
+    coordinator, store, clock, _warning, facade, _auth = harness(outage_hours=2)
+
+    async def refuse(action_id, deadline_at):
+        raise RuntimeError("database unavailable")
+
+    store.set_delivery_deadline = refuse  # type: ignore[method-assign]
+    result = await drive(coordinator, TC_MESSAGE_ID, clock)
+
+    assert result.phase is DeliveryPhase.COMPLETE
+    assert sends(facade) == 1
+    assert "could not stamp delivery deadline" in caplog.text

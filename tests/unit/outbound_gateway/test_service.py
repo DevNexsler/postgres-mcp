@@ -205,6 +205,7 @@ class FakeStore:
     def __init__(self, initial=None, *, remediation_successor_id=None, remediation_error=None):
         self.current = initial
         self.calls = []
+        self.deadlines = []
         self.last_receipt = None
         self.remediation_successor_id = remediation_successor_id
         self.remediation_error = remediation_error
@@ -320,6 +321,13 @@ class FakeStore:
                 delivery_paused_seconds=self.current.delivery_paused_seconds + (now - since).total_seconds(),
                 delivery_paused_since=None,
             )
+        return self.current
+
+    async def set_delivery_deadline(self, action_id, deadline_at):
+        """Comm-Data-Store set_outbound_delivery_deadline (migration 282).
+        Kept out of `calls`: the stamp is bookkeeping, not a delivery step."""
+        self.deadlines.append(deadline_at)
+        self.current = replace(self.current, delivery_deadline_at=deadline_at)
         return self.current
 
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code):

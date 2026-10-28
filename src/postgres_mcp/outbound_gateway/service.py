@@ -65,6 +65,7 @@ from .retry_config import deliverable_elapsed_seconds
 from .retry_config import jitter_key
 from .retry_config import paused_seconds
 from .retry_config import wall_elapsed_seconds
+from .retry_policy import stamp_delivery_deadline
 from .stale_context import ExecuteAnswer
 from .stale_context import StaleContextQuestions
 from .stale_context import answer_refusal
@@ -1015,12 +1016,14 @@ class OutboundActionService:
             # clock (the deadline does not count it) and look again when the
             # circuit may have closed. No claim, so no attempt is spent.
             paused = await self._pause(action)
+            wait_seconds = max(1, circuit.retry_after_seconds)
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
                 paused.state,
-                max(1, circuit.retry_after_seconds),
+                wait_seconds,
                 "provider_circuit_open",
             )
+            await stamp_delivery_deadline(self._store, scheduled, policy, now, next_check_seconds=wait_seconds)
             return action_result(scheduled)
         if _tenantcloud_auth_wait_pending(action, now, policy.staleness_ceiling_seconds):
             # The provider's auth is down: the same pause, waited out on the
@@ -1029,12 +1032,14 @@ class OutboundActionService:
             # ordinary claim()/dispatch below.
             paused = await self._pause(action)
             pause_age = paused_seconds(paused, now) - paused.delivery_paused_seconds
+            wait_seconds = policy.backoff_seconds(pause_age, jitter_key=jitter_key(paused))
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
                 paused.state,
-                policy.backoff_seconds(pause_age, jitter_key=jitter_key(paused)),
+                wait_seconds,
                 "tenantcloud_auth_wait",
             )
+            await stamp_delivery_deadline(self._store, scheduled, policy, now, next_check_seconds=wait_seconds)
             return action_result(scheduled)
         if action.delivery_paused_since is not None:
             action = await self._store.set_delivery_paused(action.action_id, False)
@@ -1204,6 +1209,7 @@ class OutboundActionService:
         detail_code: str,
     ) -> OutboundActionRecord:
         policy = self._policies.for_operation(action.operation)
+        now = self._clock()
         if action.operation in self._restate_operations:
             # attempt_count is the legacy worker's own counter (bumped by
             # claim_outbound_action, Comm-Data-Store) -- a Restate-routed
@@ -1212,16 +1218,18 @@ class OutboundActionService:
             # never-growing wait (360 TenantCloud status-update reinvokes in
             # one hour). Time spent deliverable-but-failing cannot go flat.
             wait_seconds = policy.backoff_seconds(
-                deliverable_elapsed_seconds(action, self._clock()), jitter_key=jitter_key(action)
+                deliverable_elapsed_seconds(action, now), jitter_key=jitter_key(action)
             )
         else:
             wait_seconds = policy.attempt_backoff_seconds(action.attempt_count, jitter_key=jitter_key(action))
-        return await self._store.schedule_next_attempt(
+        scheduled = await self._store.schedule_next_attempt(
             action.action_id,
             action.state,
             wait_seconds,
             detail_code,
         )
+        await stamp_delivery_deadline(self._store, scheduled, policy, now, next_check_seconds=wait_seconds)
+        return scheduled
 
     async def _pause(self, action: OutboundActionRecord) -> OutboundActionRecord:
         """Open this row's provider-down pause, unless one is already open."""

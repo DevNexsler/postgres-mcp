@@ -292,6 +292,31 @@ async def test_store_schedules_bounded_next_attempt_through_database_function():
 
 
 @pytest.mark.asyncio
+async def test_store_stamps_the_delivery_deadline_through_database_function_and_reads_it_back():
+    """Comm-Data-Store migration 282: set_outbound_delivery_deadline."""
+    from datetime import datetime
+    from datetime import timezone
+
+    deadline = datetime(2026, 10, 28, 20, 0, tzinfo=timezone.utc)
+    calls = []
+
+    async def execute(_driver, query, params):
+        calls.append((query, params))
+        return [Row({**action_row("prepared"), "delivery_deadline_at": deadline})]
+
+    store = PostgresActionStore(object())
+    with patch(
+        "postgres_mcp.outbound_gateway.store.SafeSqlDriver.execute_param_query",
+        AsyncMock(side_effect=execute),
+    ):
+        stamped = await store.set_delivery_deadline(ACTION_ID, deadline)
+
+    assert "set_outbound_delivery_deadline" in calls[0][0]
+    assert calls[0][1] == [ACTION_ID, deadline]
+    assert stamped.delivery_deadline_at == deadline
+
+
+@pytest.mark.asyncio
 async def test_prospect_lock_scope_includes_canonical_source_turn():
     calls = []
 
