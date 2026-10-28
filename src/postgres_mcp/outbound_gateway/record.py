@@ -90,6 +90,11 @@ class OutboundActionRecord:
     # start of a pause still open. The delivery deadline does not count them.
     delivery_paused_seconds: float = 0.0
     delivery_paused_since: datetime | None = None
+    # Comm-Data-Store migration 282: when this gateway will have given up on
+    # the action if nothing changes (retry_config.delivery_give_up_at),
+    # restamped on every reschedule. The wake reconciler reads it instead of
+    # a copy of the policy. None until the first reschedule.
+    delivery_deadline_at: datetime | None = None
 
     def execute_request(self) -> ExecuteRequest:
         # create_or_load() persists TenantCloud arguments enriched with
@@ -122,6 +127,8 @@ class ActionStore(Protocol):
     async def create_escalation(self, context: ActionContext, failed_action_id: UUID) -> OutboundActionRecord: ...
 
     async def set_delivery_paused(self, action_id: UUID, paused: bool) -> OutboundActionRecord: ...
+
+    async def set_delivery_deadline(self, action_id: UUID, deadline_at: datetime) -> OutboundActionRecord: ...
 
     async def prepare(
         self,

@@ -54,6 +54,7 @@ from .retry_policy import STALENESS_CEILING_DETAIL
 from .retry_policy import NoopStaffWarningPort
 from .retry_policy import StaffWarningPort
 from .retry_policy import should_wait_for_context_reload
+from .retry_policy import stamp_delivery_deadline
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,8 @@ class DeliveryStore(Protocol):
     async def later_sent_sibling(self, action_id: UUID) -> UUID | None: ...
 
     async def set_delivery_paused(self, action_id: UUID, paused: bool) -> Any: ...
+
+    async def set_delivery_deadline(self, action_id: UUID, deadline_at: datetime) -> Any: ...
 
 
 class DeliveryService(Protocol):
@@ -301,10 +304,8 @@ class OutboundDeliveryCoordinator:
                 action = await self._store.set_delivery_paused(action_id, True)
             pause_age = paused_seconds(action, now) - float(getattr(action, "delivery_paused_seconds", 0.0) or 0.0)
             wait = policy.backoff_seconds(pause_age, jitter_key=jitter_key(action))
-            return DeliveryResult(
-                DeliveryPhase.WAIT,
-                f"tenantcloud_auth_{auth.state.value}",
-                max(1, wait, auth.retry_after_seconds),
+            return await self._wait(
+                action, policy, now, f"tenantcloud_auth_{auth.state.value}", max(1, wait, auth.retry_after_seconds)
             )
         just_recovered = getattr(action, "delivery_paused_since", None) is not None
         if just_recovered:
@@ -320,8 +321,8 @@ class OutboundDeliveryCoordinator:
             # ends it rejected (nothing was sent) instead of preparing again.
             result = await self._service.exhaust(action_id) if exhausted else await self._service.prepare(action_id)
             if result.status is PublicStatus.PENDING and result.detail_code in CONTEXT_RELOAD_WAIT_DETAILS:
-                return DeliveryResult(
-                    DeliveryPhase.WAIT, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+                return await self._wait(
+                    action, policy, now, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
                 )
         elif action.state in _AMBIGUOUS_STATES:
             result = await self._service.exhaust(action_id) if exhausted else await self._service.reconcile(action_id)
@@ -336,21 +337,29 @@ class OutboundDeliveryCoordinator:
             # passing database error, most often). Ending the workflow here
             # would leave the row with nobody to advance it. Wait and try
             # again under the same deadline, which ends it.
-            return DeliveryResult(
-                DeliveryPhase.WAIT, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+            return await self._wait(
+                action, policy, now, result.detail_code, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
             )
         if result.status is PublicStatus.MANUAL_REVIEW:
             wait_detail = result.detail_code if result.detail_code in CONTEXT_RELOAD_WAIT_DETAILS else getattr(result, "detail", None)
             if wait_detail in CONTEXT_RELOAD_WAIT_DETAILS and should_wait_for_context_reload(wait_detail, elapsed, policy):
                 # A context reload that raced a write is not a failure: wait
                 # and reload again (action 497fcaf8, calendar.update).
-                return DeliveryResult(
-                    DeliveryPhase.WAIT, wait_detail, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
+                return await self._wait(
+                    action, policy, now, wait_detail, policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
                 )
         settled = self._settle(result, policy)
         if settled is not None:
             return settled
         return await self.status(action_id)
+
+    async def _wait(self, action: Any, policy: Any, now: datetime, detail_code: str, seconds: int) -> DeliveryResult:
+        """A wait this coordinator schedules itself (Restate sleeps it; no
+        schedule_next_attempt): stamp the row's give-up time first, as every
+        reschedule does, so the wake reconciler knows the gateway is still
+        working it -- through an outage, for as long as the pause lasts."""
+        await stamp_delivery_deadline(self._store, action, policy, now, next_check_seconds=seconds)
+        return DeliveryResult(DeliveryPhase.WAIT, detail_code, seconds)
 
     @staticmethod
     def _settle(result: Any, policy: Any) -> DeliveryResult | None:

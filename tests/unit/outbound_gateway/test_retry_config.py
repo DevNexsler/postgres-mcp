@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 import pytest
 
@@ -12,6 +16,7 @@ from postgres_mcp.outbound_gateway.models import Operation
 from postgres_mcp.outbound_gateway.retry_config import RetryPolicy
 from postgres_mcp.outbound_gateway.retry_config import RetryPolicyConfig
 from postgres_mcp.outbound_gateway.retry_config import RetryPolicyConfigError
+from postgres_mcp.outbound_gateway.retry_config import delivery_give_up_at
 
 # What production sets today (docker-compose.yaml), plus the new keys.
 PRODUCTION = {
@@ -163,3 +168,68 @@ def test_jitter_only_ever_shortens_a_wait_by_up_to_its_ratio_and_is_stable_per_k
         assert waits == [policy.backoff_seconds(elapsed, jitter_key=key) for key in keys]
     # Spread: actions queued by one outage do not all retry together.
     assert len({policy.backoff_seconds(50_000, jitter_key=key) for key in keys}) > 50
+
+
+# -- the give-up time stamped on the row (CDS migration 282) ----------------
+
+CREATED = datetime(2026, 10, 26, 21, 25, tzinfo=timezone.utc)
+
+
+@dataclass
+class Row:
+    created_at: datetime | None = CREATED
+    delivery_paused_seconds: float = 0.0
+    delivery_paused_since: datetime | None = None
+
+
+def test_give_up_time_is_the_deadline_from_creation_when_nothing_paused() -> None:
+    policy = RetryPolicy()
+    now = CREATED + timedelta(minutes=10)
+    assert delivery_give_up_at(Row(), policy, now, next_check_seconds=40) == CREATED + timedelta(seconds=3600)
+
+
+def test_closed_pauses_push_the_give_up_time_back_by_their_length() -> None:
+    now = CREATED + timedelta(hours=7, minutes=30)
+    row = Row(delivery_paused_seconds=7 * 3600)
+    assert delivery_give_up_at(row, RetryPolicy(), now, next_check_seconds=60) == CREATED + timedelta(hours=8)
+
+
+def test_an_open_pause_is_assumed_to_last_through_the_next_check() -> None:
+    """Five hours into an outage with a 900 s wait ahead: the gateway cannot
+    give up before the pause has lasted 5 h 15 m, plus its hour of deliverable
+    time -- far past the reconciler's old one-hour copy."""
+    now = CREATED + timedelta(hours=5)
+    row = Row(delivery_paused_since=CREATED)
+    expected = CREATED + timedelta(hours=5, seconds=900 + 3600)
+    assert delivery_give_up_at(row, RetryPolicy(), now, next_check_seconds=900) == expected
+
+
+def test_the_staleness_ceiling_caps_the_give_up_time() -> None:
+    now = CREATED + timedelta(hours=23, minutes=50)
+    row = Row(delivery_paused_since=CREATED)
+    assert delivery_give_up_at(row, RetryPolicy(), now, next_check_seconds=300) == CREATED + timedelta(hours=24)
+
+
+def test_the_gateway_only_gives_up_when_it_next_looks() -> None:
+    """Past the budget, the give-up time is the next check, not the past."""
+    now = CREATED + timedelta(hours=2)
+    assert delivery_give_up_at(Row(), RetryPolicy(), now, next_check_seconds=900) == now + timedelta(seconds=900)
+
+
+def test_a_pending_wait_is_bounded_only_by_the_staleness_ceiling() -> None:
+    now = CREATED + timedelta(hours=2)
+    stamped = delivery_give_up_at(Row(), RetryPolicy(), now, next_check_seconds=60, staleness_only=True)
+    assert stamped == CREATED + timedelta(hours=24)
+
+
+def test_the_give_up_time_follows_the_operations_effective_policy() -> None:
+    config = RetryPolicyConfig.from_env({"OUTBOUND_RETRY_POLICY_JSON": json.dumps({"tenantcloud": {"deadline_seconds": 7200}})})
+    now = CREATED + timedelta(minutes=1)
+    tenantcloud = config.for_operation(Operation.TENANTCLOUD_MESSAGE_SEND)
+    email = config.for_operation(Operation.EMAIL_SEND)
+    assert delivery_give_up_at(Row(), tenantcloud, now, next_check_seconds=5) == CREATED + timedelta(hours=2)
+    assert delivery_give_up_at(Row(), email, now, next_check_seconds=5) == CREATED + timedelta(hours=1)
+
+
+def test_a_record_without_created_at_gets_no_give_up_time() -> None:
+    assert delivery_give_up_at(Row(created_at=None), RetryPolicy(), CREATED, next_check_seconds=5) is None

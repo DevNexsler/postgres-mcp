@@ -17,8 +17,11 @@ later).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
+from typing import Any
 from typing import Protocol
 from uuid import UUID
 
@@ -26,12 +29,48 @@ from .adapters.base import ProviderDisposition
 from .adapters.base import ProviderObservation
 from .models import Operation
 from .retry_config import RetryPolicy
+from .retry_config import delivery_give_up_at
+
+logger = logging.getLogger(__name__)
 
 CONTEXT_RELOAD_WAIT_DETAILS = frozenset({"persisted_context_unavailable", "persisted_context_mismatch"})
 
 # The detail code of an action ended because it reached its staleness
 # ceiling: never sent, because it would have been too late to send.
 STALENESS_CEILING_DETAIL = "staleness_ceiling_exceeded"
+
+
+class DeliveryDeadlineStore(Protocol):
+    async def set_delivery_deadline(self, action_id: UUID, deadline_at: datetime) -> Any: ...
+
+
+async def stamp_delivery_deadline(
+    store: DeliveryDeadlineStore,
+    action: Any,
+    policy: RetryPolicy,
+    now: datetime,
+    *,
+    next_check_seconds: float,
+    staleness_only: bool = False,
+) -> None:
+    """Write this action's give-up time (``retry_config.delivery_give_up_at``)
+    onto its row whenever a retry is scheduled. The stamp only tells the wake
+    reconciler how long the gateway is still working the row; it never
+    decides delivery, so a failure to write it is logged and the retry goes
+    ahead (the row keeps its previous stamp, or the reconciler's legacy
+    one-hour reading)."""
+    deadline_at = delivery_give_up_at(action, policy, now, next_check_seconds=next_check_seconds, staleness_only=staleness_only)
+    if deadline_at is None or deadline_at == getattr(action, "delivery_deadline_at", None):
+        return
+    try:
+        await store.set_delivery_deadline(action.action_id, deadline_at)
+    except Exception:
+        logger.warning(
+            "could not stamp delivery deadline %s on outbound action %s; the retry goes ahead",
+            deadline_at.isoformat(),
+            getattr(action, "action_id", None),
+            exc_info=True,
+        )
 
 
 def should_wait_for_context_reload(detail_code: str, deliverable_elapsed_seconds: float, policy: RetryPolicy) -> bool:

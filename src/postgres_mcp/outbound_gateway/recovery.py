@@ -53,6 +53,7 @@ from .record import require_action
 from .retry_config import RetryPolicyConfig
 from .retry_config import jitter_key
 from .retry_config import wall_elapsed_seconds
+from .retry_policy import stamp_delivery_deadline
 from .tenantcloud_shared import EVIDENCE_KIND_VERIFIED_READBACK
 from .tenantcloud_shared import READBACK_OBSERVATION_KEYS
 from .tenantcloud_shared import TENANTCLOUD_OPERATIONS
@@ -650,13 +651,19 @@ class ActionRecovery:
         Past the ceiling this rejoins the ordinary claim()-then-schedule path,
         so a job that truly never finishes still reaches a person."""
         policy = self._policies.for_operation(action.operation)
-        elapsed = wall_elapsed_seconds(action, self._clock())
+        now = self._clock()
+        elapsed = wall_elapsed_seconds(action, now)
         if not policy.staleness_exceeded(elapsed):
+            wait_seconds = policy.backoff_seconds(elapsed, jitter_key=jitter_key(action))
             scheduled = await self._store.schedule_next_attempt(
                 action.action_id,
                 action.state,
-                policy.backoff_seconds(elapsed, jitter_key=jitter_key(action)),
+                wait_seconds,
                 observation.detail_code,
+            )
+            # Only the staleness ceiling ends a pending wait.
+            await stamp_delivery_deadline(
+                self._store, scheduled, policy, now, next_check_seconds=wait_seconds, staleness_only=True
             )
             return action_result(scheduled)
         claimed = await self._apply(action, (Claim(action.state),))

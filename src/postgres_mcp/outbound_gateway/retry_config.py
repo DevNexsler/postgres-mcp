@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from dataclasses import fields
 from dataclasses import replace
 from datetime import datetime
+from datetime import timedelta
 from typing import Any
 
 from .metrics import PROVIDER_BY_OPERATION
@@ -188,6 +189,43 @@ def deliverable_elapsed_seconds(action: Any, now: datetime) -> float:
     """Seconds the action could have been delivered and was not: its age
     less the time the provider was known to be down."""
     return max(0.0, wall_elapsed_seconds(action, now) - paused_seconds(action, now))
+
+
+def delivery_give_up_at(
+    action: Any,
+    policy: RetryPolicy,
+    now: datetime,
+    *,
+    next_check_seconds: float,
+    staleness_only: bool = False,
+) -> datetime | None:
+    """When the gateway will have given up on this action if nothing changes
+    -- stamped on the row (``delivery_deadline_at``, Comm-Data-Store migration
+    282) every time a retry is scheduled, so the wake reconciler reads the
+    gateway's own answer instead of keeping a copy of this policy.
+
+    The deadline counts only deliverable time, so it is ``created_at`` plus
+    the policy's deadline plus every provider-down pause so far; a pause still
+    open is assumed to last at least until the next check. Never past the
+    staleness ceiling, which ends the action whatever the provider state.
+    ``staleness_only`` is for a wait the deadline does not bound (a provider
+    job still pending), which only the ceiling ends. And never before the
+    next check: the gateway only gives up when it looks again. None for a
+    record with no ``created_at`` (a hand-built test record)."""
+    created_at = getattr(action, "created_at", None)
+    if created_at is None:
+        return None
+    wait = max(0.0, float(next_check_seconds))
+    next_check = now + timedelta(seconds=wait)
+    staleness_at = created_at + timedelta(seconds=policy.staleness_ceiling_seconds)
+    if staleness_only:
+        budget_end = staleness_at
+    else:
+        paused = paused_seconds(action, now)
+        if getattr(action, "delivery_paused_since", None) is not None:
+            paused += wait
+        budget_end = min(staleness_at, created_at + timedelta(seconds=policy.deadline_seconds + paused))
+    return max(budget_end, next_check)
 
 
 def jitter_key(action: Any) -> str:

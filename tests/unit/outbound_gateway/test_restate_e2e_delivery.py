@@ -117,6 +117,19 @@ def make_row(*, created_at: datetime) -> OutboundActionRecord:
     )
 
 
+# Comm-Data-Store set_outbound_delivery_deadline leaves a settled row alone.
+TERMINAL_FOR_DEADLINE = frozenset(
+    {
+        ActionState.COMPLETED,
+        ActionState.STALE,
+        ActionState.REJECTED,
+        ActionState.DEFINITIVE_FAILED,
+        ActionState.DEAD_LETTER,
+        ActionState.MANUAL_REVIEW,
+    }
+)
+
+
 class FakeStore:
     """A trimmed copy of test_service.py's FakeStore: the same claim/
     definitive_fail state guards the real SQL functions enforce, so a plan
@@ -125,6 +138,7 @@ class FakeStore:
 
     def __init__(self, initial: OutboundActionRecord, *, clock: Any = None) -> None:
         self.current = initial
+        self.deadlines: list[datetime] = []
         # The agent's own resend, when a test plays one (see later_sent_sibling).
         self.recovered_by: UUID | None = None
         # set_delivery_paused stamps pauses with this (the test's FakeClock).
@@ -198,6 +212,14 @@ class FakeStore:
                 delivery_paused_seconds=self.current.delivery_paused_seconds + (now - since).total_seconds(),
                 delivery_paused_since=None,
             )
+        return self.current
+
+    async def set_delivery_deadline(self, action_id: UUID, deadline_at: datetime) -> OutboundActionRecord:
+        """Comm-Data-Store set_outbound_delivery_deadline (migration 282):
+        a settled row keeps what it had."""
+        self.deadlines.append(deadline_at)
+        if self.current.state not in TERMINAL_FOR_DEADLINE:
+            self.current = replace(self.current, delivery_deadline_at=deadline_at)
         return self.current
 
     async def schedule_next_attempt(self, action_id, expected_state, delay_seconds, detail_code) -> OutboundActionRecord:
