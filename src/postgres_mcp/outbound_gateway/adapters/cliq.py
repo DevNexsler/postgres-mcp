@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
+from typing import Any
 from uuid import UUID
 
 from ..cliq_failure import CLIQ_CHAT_ACCOUNT_MISMATCH
@@ -46,6 +48,17 @@ class CliqAdapter:
         # cliq_chat_post here. See cliq_target.py for the single shared
         # classification this and context derivation both use.
         tool, target_field = cliq_tool_for_kind(CliqTargetKind(context.target.kind))
+        thread_fields = {
+            name: context.arguments[name]
+            for name in ("thread_message_id", "thread_title", "reply_to", "post_in_parent")
+            if context.arguments.get(name) is not None
+        }
+        if thread_fields.get("thread_message_id"):
+            if target_field != "channel_unique_name":
+                raise ValueError("Cliq thread creation requires a channel target")
+            thread_fields.setdefault("post_in_parent", False)
+        elif "-T-" in context.target.target_id:
+            thread_fields.setdefault("post_in_parent", False)
         return ProviderRequest(
             server_name="agent-email",
             tool=tool,
@@ -53,10 +66,8 @@ class CliqAdapter:
                 target_field: context.target.target_id,
                 "text": str(context.arguments["text"]),
                 "sync_message": True,
-                "idempotency_key": (
-                    f"cliq-wake:{context.wakeup_event_id}:"
-                    f"{context.action_role.value}:{self._operation.value}"
-                ),
+                **thread_fields,
+                "idempotency_key": (f"cliq-wake:{context.wakeup_event_id}:{context.action_role.value}:{self._operation.value}"),
             },
         )
 
@@ -71,6 +82,15 @@ class CliqAdapter:
 
     def parse_receipt(self, context: ActionContext, observation: ProviderObservation) -> ProviderReceipt | None:
         self.validate(context)
+        parent = context.arguments.get("thread_message_id")
+        if parent:
+            thread = (observation.evidence or {}).get("thread_information")
+            if (
+                not isinstance(thread, dict)
+                or not re.fullmatch(r"CT_.+-T-\d+", str(thread.get("chat_id", "")))
+                or re.sub(r"%20| ", "_", str(thread.get("parent_message_id", "")), flags=re.IGNORECASE) != parent
+            ):
+                return None
         return receipt_from_observation(observation)
 
     async def reconcile(
@@ -129,7 +149,11 @@ class CliqAdapter:
             status = item.get("status")
             message_id = item.get("provider_message_id")
             if status in {"sent", "duplicate_suppressed"} and isinstance(message_id, str) and message_id.strip():
-                return accepted_observation(request_ref_value=ref, message_id=message_id.strip())
+                evidence: dict[str, Any] = {"kind": "provider_message_id", "provider_message_id": message_id.strip()}
+                thread = item.get("thread_information")
+                if isinstance(thread, dict):
+                    evidence["thread_information"] = thread
+                return accepted_observation(request_ref_value=ref, message_id=message_id.strip(), evidence=evidence)
         return ProviderObservation(
             ProviderDisposition.AMBIGUOUS,
             "malformed_provider_success",

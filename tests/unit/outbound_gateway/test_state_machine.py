@@ -129,11 +129,15 @@ def test_public_result_is_normalized_and_never_exposes_raw_provider_payload(stat
     assert result.override is None
     assert result.already_sent is None
     assert result.recently_answered is None
+    assert result.provider_message_id is None
+    assert result.thread_information is None
     assert set(result.model_dump()) == {
         "status",
         "action_id",
         "action_uid",
         "provider_request_ref",
+        "provider_message_id",
+        "thread_information",
         "retryable",
         "detail_code",
         "detail",

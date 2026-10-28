@@ -22,6 +22,7 @@ from .models import STALE_CONTEXT_DETAILS
 from .models import STORED_ACTION_CONTEXT
 from .models import ActionRole
 from .models import ActionState
+from .models import CliqThreadInformation
 from .models import CompletionKind
 from .models import ExecuteRequest
 from .models import Operation
@@ -60,6 +61,7 @@ class OutboundActionRecord:
     provider_evidence_reference: str | None = None
     provider_evidence_hash: str | None = None
     provider_readback_evidence: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    provider_receipt: Mapping[str, Any] = dataclass_field(default_factory=dict)
     error_category: str | None = None
     retry_of_action_id: UUID | None = None
     remediation_reason: str | None = None
@@ -416,6 +418,16 @@ def action_result(
         repeated_execute=repeated,
         detail=detail or _row_detail(action, repeated=repeated),
     )
+    if action.state is ActionState.COMPLETED and action.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}:
+        updates: dict[str, Any] = {"provider_message_id": action.provider_message_id}
+        evidence = action.provider_receipt.get("evidence")
+        thread = evidence.get("thread_information") if isinstance(evidence, Mapping) else None
+        if isinstance(thread, Mapping):
+            try:
+                updates["thread_information"] = CliqThreadInformation.model_validate(thread)
+            except ValueError:
+                pass
+        result = result.model_copy(update=updates)
     if not overridable(action):
         return result
     why = (result.detail or "").rstrip()

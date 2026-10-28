@@ -46,6 +46,20 @@
       "reply_to": {
         "type": "string",
         "description": "Optional Zoho message ID to reply to in the channel."
+      },
+      "thread_message_id": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Existing channel root message ID from which to create a true thread. Unlike reply_to, this creates a thread."
+      },
+      "thread_title": {
+        "type": "string",
+        "maxLength": 200,
+        "description": "Optional ticket thread title; requires thread_message_id."
+      },
+      "post_in_parent": {
+        "type": "boolean",
+        "description": "Whether to also publish the thread message to the parent channel. Defaults to false for thread creation."
       }
     },
     "required": [
@@ -62,6 +76,10 @@
         "maxLength": 256,
         "pattern": "^(?:[0-9]{15,}|CT_[A-Za-z0-9_/%-]*[0-9][A-Za-z0-9_/%-]*)$",
         "description": "Zoho existing DM/group chat ID. Do not pass a channel unique name or a user id (ZUID). Expected a numeric Cliq chat id of at least 15 digits (e.g. 1424728044450751028) or a CT_<chat>_<user> conversation id (e.g. CT_2198174035284346737_721156495)."
+      },
+      "post_in_parent": {
+        "type": "boolean",
+        "description": "For an existing thread chat, also publish reply in parent channel. Defaults to false; only valid for a thread chat ID."
       },
       "text": {
         "type": "string",
