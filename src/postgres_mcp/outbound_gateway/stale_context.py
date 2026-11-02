@@ -60,6 +60,7 @@ from .models import ConfirmRequest
 from .models import ContextItem
 from .models import ExecuteRequest
 from .models import NewerActivity
+from .models import Operation
 from .models import PublicResult
 from .models import PublicStatus
 from .models import RequestRefusedError
@@ -127,6 +128,24 @@ class StaleQuestion:
             f'({newest.ref.replace(":", " ")} via {newest.source} at {newest.occurred_at.isoformat()}: '
             f'"{newest.preview}"){more}{omitted}. Still send? Answer with op=confirm: yes, no, or revise.'
         )
+
+
+def posts_into_waking_cliq_conversation(context: ActionContext) -> bool:
+    """True when a Cliq post goes back into the conversation that woke it.
+
+    A reply in a Cliq org channel must go out as an internal_notification
+    cliq.channel.post (internal_reply is a cliq.chat.post into a DM only), so
+    the role alone cannot tell a staff alert posted elsewhere from a reply in
+    the thread the manager is still talking in. Wake 30443 (2026-11-02): Dan
+    asked a question in #Tenant Management Chat, Laura answered it at 11:04,
+    and Nigel's posts at 11:19, 11:22 and 11:35 never saw her answer -- the
+    last one called the reason "still unknown".
+    """
+    return (
+        context.operation in {Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST}
+        and bool(context.thread_identity.strip())
+        and context.target.target_id.strip() == context.thread_identity.strip()
+    )
 
 
 def stale_question(found: list[NewerActivity]) -> StaleQuestion | None:
@@ -373,12 +392,12 @@ class StaleContextQuestions:
         (or, where nobody can be asked, the `stale_context_unasked` no-send),
         or None: send. confirm=True (override=true) records the question and
         answers yes at once."""
-        if action.action_role is ActionRole.INTERNAL_NOTIFICATION:
+        if action.action_role is ActionRole.INTERNAL_NOTIFICATION and not posts_into_waking_cliq_conversation(context):
             # The question is "since your context was built, a new message
             # was sent to or received from this recipient -- still send?" An
-            # internal_notification has no such recipient: it posts to a
-            # staff review channel about something that happened, not a
-            # reply in a conversation that can go stale. newer_context's
+            # internal_notification posted elsewhere has no such recipient: it
+            # goes to a staff review channel about something that happened,
+            # not a reply in a conversation that can go stale. newer_context's
             # "received" match is channel-scoped, not role-scoped, so a busy
             # wake's own channel (e.g. a Quo line still getting texts) used
             # to trip this for a manual_review_alert with nothing to do with
