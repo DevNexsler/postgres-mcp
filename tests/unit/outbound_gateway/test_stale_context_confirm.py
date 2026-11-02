@@ -53,6 +53,8 @@ from postgres_mcp.outbound_gateway.service import OutboundActionService
 
 WAKE = 27164
 CHAT = "1424728044450751028"
+# A staff review channel: not the conversation that woke the wake.
+REVIEW_CHAT = "CT_2243179624167910134_721156495"
 SUBJECT = f"internal:{CHAT}"
 # Real timeline, wake 27164 (UTC).
 WATERMARK = datetime(2026, 9, 23, 19, 36, 29, 938418, tzinfo=timezone.utc)
@@ -154,7 +156,7 @@ class FakeLoader:
             canonical_context=self.canonical_context,
             payload_hash=payload_hash,
             lock_holder=f"outbound-gateway:{action_id}",
-            thread_identity=f"cliq:{CHAT}",
+            thread_identity=CHAT,
             showing_lifecycle_id=f"showing:wake:{request.wakeup_event_id}",
             calendar_event_uid=None,
         )
@@ -553,7 +555,7 @@ def harness(*activity: NewerActivity, evidence: StaticEvidence | None = None):
         store=store,
         context_loader=FakeLoader(),
         evidence_loader=evidence,
-        adapters={Operation.CLIQ_CHAT_POST: adapter, Operation.QUO_SMS_SEND: adapter},
+        adapters={Operation.CLIQ_CHAT_POST: adapter, Operation.CLIQ_CHANNEL_POST: adapter, Operation.QUO_SMS_SEND: adapter},
         provider_client=object(),
         clock=lambda: EXECUTED_AT,
         lease_owner="outbound-gateway",
@@ -627,9 +629,9 @@ async def test_internal_notification_never_asks_the_stale_context_question():
             "op": "execute",
             "wakeup_event_id": WAKE,
             "action_role": "internal_notification",
-            "operation": "cliq.chat.post",
+            "operation": "cliq.channel.post",
             "intent_kind": "manual_review_alert",
-            "arguments": {"text": "calendar.update needs a property this wake does not name", "channel_or_chat_id": CHAT},
+            "arguments": {"text": "calendar.update needs a property this wake does not name", "channel_or_chat_id": REVIEW_CHAT},
         }
     )
     assert isinstance(alert, ExecuteRequest)
@@ -638,6 +640,35 @@ async def test_internal_notification_never_asks_the_stale_context_question():
 
     assert result.status is PublicStatus.SENT
     assert adapter.sent == ["calendar.update needs a property this wake does not name"]
+
+
+@pytest.mark.asyncio
+async def test_internal_notification_back_into_the_waking_cliq_channel_asks_the_stale_context_question():
+    """Wake 30443, 2026-11-02: Dan asked a question in #Tenant Management
+    Chat, Laura answered it in the same channel at 11:04, and Nigel's reply
+    posts -- an org-channel reply can only be an internal_notification
+    cliq.channel.post -- went out at 11:19, 11:22 and 11:35 without anyone
+    asking whether the thread had moved on; the last one called the reason
+    Laura had already given "still unknown". A post into the conversation
+    that woke the wake is a reply in that conversation, whatever its role."""
+    service, store, _probe, adapter = harness(DAN_FOLLOW_UP)
+    reply = parse_outbound_request(
+        {
+            "op": "execute",
+            "wakeup_event_id": WAKE,
+            "action_role": "internal_notification",
+            "operation": "cliq.channel.post",
+            "intent_kind": "manual_review_alert",
+            "arguments": {"text": "Why they are leaving: still unknown.", "channel_or_chat_id": CHAT},
+        }
+    )
+    assert isinstance(reply, ExecuteRequest)
+
+    result = await service.execute(reply)
+
+    assert result.status is PublicStatus.NEEDS_CONFIRMATION
+    assert adapter.sent == []
+    assert store.rows[result.action_id].stale_context_shown_refs == ("message:750826",)
 
 
 @pytest.mark.asyncio
