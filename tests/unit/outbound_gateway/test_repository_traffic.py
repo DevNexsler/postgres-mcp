@@ -64,6 +64,9 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
         "lead@convo.zillow.com",
         True,
         None,
+        "email",  # the destination, whatever the wake (ActionContext.destination_key)
+        "lead@convo.zillow.com",
+        False,  # a reply: not destination-only
         11,
     ]
     for clause in (
@@ -79,6 +82,9 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
         "candidate.source = ANY(p.sent_sources)",
         "ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed'",
         "retry_lineage",
+        "candidate.dest_from",  # received from the destination, any channel
+        "candidate.dest_to",  # sent to the destination, any line or mailbox
+        "destination_sent AS (",  # another turn's gateway send to the destination
     ):
         assert clause in query, clause
 
@@ -99,4 +105,4 @@ async def test_newer_context_maps_received_messages_and_our_sends_newest_first()
         (f"action:{OTHER_ACTION_ID}", "sent by us"),
     ]
     assert items[0].sender == "Dan Park"
-    assert calls[0][1][-3:] == [False, None, 2]
+    assert calls[0][1][-6:] == [False, None, "email", "lead@convo.zillow.com", False, 2]

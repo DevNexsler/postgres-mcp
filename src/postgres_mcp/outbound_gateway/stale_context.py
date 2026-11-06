@@ -392,7 +392,11 @@ class StaleContextQuestions:
         (or, where nobody can be asked, the `stale_context_unasked` no-send),
         or None: send. confirm=True (override=true) records the question and
         answers yes at once."""
-        if action.action_role is ActionRole.INTERNAL_NOTIFICATION and not posts_into_waking_cliq_conversation(context):
+        if (
+            action.action_role is ActionRole.INTERNAL_NOTIFICATION
+            and not posts_into_waking_cliq_conversation(context)
+            and context.destination_key is None
+        ):
             # The question is "since your context was built, a new message
             # was sent to or received from this recipient -- still send?" An
             # internal_notification posted elsewhere has no such recipient: it
@@ -404,6 +408,13 @@ class StaleContextQuestions:
             # its content (wakes 27313/27314, 2026-09-28: the bug report
             # itself was blocked as stale_context, delaying it behind a
             # confirm round trip it never needed). Always send.
+            #
+            # A text or email has a real person at the other end whatever
+            # role the agent gave it: an internal_notification quo.sms.send
+            # to a tenant (keyed `internal:+1908...`, 2026-11-05) skipped
+            # this check while another profile was texting her. Those are
+            # checked on their destination only (repository.newer_context's
+            # destination_only), never on the wake's own channel.
             return None
         if action.remediation_reason == AGENT_OVERRIDE:
             # The agent already saw this message refused and chose to send it
