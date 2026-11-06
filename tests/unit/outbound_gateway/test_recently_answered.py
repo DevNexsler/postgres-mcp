@@ -328,6 +328,8 @@ async def test_status_lists_no_structured_field_when_none() -> None:
         {"trigger_source": "zoho_cliq"},
         {"trigger_source": "hermes_schedule"},
         {"trigger_source": "internal_qualification"},
+        {"trigger_source": "comms_review_task"},
+        {"trigger_source": "wake_handoff"},
         {"trigger_is_new_question": True},
     ],
 )

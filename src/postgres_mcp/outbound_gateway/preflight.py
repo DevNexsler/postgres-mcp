@@ -58,7 +58,13 @@ RECENTLY_ANSWERED_DETAIL = "recently_answered"
 # How much of the earlier reply's text the refusal quotes.
 RECENTLY_ANSWERED_PREVIEW_CHARS = 300
 # A wake triggered by staff or a schedule: someone asked for this send.
-_REQUESTED_SEND_SOURCES = frozenset({"zoho_cliq", "hermes_schedule", "internal_qualification"})
+# comms_review_task and wake_handoff are Comm-Data-Store internal notices
+# (CDS migrations 284 and 286): a verified comms-review task action, and a staff
+# directive one agent profile handed to another (e.g. a staff DM's "inform the
+# tenant" handed from general-qa to maintenance-supervisor). Both carry a
+# staff-originated request, so an earlier reply to the person is not a reason
+# to refuse it.
+_REQUESTED_SEND_SOURCES = frozenset({"zoho_cliq", "hermes_schedule", "internal_qualification", "comms_review_task", "wake_handoff"})
 
 
 @dataclass(frozen=True)
