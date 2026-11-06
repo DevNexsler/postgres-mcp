@@ -86,7 +86,8 @@ async def traffic(traffic_database):
                 -- migration 204) the probe ignores the wake's own actions.
                 wakeup_event_id bigint DEFAULT 26800,
                 stale_context_shown_refs text[],
-                provider_message_id text
+                provider_message_id text,
+                recipient_scope jsonb  -- {kind, target_id, verified}: the destination
             );
             CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
             CREATE TEMP TABLE hermes_wakeup_events (
@@ -227,7 +228,9 @@ async def test_only_jessicas_endpoints_are_her_context(traffic, sender, recipien
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("channel", "minute", "listed"), [(19, 13, False), (18, 8, False), (18, 9, False), (18, 10, True)])
+# Channel 19 is another line: her text there is still from the destination
+# being texted (2026-11-05: the recipient, not the wake's line, decides).
+@pytest.mark.parametrize(("channel", "minute", "listed"), [(19, 13, True), (19, 4, False), (18, 8, False), (18, 9, False), (18, 10, True)])
 async def test_line_and_watermark_boundaries(traffic, channel, minute, listed):
     conn, repository = traffic
     await add_message(conn, sender=JESSICA, channel=channel, minute=minute)
@@ -431,13 +434,16 @@ async def add_quo_elsewhere(conn, message_id, *, channel=19, minute=13, sent_min
 
 
 @pytest.mark.asyncio
-async def test_her_text_on_another_channel_of_the_same_line_and_conversation_is_listed(traffic):
+async def test_her_text_on_any_channel_line_or_conversation_is_listed_and_gunthers_never(traffic):
+    """Her phone is the destination: a text from it on another channel, Quo
+    line or conversation is news (2026-11-05); Gunther's is not, whatever
+    line he uses."""
     conn, repository = traffic
     await add_quo_elsewhere(conn, 30)
     await add_quo_elsewhere(conn, 31, line="PN-other")
     await add_quo_elsewhere(conn, 32, conversation="CN-other")
     await add_quo_elsewhere(conn, 33, frm=GUNTHER)
-    assert await refs(repository) == ["message:30"]
+    assert sorted(await refs(repository)) == ["message:30", "message:31", "message:32"]
 
 
 @pytest.mark.asyncio
@@ -599,3 +605,126 @@ async def test_reaching_cds_is_received_at_not_the_send_time(traffic):
     # Received before the watermark, it was context.
     await conn.execute("UPDATE messages SET received_at = %s WHERE id = 95", (WATERMARK.replace(minute=8),))
     assert await refs(repository) == []
+
+
+# ----------------------------------------------------------------------------
+# 2026-11-05: two profiles texted one tenant minutes apart, contradicting each
+# other. A maintenance-supervisor wake (her Maintenance-line texts, subject
+# `subject:<hash>`) and a general-qa wake (a staff Cliq directive, subject
+# `prospect:+1...`) each checked only its own subject and its own wake
+# channel; a third, staff-role send (`internal:+1...`) was never checked.
+# ----------------------------------------------------------------------------
+
+TENANT = "+12025550142"
+MAINT_LINE_CHANNEL = 18  # the Quo Maintenance line's channel
+CLIQ_CHANNEL = 50  # the staff Cliq chat that woke general-qa
+
+GENERAL_QA = dict(
+    source="zoho_cliq",
+    channel_id=CLIQ_CHANNEL,
+    prospect_id=f"prospect:{TENANT}",
+    target=DerivedTarget("quo_conversation", TENANT, True),
+    arguments={"text": "A plumber is booked for Monday.", "to_phone": TENANT},
+    recipient_phone=TENANT,
+    provider_account="PN-maintenance",
+    thread_identity="1424728044450751028",
+)
+MAINTENANCE = dict(GENERAL_QA, source="quo", channel_id=MAINT_LINE_CHANNEL, prospect_id="subject:7ab2fbbe", thread_identity="CN-tenant")
+STAFF_ROLE = dict(
+    GENERAL_QA,
+    action_role=ActionRole.INTERNAL_NOTIFICATION,
+    intent_kind=IntentKind.MANUAL_REVIEW_ALERT,
+    prospect_id=f"internal:{TENANT}",
+)
+
+
+async def add_other_profiles_send(conn, *, action_id, subject, to, operation="quo.sms.send", minute=12, state="completed"):
+    created = WATERMARK.replace(minute=minute)
+    await conn.execute(
+        "INSERT INTO outbound_actions (action_id, subject_key, operation, state, created_at, arguments, "
+        "canonical_context, dispatch_started_at, recipient_scope) VALUES (%s,%s,%s,%s,%s,%s,'{}',%s,%s)",
+        (action_id, subject, operation, state, created, Jsonb({"text": "No plumber until Wednesday.", "to_phone": to}),
+         created, Jsonb({"kind": "quo_conversation", "target_id": to, "verified": True})),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("this_wake", "other_subject"),
+    [
+        (GENERAL_QA, "subject:7ab2fbbe"),  # general-qa must see maintenance's text
+        (MAINTENANCE, f"prospect:{TENANT}"),  # and maintenance general-qa's
+        (MAINTENANCE, f"internal:{TENANT}"),  # and a staff-role text to her
+        (STAFF_ROLE, "subject:7ab2fbbe"),  # and the staff-role text everyone else's
+    ],
+)
+async def test_another_profiles_text_to_the_same_phone_is_news_whatever_its_subject(traffic, this_wake, other_subject):
+    conn, repository = traffic
+    other = UUID(int=1105)
+    await add_other_profiles_send(conn, action_id=other, subject=other_subject, to=TENANT)
+    items = await newer(repository, **this_wake)
+    assert [(item.ref, item.label) for item in items] == [(f"action:{other}", "sent by us")]
+
+
+@pytest.mark.asyncio
+async def test_another_profiles_send_to_someone_else_or_by_email_is_not_her_text(traffic):
+    conn, repository = traffic
+    await add_other_profiles_send(conn, action_id=UUID(int=1), subject="subject:other", to=GUNTHER)
+    await add_other_profiles_send(conn, action_id=UUID(int=2), subject="subject:other", to=TENANT, operation="email.send")
+    await add_other_profiles_send(conn, action_id=UUID(int=3), subject="subject:other", to=TENANT, minute=8)  # before the watermark
+    await add_other_profiles_send(conn, action_id=UUID(int=4), subject="subject:other", to=TENANT, state="prepared")
+    await conn.execute("UPDATE outbound_actions SET dispatch_started_at = NULL WHERE action_id = %s", (UUID(int=4),))
+    assert await refs(repository, **GENERAL_QA) == []
+
+
+@pytest.mark.asyncio
+async def test_a_cliq_woken_text_sees_her_newer_text_on_the_maintenance_line(traffic):
+    """General-qa's wake channel is the staff Cliq chat; she wrote on the Quo
+    Maintenance line after the directive it is acting on."""
+    conn, repository = traffic
+    await add_quo_elsewhere(conn, 61, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", conversation="CN-tenant", minute=13)
+    await add_quo_elsewhere(conn, 60, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", minute=4)  # before the directive
+    await add_quo_elsewhere(conn, 62, channel=MAINT_LINE_CHANNEL, frm=GUNTHER, line="PN-maintenance", minute=13)
+    items = await newer(repository, **GENERAL_QA)
+    assert [(item.ref, item.label) for item in items] == [("message:61", "received")]
+
+
+@pytest.mark.asyncio
+async def test_a_cliq_woken_text_sees_maintenances_text_once_ingested(traffic):
+    conn, repository = traffic
+    await add_message(conn, sender=LINE, recipient=TENANT, direction="outbound", channel=MAINT_LINE_CHANNEL, minute=13, message_id=63)
+    assert await refs(repository, **GENERAL_QA) == ["message:63"]
+    # A staff-role text's destination-only check sees it too.
+    assert await refs(repository, **STAFF_ROLE) == ["message:63"]
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_staff_identity_does_not_hide_her_text(traffic):
+    """A Cliq wake can resolve to the staff member who wrote it; the person
+    texted is still the destination."""
+    conn, repository = traffic
+    await conn.execute(
+        "UPDATE hermes_wakeup_events SET envelope = %s WHERE id = 26817",
+        (Jsonb({"identity": {"factbook_entity_uuid": "staff-dan"}}),),
+    )
+    await add_quo_elsewhere(conn, 61, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", minute=13)
+    await add_other_profiles_send(conn, action_id=UUID(int=1105), subject="subject:7ab2fbbe", to=TENANT)
+    assert sorted(await refs(repository, **GENERAL_QA)) == [f"action:{UUID(int=1105)}", "message:61"]
+
+
+@pytest.mark.asyncio
+async def test_a_staff_role_text_is_checked_on_its_destination_only(traffic):
+    """Not on its wake's Cliq chat or subject: those are not her conversation."""
+    conn, repository = traffic
+    await conn.execute(
+        "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source) "
+        "VALUES (70,%s,%s,%s,%s,'inbound','also check unit 2','zoho_cliq')",
+        (CLIQ_CHANNEL, WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), WATERMARK.replace(minute=11)),
+    )
+    await add_other_profiles_send(conn, action_id=UUID(int=6), subject=f"internal:{TENANT}", to=GUNTHER)
+    assert await refs(repository, **STAFF_ROLE) == []
+    # The same wake's customer reply still matches its subject as before (a
+    # text's own-channel match was always her phone's Quo messages only).
+    assert await refs(repository, **dict(GENERAL_QA, prospect_id=f"internal:{TENANT}")) == [f"action:{UUID(int=6)}"]
+    await add_quo_elsewhere(conn, 71, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", minute=13)
+    assert await refs(repository, **STAFF_ROLE) == ["message:71"]

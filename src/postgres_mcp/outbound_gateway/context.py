@@ -166,6 +166,34 @@ class ActionContext:
     cross_channel_duplicate_message_ids: tuple[int, ...] = ()
     certified_older_message_ids: tuple[int, ...] = ()
 
+    @property
+    def destination_key(self) -> str | None:
+        """The person this send reaches, keyed on the destination itself
+        (destination_key()), never on the wake that produced it."""
+        return destination_key(self.operation, self.target.target_id)
+
+
+def destination_key(operation: Operation, target_id: str | None) -> str | None:
+    """The canonical key of a customer-facing send's actual destination:
+    `phone:+E164` for a text, `email:<address>` for an email; None for every
+    other operation (a Cliq post, a calendar or TenantCloud write).
+
+    prospect_id (the outbound-action subject) is derived from the WAKE, so one
+    tenant's phone was `subject:<hash>` on a maintenance wake, `prospect:+1...`
+    on a general-qa wake and `internal:+1...` on a staff-role send
+    (2026-11-05): checks keyed on it never saw the other profile's texts.
+    Cross-wake collision checks key on this instead."""
+    target = (target_id or "").strip()
+    if not target:
+        return None
+    if operation is Operation.QUO_SMS_SEND:
+        phone = normalize_phone(target)
+        return f"phone:{phone}" if phone else None
+    if operation is Operation.EMAIL_SEND:
+        address = target.casefold()
+        return f"email:{address}" if _EMAIL.fullmatch(address) else None
+    return None
+
 
 def normalize_string(value: str) -> str:
     return normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))

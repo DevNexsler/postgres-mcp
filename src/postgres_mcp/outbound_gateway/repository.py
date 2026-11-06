@@ -258,12 +258,29 @@ class OutboundGatewayRepository:
         "tell me a short story" and "9+4" in one turn; the story sent for
         27458 made 27459's "13" stale twice, and it went out 3.5 min late.
 
+        Destination, whatever the wake: a text or an email reaches a person
+        at a destination (ActionContext.destination_key), and two profiles
+        woken by different events reach that person under different subject
+        keys and channels. So, whether or not identity resolved, also new:
+        a message received from, or sent to, that phone (on any Quo line) or
+        address since the context was built -- on the wake's own channel
+        after the watermark, elsewhere after the message being answered --
+        and another turn's gateway send to the same destination that started
+        dispatch after the watermark. A tenant, 2026-11-05: a
+        maintenance-supervisor wake (her Maintenance-line texts) and a
+        general-qa wake (a staff Cliq directive) texted her minutes apart;
+        each send was keyed on its own wake's subject and the general-qa
+        check looked only at the Cliq channel, so neither saw the other's
+        texts or her newer replies. A staff-role (internal_notification)
+        text or email is checked on its destination only.
+
         waive_shown leaves out what this turn's agent was already shown for
         this recipient (migration 192), by identity (the shown-refs ledger,
         unrelated to CDS person identity above).
 
         as_of: replay only -- the world as it stood at that time."""
         target = outbound_target(context)
+        destination = probe_destination(context)
         rows = await SafeSqlDriver.execute_param_query(
             self._driver,
             """
@@ -287,7 +304,10 @@ class OutboundGatewayRepository:
                     {}::text AS sent_match,
                     {}::text AS sent_recipient,
                     {}::boolean AS waive_shown,
-                    {}::timestamptz AS as_of
+                    {}::timestamptz AS as_of,
+                    {}::text AS dest_kind,
+                    {}::text AS dest_value,
+                    {}::boolean AS destination_only
             ), watermark AS (
                 SELECT coalesce(event.webui_accepted_at, event.created_at) AS at
                 FROM hermes_wakeup_events AS event, p
@@ -365,6 +385,8 @@ class OutboundGatewayRepository:
                     sender.participant_type,
                     sender.participant_key,
                     sender.display_name,
+                    dest.dest_from,
+                    dest.dest_to,
                     CASE
                         WHEN lower(coalesce(
                             message.direction,
@@ -380,6 +402,58 @@ class OutboundGatewayRepository:
                 CROSS JOIN identity
                 LEFT JOIN raw_events AS raw ON raw.id = message.raw_event_id
                 LEFT JOIN participants AS sender ON sender.id = message.sender_participant_id
+                -- This send's destination (p.dest_kind/dest_value), whatever
+                -- the wake: a text from or to that phone on any Quo line
+                -- (last ten digits, either endpoint shape), an email from or
+                -- to that address. Never true without a destination.
+                CROSS JOIN LATERAL (
+                    SELECT
+                        coalesce(CASE p.dest_kind
+                            WHEN 'phone' THEN lower(message.source) IN ('quo', 'openphone') AND EXISTS (
+                                SELECT 1
+                                FROM jsonb_array_elements_text(
+                                    CASE jsonb_typeof(raw.payload#>'{{data,object,from}}')
+                                        WHEN 'array' THEN raw.payload#>'{{data,object,from}}'
+                                        WHEN 'string' THEN jsonb_build_array(raw.payload#>'{{data,object,from}}')
+                                        ELSE '[]'::jsonb
+                                    END
+                                ) AS endpoint(value)
+                                WHERE right(regexp_replace(endpoint.value, '[^0-9]', '', 'g'), 10) = p.dest_value
+                            )
+                            WHEN 'email' THEN lower(btrim(coalesce(sender.participant_key, ''))) = p.dest_value
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM jsonb_array_elements(
+                                        CASE WHEN jsonb_typeof(raw.payload->'participants') = 'array'
+                                             THEN raw.payload->'participants' ELSE '[]'::jsonb END
+                                    ) AS party(value)
+                                    WHERE lower(coalesce(party.value->>'kind', '')) = 'from'
+                                      AND lower(btrim(coalesce(party.value->>'address', ''))) = p.dest_value
+                                )
+                        END, false) AS dest_from,
+                        coalesce(CASE p.dest_kind
+                            WHEN 'phone' THEN lower(message.source) IN ('quo', 'openphone') AND EXISTS (
+                                SELECT 1
+                                FROM jsonb_array_elements_text(
+                                    CASE jsonb_typeof(raw.payload#>'{{data,object,to}}')
+                                        WHEN 'array' THEN raw.payload#>'{{data,object,to}}'
+                                        WHEN 'string' THEN jsonb_build_array(raw.payload#>'{{data,object,to}}')
+                                        ELSE '[]'::jsonb
+                                    END
+                                ) AS endpoint(value)
+                                WHERE right(regexp_replace(endpoint.value, '[^0-9]', '', 'g'), 10) = p.dest_value
+                            )
+                            WHEN 'email' THEN EXISTS (
+                                SELECT 1
+                                FROM jsonb_array_elements(
+                                    CASE WHEN jsonb_typeof(raw.payload->'participants') = 'array'
+                                         THEN raw.payload->'participants' ELSE '[]'::jsonb END
+                                ) AS party(value)
+                                WHERE lower(coalesce(party.value->>'kind', '')) IN ('to', 'cc', 'bcc')
+                                  AND lower(btrim(coalesce(party.value->>'address', ''))) = p.dest_value
+                            )
+                        END, false) AS dest_to
+                ) AS dest
                 -- received_at is when a message reached CDS. created_at is a
                 -- generated alias of sent_at, and a web-extract scrape's
                 -- sent_at is the scraped timestamp, a day before it lands.
@@ -389,6 +463,7 @@ class OutboundGatewayRepository:
                           -- Identity resolved: any other wake CDS resolved to
                           -- the same person, whatever its channel or source.
                           identity.entity_uuid IS NOT NULL
+                          AND NOT p.destination_only
                           AND EXISTS (
                               SELECT 1 FROM identity_wakes
                               WHERE identity_wakes.message_id = message.id
@@ -397,8 +472,14 @@ class OutboundGatewayRepository:
                       )
                       OR (
                           -- No resolved identity: today's channel matching,
-                          -- unchanged.
-                          identity.entity_uuid IS NULL
+                          -- unchanged. With or without identity: anything
+                          -- from or to this send's destination, on the same
+                          -- timing (a staff-role text: only that).
+                          (
+                              (identity.entity_uuid IS NULL AND NOT p.destination_only)
+                              OR dest.dest_from
+                              OR dest.dest_to
+                          )
                           AND (
                               -- The wake's own channel is in the agent's
                               -- context up to the watermark; anything that
@@ -443,7 +524,9 @@ class OutboundGatewayRepository:
                 FROM candidate, p
                 WHERE candidate.direction <> 'outbound'
                   AND (
-                      (
+                      -- From this send's destination, on any channel or line.
+                      candidate.dest_from
+                      OR (
                           candidate.channel_id = p.channel_id
                           AND (
                               -- A Quo channel is a shared business line, not a
@@ -534,7 +617,11 @@ class OutboundGatewayRepository:
                 CROSS JOIN p
                 JOIN channels AS candidate_channel ON candidate_channel.id = candidate.channel_id
                 WHERE candidate.direction = 'outbound'
-                  AND candidate.source = ANY(p.sent_sources)
+                  AND (
+                  -- To this send's destination, from any line or mailbox.
+                  candidate.dest_to
+                  OR (
+                  candidate.source = ANY(p.sent_sources)
                   AND CASE p.sent_match
                       WHEN 'email' THEN EXISTS (
                           SELECT 1
@@ -564,6 +651,7 @@ class OutboundGatewayRepository:
                       WHEN 'channel' THEN candidate_channel.source_channel_id = p.sent_recipient
                       ELSE false
                   END
+                  ))
             ), retry_lineage AS (
                 SELECT action.action_id, action.retry_of_action_id
                 FROM outbound_actions AS action, p
@@ -627,6 +715,7 @@ class OutboundGatewayRepository:
                 CROSS JOIN watermark
                 CROSS JOIN identity
                 WHERE identity.entity_uuid IS NULL
+                  AND NOT p.destination_only
                   AND ledger.subject_key = p.subject
                   AND NOT EXISTS (
                       SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
@@ -652,11 +741,40 @@ class OutboundGatewayRepository:
                 CROSS JOIN p
                 CROSS JOIN watermark
                 WHERE ledger.created_at > watermark.at
+                  AND NOT p.destination_only
                   AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
                   AND NOT EXISTS (
                       SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
                   )
                   AND ledger.state = ANY(ARRAY['completed', 'dispatching', 'unknown', 'reconciling', 'provider_accepted'])
+                  AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
+            ), destination_sent AS (
+                -- Another turn's gateway send to this send's destination --
+                -- whatever wake, profile, role or subject key produced it --
+                -- that started dispatch after the watermark (it may not be
+                -- ingested back as a message yet). The subject-keyed match
+                -- above is kept; this one is what crosses profiles.
+                SELECT
+                    ledger.action_id,
+                    ledger.operation,
+                    ledger.created_at,
+                    left(coalesce(ledger.arguments->>'text', ledger.arguments::text, ''), 300) AS preview
+                FROM outbound_actions AS ledger
+                CROSS JOIN p
+                CROSS JOIN watermark
+                WHERE p.dest_kind IS NOT NULL
+                  AND ledger.operation = CASE p.dest_kind WHEN 'phone' THEN 'quo.sms.send' ELSE 'email.send' END
+                  AND CASE p.dest_kind
+                      WHEN 'phone' THEN right(regexp_replace(
+                          coalesce(ledger.recipient_scope->>'target_id', ''), '[^0-9]', '', 'g'), 10)
+                      ELSE lower(btrim(coalesce(ledger.recipient_scope->>'target_id', '')))
+                  END = p.dest_value
+                  AND NOT EXISTS (
+                      SELECT 1 FROM turn WHERE turn.wakeup_event_id = ledger.wakeup_event_id
+                  )
+                  AND ledger.created_at > watermark.at
+                  AND (p.as_of IS NULL OR ledger.created_at <= p.as_of)
+                  AND (ledger.dispatch_started_at IS NOT NULL OR ledger.state = 'completed')
                   AND ledger.action_id NOT IN (SELECT retry_lineage.action_id FROM retry_lineage)
             ), found AS (
                 SELECT 'message:' || id AS ref, id AS message_id, NULL::uuid AS action_id, created_at,
@@ -670,6 +788,10 @@ class OutboundGatewayRepository:
                 SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
                        'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
                 FROM identity_sent
+                UNION
+                SELECT 'action:' || action_id, NULL::bigint, action_id, created_at,
+                       'outbound', 'outbound_actions', 'outbound gateway (' || operation || ')', preview
+                FROM destination_sent
             )
             SELECT found.*
             FROM found
@@ -697,6 +819,9 @@ class OutboundGatewayRepository:
                 target.recipient,
                 waive_shown,
                 as_of,
+                destination.kind,
+                destination.value,
+                destination.only,
                 max(1, int(limit)),
             ],
         )
@@ -715,6 +840,30 @@ class OutboundGatewayRepository:
 
 
 _ZILLOW_FAMILY = frozenset({"hotpads", "zillow", "zumper"})
+
+
+@dataclass(frozen=True)
+class ProbeDestination:
+    """How newer_context matches this send's destination
+    (ActionContext.destination_key): kind `phone` (value: the last ten
+    digits, the same as Comm-Data-Store's contact_key) or `email` (value: the
+    address), or kind None. `only`: a staff-role send, checked on its
+    destination alone -- its wake's channel and subject are not its
+    recipient's conversation (stale_context.check)."""
+
+    kind: str | None
+    value: str | None
+    only: bool
+
+
+def probe_destination(context: ActionContext) -> ProbeDestination:
+    key = context.destination_key
+    if key is None:
+        return ProbeDestination(kind=None, value=None, only=False)
+    kind, _, value = key.partition(":")
+    if kind == "phone":
+        value = "".join(character for character in value if character.isdigit())[-10:]
+    return ProbeDestination(kind=kind, value=value, only=context.action_role is ActionRole.INTERNAL_NOTIFICATION)
 
 
 @dataclass(frozen=True)

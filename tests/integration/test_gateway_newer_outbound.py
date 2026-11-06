@@ -153,7 +153,7 @@ SCHEMA = """
         action_id uuid PRIMARY KEY, wakeup_event_id bigint, action_role text, operation text,
         state text, subject_key text, created_at timestamptz, arguments jsonb,
         canonical_context jsonb, dispatch_started_at timestamptz, retry_of_action_id uuid,
-        stale_context_shown_refs text[], provider_message_id text
+        stale_context_shown_refs text[], provider_message_id text, recipient_scope jsonb
     );
     CREATE TEMP TABLE agency_identifiers (kind text, value text, label text);
     -- These scenario rows reach CDS when they are sent.
