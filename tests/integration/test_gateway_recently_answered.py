@@ -526,7 +526,7 @@ async def test_a_new_question_after_our_reply_is_marked_new(conn, store) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["zoho_cliq", "hermes_schedule"])
+@pytest.mark.parametrize("source", ["zoho_cliq", "hermes_schedule", "comms_review_task", "wake_handoff"])
 async def test_a_staff_directive_or_a_schedule_carries_its_trigger_source(conn, store, source) -> None:
     await amy(conn)
     await message(conn, 860002, source, at("2026-10-09 01:20:00"), 407, "send Amy the application link")

@@ -139,6 +139,9 @@ def test_an_earlier_reply_to_this_person_is_a_recently_answered_refusal():
         RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="zoho_cliq"),
         RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="hermes_schedule"),
         RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="internal_qualification"),
+        # CDS internal notices: a comms-review task action and a handed-off staff directive.
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="comms_review_task"),
+        RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="wake_handoff"),
         RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="quo", trigger_is_new_question=True),
     ],
 )
@@ -146,6 +149,22 @@ def test_no_reply_a_requested_send_or_a_new_question_is_ready(answered):
     decision = SafetyPreflight.evaluate(context(intent_kind=IntentKind.INQUIRY_REPLY), evidence(), answered)
 
     assert decision.outcome is PreflightOutcome.READY
+
+
+def test_a_handed_off_staff_directive_to_a_just_answered_tenant_is_ready():
+    """2026-11-05: maintenance-supervisor answered Christina Santiago on the
+    Maintenance line; Joycelyn's DM "inform tenant it has to be done Monday"
+    is handed to maintenance-supervisor as a CDS wake_handoff notice (CDS
+    migration 286). That send is staff-requested, so the earlier reply does not
+    refuse it; the same reply against her own repeated text still does."""
+    handed_off = RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="wake_handoff")
+    her_repeat = RecentlyAnsweredEvidence(replies=(EARLIER_REPLY,), trigger_source="quo")
+
+    ready = SafetyPreflight.evaluate(context(intent_kind=IntentKind.INQUIRY_REPLY), evidence(), handed_off)
+    refused = SafetyPreflight.evaluate(context(intent_kind=IntentKind.INQUIRY_REPLY), evidence(), her_repeat)
+
+    assert ready.outcome is PreflightOutcome.READY
+    assert (refused.outcome, refused.detail_code) == (PreflightOutcome.REFUSED, RECENTLY_ANSWERED_DETAIL)
 
 
 @pytest.mark.parametrize("role", list(ActionRole))
