@@ -41,10 +41,10 @@ def context(**overrides):
         source_sent_at=NOW,
         conversation_id="conversation:zillow-1",
         conversation_watermark=700,
-        prospect_id="prospect:amanda",
-        aliases=("email:amanda@example.com",),
-        property_id="building:bullman-st",
-        property_label="138 Bullman St #144-A",
+        prospect_id="prospect:zara",
+        aliases=("email:zara@example.com",),
+        property_id="building:samplewood-st",
+        property_label="138 Samplewood St #144-A",
         target=DerivedTarget("email_thread", "lead@convo.zillow.com", True),
         provider_account="nigel-zoho",
         routing_policy_version="v1",
@@ -103,16 +103,16 @@ async def test_the_evidence_loader_reads_the_calendar_dependency_only(state):
     [
         # wake 27279: an email's target is its address, whatever the wake's source
         (
-            {"source": "cliq", "target": DerivedTarget("email_thread", "YTryboujee@Gmail.com", True)},
-            OutboundTarget(("zoho_mail", "nigel_mail"), "email", "ytryboujee@gmail.com"),
+            {"source": "cliq", "target": DerivedTarget("email_thread", "Nico-Prospect@example.com", True)},
+            OutboundTarget(("zoho_mail", "nigel_mail"), "email", "nico-prospect@example.com"),
         ),
         (
-            {"operation": Operation.QUO_SMS_SEND, "target": DerivedTarget("quo_conversation", "(516) 859-4333", True)},
-            OutboundTarget(("quo", "openphone"), "sms", "15168594333"),
+            {"operation": Operation.QUO_SMS_SEND, "target": DerivedTarget("quo_conversation", "(516) 555-0133", True)},
+            OutboundTarget(("quo", "openphone"), "sms", "15165550133"),
         ),
         (
-            {"operation": Operation.CLIQ_CHAT_POST, "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
-            OutboundTarget(("zoho_cliq",), "channel", "1424728044450751028"),
+            {"operation": Operation.CLIQ_CHAT_POST, "target": DerivedTarget("cliq_chat", "1000000000000000028", True)},
+            OutboundTarget(("zoho_cliq",), "channel", "1000000000000000028"),
         ),
         (
             {"operation": Operation.TENANTCLOUD_MESSAGE_SEND, "target": DerivedTarget("tenantcloud_thread", "1861792", True)},
@@ -121,13 +121,13 @@ async def test_the_evidence_loader_reads_the_calendar_dependency_only(state):
         # an internal reply answers in its own chat: our other posts there count
         (
             {"action_role": ActionRole.INTERNAL_REPLY, "operation": Operation.CLIQ_CHAT_POST,
-             "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
-            OutboundTarget(("zoho_cliq",), "channel", "1424728044450751028"),
+             "target": DerivedTarget("cliq_chat", "1000000000000000028", True)},
+            OutboundTarget(("zoho_cliq",), "channel", "1000000000000000028"),
         ),
         # a notification's chat carries other subjects' notifications: never context
         (
             {"action_role": ActionRole.INTERNAL_NOTIFICATION, "operation": Operation.CLIQ_CHAT_POST,
-             "target": DerivedTarget("cliq_chat", "1424728044450751028", True)},
+             "target": DerivedTarget("cliq_chat", "1000000000000000028", True)},
             OutboundTarget((), "none", ""),
         ),
         (

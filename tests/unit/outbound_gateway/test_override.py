@@ -796,7 +796,7 @@ async def test_restate_waits_on_a_live_row_after_a_pre_send_error_instead_of_end
 async def test_a_staff_post_on_a_split_prospects_wake_keys_on_its_recipient(role, operation, intent):
     """Wake 27865: the manual_review_alert about the split prospect was
     itself refused, because it carried that prospect's aliases."""
-    dm = context_tests.record(event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="1424728044450751028", channel_type="dm")
+    dm = context_tests.record(event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="1000000000000000028", channel_type="dm")
     repository = context_tests.FakeRepository(dm, ambiguous=True)
     loader = ActionContextLoader(repository, context_tests.policy())
 
@@ -806,13 +806,13 @@ async def test_a_staff_post_on_a_split_prospects_wake_keys_on_its_recipient(role
             operation=operation,
             intent_kind=intent,
             appointment_slot=None,
-            arguments={"channel_or_chat_id": "1424728044450751028", "text": "split prospect, please check"},
+            arguments={"channel_or_chat_id": "1000000000000000028", "text": "split prospect, please check"},
         )
     )
 
-    assert ctx.prospect_id == "internal:1424728044450751028"
+    assert ctx.prospect_id == "internal:1000000000000000028"
     assert ctx.aliases == ()
-    assert ctx.canonical_context["prospect_id"] == "internal:1424728044450751028"
+    assert ctx.canonical_context["prospect_id"] == "internal:1000000000000000028"
     assert repository.alias_calls == []
 
 
@@ -827,7 +827,7 @@ async def test_a_prospect_reply_on_a_split_prospects_wake_passes_every_alias_to_
 
     assert ctx.prospect_id == "prospect:factbook:aa1a1515-7929-4f17-a632-ec89c32f5895"
     assert "factbook:aa1a1515-7929-4f17-a632-ec89c32f5895" in ctx.aliases
-    assert "email:amanda.abc@convo.zillow.com" in ctx.aliases
+    assert "email:zara.abc@convo.zillow.com" in ctx.aliases
     assert len(repository.alias_calls) == 1
 
 
@@ -837,14 +837,14 @@ async def test_a_prospect_is_never_named_by_a_hub_alias():
     outbound_alias_is_hub, applied by the resolver's query) never name the
     prospect -- not as its subject, not as its fallback alias."""
     wake = context_tests.record(
-        envelope={"identity": {}, "message": {"prospect_name": "x", "property": "138 Bullman St #144-A", "direct_email": "noreply@tenantcloud.com"}},
+        envelope={"identity": {}, "message": {"prospect_name": "x", "property": "138 Sample St #144-A", "direct_email": "noreply@tenantcloud.com"}},
         participant_type="email_address",
         participant_key="noreply@tenantcloud.com",
     )
     hubs = ("email:noreply@tenantcloud.com",)
     only_hubs = await ActionContextLoader(context_tests.FakeRepository(wake, hubs=hubs), context_tests.policy()).load(context_tests.request())
     mixed = await ActionContextLoader(
-        context_tests.FakeRepository(context_tests.record(), hubs=("email:amandasnyder@live.com",), ambiguous=True),
+        context_tests.FakeRepository(context_tests.record(), hubs=("email:zarasamplerson@example.com",), ambiguous=True),
         context_tests.policy(),
     ).load(context_tests.request())
 
@@ -860,7 +860,7 @@ async def test_the_subject_resolver_leaves_hub_aliases_to_the_database_rule():
     driver = object()
     rows = [SimpleNamespace(cells={"personal_aliases": ["phone:+19085550100"], "canonical_subject": None})]
     with patch("postgres_mcp.outbound_gateway.repository.SafeSqlDriver.execute_param_query", AsyncMock(return_value=rows)) as query:
-        resolved = await OutboundGatewayRepository(driver).resolve_canonical_subject(("email:dan@pfg.io", "phone:+19085550100"), "")
+        resolved = await OutboundGatewayRepository(driver).resolve_canonical_subject(("email:staff-a@pfg.io", "phone:+19085550100"), "")
 
     assert "NOT outbound_alias_is_hub(alias)" in query.await_args.args[1]
     assert resolved == AliasResolution(canonical_subject=None, personal_aliases=("phone:+19085550100",))
@@ -896,7 +896,7 @@ def quo_harness():
 def quo_execute(**arguments) -> dict[str, Any]:
     return {
         "op": "execute", "wakeup_event_id": WAKE, "action_role": "prospect_reply", "operation": "quo.sms.send",
-        "intent_kind": "inquiry_reply", "arguments": {"to_phone": "+12015756789", "text": "Notice to Quit attached.", **arguments},
+        "intent_kind": "inquiry_reply", "arguments": {"to_phone": "+12015550189", "text": "Notice to Quit attached.", **arguments},
     }
 
 
@@ -905,7 +905,7 @@ def quo_execute(**arguments) -> dict[str, Any]:
     ("arguments", "why"),
     [
         ({}, "from_phone is missing. Nothing was sent: quo.sms.send must name the line to send from."),
-        ({"from_phone": "+17623726083"}, "from_phone +17623726083 is not a line the gateway can send from. Nothing was sent."),
+        ({"from_phone": "+17625550183"}, "from_phone +17625550183 is not a line the gateway can send from. Nothing was sent."),
     ],
     ids=["missing", "listing"],
 )
@@ -922,7 +922,7 @@ async def test_a_text_without_a_line_it_can_send_from_is_a_refused_result_with_i
     body = result.structuredContent or {}
     assert (body["status"], body["detail_code"]) == ("rejected", "request_refused")
     assert body["detail"] == (
-        f"{why} Lines it can send from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
+        f"{why} Lines it can send from: +16105550175, +17575550130, +14845550120. Send again with one of them as from_phone."
     )
     assert_no_override(body)
     assert store.rows == {} and adapter.sent == []
@@ -932,11 +932,11 @@ async def test_a_text_without_a_line_it_can_send_from_is_a_refused_result_with_i
 async def test_a_text_naming_its_line_sends_from_that_line():
     service, store, adapter = quo_harness()
 
-    result = await call(service, quo_execute(from_phone=" +17579972130 "), routed=frozenset())
+    result = await call(service, quo_execute(from_phone=" +17575550130 "), routed=frozenset())
 
     assert result["status"] == "sent"
-    assert adapter._current.provider_account == "PNkmv4nD54"
-    assert adapter._current.arguments["from_phone"] == "+17579972130"
+    assert adapter._current.provider_account == "PNfakeBBB2"
+    assert adapter._current.arguments["from_phone"] == "+17575550130"
 
 
 @pytest.mark.asyncio
@@ -947,7 +947,7 @@ async def test_an_override_of_a_text_recorded_before_from_phone_sends_from_its_r
     the override again, and refused again."""
     service, store, adapter = quo_harness()
     old = parse_outbound_request(quo_execute())
-    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PNfakeAAA1"))
     store._put(replace(recorded, state=ActionState.REJECTED, detail_code="gateway_refused", error_detail="ambiguous aliases"))
     assert "from_phone" not in recorded.arguments
 
@@ -955,24 +955,24 @@ async def test_an_override_of_a_text_recorded_before_from_phone_sends_from_its_r
 
     assert result["status"] == "pending"
     successor = store.successor_of(recorded.action_id)
-    assert (successor.state, successor.provider_account) == (ActionState.PREPARED, "PN8ujudrpa")
+    assert (successor.state, successor.provider_account) == (ActionState.PREPARED, "PNfakeAAA1")
     sent = await service.resume(successor.action_id)
     assert sent.status is PublicStatus.SENT
-    assert adapter._current.provider_account == "PN8ujudrpa"
+    assert adapter._current.provider_account == "PNfakeAAA1"
     assert "from_phone" not in adapter._current.arguments
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("recorded_account", ["PNtjMqMO2h", ""], ids=["listing", "none"])
+@pytest.mark.parametrize("recorded_account", ["PNfakeDDD4", ""], ids=["listing", "none"])
 async def test_an_override_of_a_text_recorded_on_a_line_outside_the_map_is_refused_before_any_successor(recorded_account):
-    """250 stored texts sit on PFG Listing (PNtjMqMO2h, banned 2026-09-11)
+    """250 stored texts sit on PFG Listing (PNfakeDDD4, banned 2026-09-11)
     and two on no line at all (wake 27269). Overriding one must neither send
     from that line nor mint a successor that is refused for it and offered
     the override again: the confirm itself is refused, with no override,
     pointing at a new execute that names its line."""
     service, store, adapter = quo_harness()
     old = parse_outbound_request(quo_execute())
-    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PNfakeAAA1"))
     store._put(replace(
         recorded, provider_account=recorded_account, state=ActionState.DEFINITIVE_FAILED,
         detail_code="operator_non_acceptance_evidence", error_detail="not accepted",
@@ -984,7 +984,7 @@ async def test_an_override_of_a_text_recorded_on_a_line_outside_the_map_is_refus
     assert result["detail"].startswith(
         f"confirm refused for action {recorded.action_id}: this text was recorded on a line the gateway does not "
         "send from, and an override cannot change its line. Nothing was sent. Lines it can send from: "
-        "+16107095575, +17579972130, +14846260220. Execute it as a new message with one of them as from_phone."
+        "+16105550175, +17575550130, +14845550120. Execute it as a new message with one of them as from_phone."
     )
     assert_no_override(result)
     assert store.successor_of(recorded.action_id) is None
@@ -999,7 +999,7 @@ async def test_repeating_a_text_recorded_before_from_phone_is_that_same_action_n
     twice. The repeat finds its stored twin and is answered as that action."""
     service, store, adapter = quo_harness()
     old = parse_outbound_request(quo_execute())
-    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PN8ujudrpa"))
+    recorded = await store.create_or_load(await service._context_loader.load(old, recorded_account="PNfakeAAA1"))
     store._put(replace(
         recorded, state=ActionState.COMPLETED, completion_kind=CompletionKind.SENT, detail_code="provider_accepted",
         provider_accepted_at=stale_tests.EXECUTED_AT,

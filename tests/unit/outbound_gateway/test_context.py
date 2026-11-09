@@ -65,7 +65,7 @@ def record(**overrides):
         "source_message_id": "mail-700",
         "message_sent_at": datetime(2026, 7, 15, 22, 20, tzinfo=timezone.utc),
         "message_updated_at": datetime(2026, 7, 15, 22, 21, tzinfo=timezone.utc),
-        "subject": "Zillow inquiry for 138 Bullman St #144-A",
+        "subject": "Zillow inquiry for 138 Samplewood St #144-A",
         "body": "I would like to schedule a tour.",
         "user_account_id": "nigel-zoho",
         "channel_id": 44,
@@ -74,15 +74,15 @@ def record(**overrides):
         "channel_name": "INBOX",
         "sender_participant_id": 55,
         "participant_type": "email_address",
-        "participant_key": "AmandaSnyder@live.com",
-        "display_name": "Amanda Snyder",
+        "participant_key": "ZaraSamplerson@example.com",
+        "display_name": "Zara Samplerson",
         "envelope": {
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
             "message": {
-                "prospect_name": "Amanda Snyder",
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "amanda.abc@convo.zillow.com",
-                "direct_email": "AmandaSnyder@live.com",
+                "prospect_name": "Zara Samplerson",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "zara.abc@convo.zillow.com",
+                "direct_email": "ZaraSamplerson@example.com",
                 "phone": "+1 (908) 555-0100",
             },
         },
@@ -93,9 +93,9 @@ def record(**overrides):
 
 
 # CDS's compose default (prod channels table): PFG-General, Collections,
-# Maintenance. Listing (+17623726083) is deliberately absent.
-PFG_GENERAL, COLLECTIONS, MAINTENANCE, LISTING = "+16107095575", "+17579972130", "+14846260220", "+17623726083"
-SENDING_LINES = {PFG_GENERAL: "PN8ujudrpa", COLLECTIONS: "PNkmv4nD54", MAINTENANCE: "PNvHh9Fq2k"}
+# Maintenance. Listing (+17625550183) is deliberately absent.
+PFG_GENERAL, COLLECTIONS, MAINTENANCE, LISTING = "+16105550175", "+17575550130", "+14845550120", "+17625550183"
+SENDING_LINES = {PFG_GENERAL: "PNfakeAAA1", COLLECTIONS: "PNfakeBBB2", MAINTENANCE: "PNfakeCCC3"}
 
 
 def policy():
@@ -109,8 +109,8 @@ def policy():
         calendar_by_profile={"appointment-setter": "nigel"},
         cliq_target_by_intent={"lead_alert": "tenant-leads"},
         conversation_aliases={
-            "zillow:zrm-thread-44": "conversation:zillow-amanda-bullman",
-            "hotpads:zrm-thread-44": "conversation:zillow-amanda-bullman",
+            "zillow:zrm-thread-44": "conversation:zillow-zara-samplewood",
+            "hotpads:zrm-thread-44": "conversation:zillow-zara-samplewood",
         },
         quo_sending_lines=SENDING_LINES,
     )
@@ -140,7 +140,7 @@ def request(**overrides) -> ExecuteRequest:
         "operation": "email.send",
         "intent_kind": "showing_offer",
         "appointment_slot": "2026-07-17T10:30:00-04:00",
-        "arguments": {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"},
+        "arguments": {"to_address": "zara.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel"},
     }
     payload.update(overrides)
     parsed = parse_outbound_request(payload)
@@ -293,14 +293,14 @@ async def test_suggest_targets_returns_claim_linked_provider_ids(family, entity_
 @pytest.mark.parametrize(
     ("entity_scope_key", "expected"),
     [
-        ("tenantcloud:lead:1574439", {"lead_id": "1574439"}),
+        ("tenantcloud:lead:9000001", {"lead_id": "9000001"}),
         ("tenantcloud:maintenance-request:1322814", {"request_id": "1322814"}),
-        ("lead:2398947", {"lead_id": "2398947"}),
-        ("tc-lead:2399346", {"lead_id": "2399346"}),
+        ("lead:9000002", {"lead_id": "9000002"}),
+        ("tc-lead:9000003", {"lead_id": "9000003"}),
         ("tc:christy-moreno-317-s-main-apt-4", {}),
-        ("tenantcloud-prospect:2398368", {"lead_id": "2398368"}),
-        ("tenantcloud-lead:2398947", {"lead_id": "2398947"}),
-        ("phone:17328017005", {}),
+        ("tenantcloud-prospect:9000004", {"lead_id": "9000004"}),
+        ("tenantcloud-lead:9000002", {"lead_id": "9000002"}),
+        ("phone:17325550105", {}),
     ],
 )
 async def test_suggest_targets_parses_real_production_entity_scope_key_prefixes(entity_scope_key, expected):
@@ -465,12 +465,12 @@ async def test_tenantcloud_operation_allowlist_keys_on_operation_not_wake_shape(
         "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
         "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
         "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
+        "arguments": {"lead_id": 9000005, "status": "working"},
     })
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(exec_request)
 
-    assert context.target.target_id == "2405115"
+    assert context.target.target_id == "9000005"
     assert context.provider_account == "tenantcloud"
 
 
@@ -491,7 +491,7 @@ async def test_tenantcloud_claim_bookkeeping_never_bakes_the_literal_string_none
         "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
         "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
         "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
+        "arguments": {"lead_id": 9000005, "status": "working"},
     })
     assert event.tenantcloud_claim_id is None
 
@@ -514,31 +514,31 @@ async def test_tenantcloud_target_comes_from_arguments_on_any_wake_shape():
         "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
         "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
         "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
+        "arguments": {"lead_id": 9000005, "status": "working"},
     })
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
     assert context.target.kind == "tenantcloud_lead"
-    assert context.target.target_id == "2405115"
+    assert context.target.target_id == "9000005"
     assert context.target.verified is True
     assert context.provider_account == "tenantcloud"
 
 
 @pytest.mark.asyncio
 async def test_execute_ignores_a_target_that_disagrees_with_the_wake():
-    """The wake's own claim says lead 999; the agent says 2405115. The agent wins."""
+    """The wake's own claim says lead 999; the agent says 9000005. The agent wins."""
     event = tenantcloud_record(wakeup_event_id=1, entity_ids={"lead_id": "999"})
     request = parse_outbound_request({
         "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
         "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
         "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
+        "arguments": {"lead_id": 9000005, "status": "working"},
     })
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request)
 
-    assert context.target.target_id == "2405115"
+    assert context.target.target_id == "9000005"
 
 
 @pytest.mark.asyncio
@@ -588,9 +588,9 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 envelope={
                     "identity": {},
                     "message": {
-                        "property": "144 Bullman Street",
+                        "property": "144 Samplewood Street",
                         "proxy_email": "lead.123@convo.zillow.com",
-                        "direct_email": "AmandaSnyder@live.com",
+                        "direct_email": "ZaraSamplerson@example.com",
                     },
                 },
             ),
@@ -621,7 +621,7 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
             ),
             "quo_conversation",
             "+19085551234",
-            "PN8ujudrpa",
+            "PNfakeAAA1",
         ),
         (
             record(
@@ -651,7 +651,7 @@ async def test_tenantcloud_provider_mutation_needs_no_unrelated_prospect_alias()
                 action_role="calendar_mutation",
                 operation="calendar.create",
                 intent_kind="showing_create",
-                arguments={"calendar_id": "nigel", "description": "Amanda tour"},
+                arguments={"calendar_id": "nigel", "description": "Zara tour"},
             ),
             "calendar",
             "nigel",
@@ -682,7 +682,7 @@ async def test_execute_target_comes_from_agent_arguments_regardless_of_wake_shap
 @pytest.mark.parametrize(
     ("event", "expected_hints"),
     [
-        (record(), {"to_address": "amanda.abc@convo.zillow.com", "to_phone": "+19085550100"}),
+        (record(), {"to_address": "zara.abc@convo.zillow.com", "to_phone": "+19085550100"}),
         (
             record(
                 raw_payload={"provider": "hotpads", "thread_id": "zrm-thread-44"},
@@ -690,9 +690,9 @@ async def test_execute_target_comes_from_agent_arguments_regardless_of_wake_shap
                 envelope={
                     "identity": {},
                     "message": {
-                        "property": "144 Bullman Street",
+                        "property": "144 Samplewood Street",
                         "proxy_email": "lead.123@convo.zillow.com",
-                        "direct_email": "AmandaSnyder@live.com",
+                        "direct_email": "ZaraSamplerson@example.com",
                     },
                 },
             ),
@@ -797,7 +797,7 @@ async def test_provider_operation_allowlist_gate_is_removed_for_cross_channel_ro
     )
 
     assert context.source == "tenantcloud"
-    assert context.provider_account == "PN8ujudrpa"
+    assert context.provider_account == "PNfakeAAA1"
     assert context.target.target_id == "+19085550199"
 
 
@@ -828,8 +828,8 @@ async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_
         envelope={
             "identity": {},
             "message": {
-                "prospect_name": "Amanda Snyder",
-                "property": "138 Bullman St #144-A",
+                "prospect_name": "Zara Samplerson",
+                "property": "138 Samplewood St #144-A",
             },
         },
     )
@@ -851,15 +851,15 @@ async def test_participant_only_zillow_proxy_drives_thread_identity_and_matches_
 async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
     event = record(
         subject=(
-            "Kailani is requesting information about 138 Bullman St #144-A, "
-            "Phillipsburg, NJ, 08865"
+            "Xena is requesting information about 138 Samplewood St #144-A, "
+            "Testville, NJ, 00000"
         ),
-        participant_key="kailani.abc@convo.zillow.com",
+        participant_key="xena.abc@convo.zillow.com",
         envelope={
             "identity": {},
             "message": {
-                "prospect_name": "Kailani Deleon",
-                "proxy_email": "kailani.abc@convo.zillow.com",
+                "prospect_name": "Xena Fakeley",
+                "proxy_email": "xena.abc@convo.zillow.com",
             },
             "conversation_context": {
                 "nearby_messages": [
@@ -868,8 +868,8 @@ async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
                         "proxy_email": "different.abc@convo.zillow.com",
                     },
                     {
-                        "property": "138 Bullman St #144-A",
-                        "proxy_email": "kailani.abc@convo.zillow.com",
+                        "property": "138 Samplewood St #144-A",
+                        "proxy_email": "xena.abc@convo.zillow.com",
                     },
                 ]
             },
@@ -878,7 +878,7 @@ async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
 
-    assert context.property_label == "138 Bullman St #144-A"
+    assert context.property_label == "138 Samplewood St #144-A"
     assert context.canonical_context["property_source"] == "unresolved"
 
 
@@ -886,22 +886,22 @@ async def test_zillow_email_property_uses_matching_nearby_proxy_thread():
 async def test_zillow_information_about_subject_derives_listing_address():
     event = record(
         subject=(
-            "Kailani is requesting information about 138 Bullman St #144-A, "
-            "Phillipsburg, NJ, 08865"
+            "Xena is requesting information about 138 Samplewood St #144-A, "
+            "Testville, NJ, 00000"
         ),
-        participant_key="kailani.abc@convo.zillow.com",
+        participant_key="xena.abc@convo.zillow.com",
         envelope={
             "identity": {},
             "message": {
-                "prospect_name": "Kailani Deleon",
-                "proxy_email": "kailani.abc@convo.zillow.com",
+                "prospect_name": "Xena Fakeley",
+                "proxy_email": "xena.abc@convo.zillow.com",
             },
         },
     )
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
 
-    assert context.property_label == "138 Bullman St #144-A"
+    assert context.property_label == "138 Samplewood St #144-A"
     assert context.canonical_context["property_source"] == "unresolved"
 
 
@@ -919,7 +919,7 @@ async def test_zillow_wake_with_no_proxy_offers_no_email_suggestion_but_execute_
         raw_payload={"provider": "zillow"},
         envelope={
             "identity": {},
-            "message": {"property": "138 Bullman St #144-A"},
+            "message": {"property": "138 Samplewood St #144-A"},
         },
     )
     loader = ActionContextLoader(FakeRepository(event), policy())
@@ -997,7 +997,7 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
             "related_call": {
                 "call_id": 2549,
                 "source_call_id": "synthetic-provider-call-2549",
-                "to_number": "+17623726083",
+                "to_number": "+17625550183",
             },
         },
         envelope={
@@ -1027,7 +1027,7 @@ async def test_zillow_linked_missed_call_can_use_server_owned_quo_route():
     assert context.target.verified is True
     # The call rang the Listing line (related_call.to_number), which no agent
     # sends from; the agent's from_phone decides.
-    assert context.provider_account == "PN8ujudrpa"
+    assert context.provider_account == "PNfakeAAA1"
     assert context.recipient_phone == "+19085550140"
 
 
@@ -1041,7 +1041,7 @@ async def test_a_reply_to_a_quo_text_goes_out_from_the_line_the_agent_names(from
     event = record(
         event_source="quo",
         message_source="quo",
-        source_channel_id="PNvHh9Fq2k",
+        source_channel_id="PNfakeCCC3",
         channel_type="phone_number",
         participant_type="phone_number",
         participant_key="+19085550199",
@@ -1049,7 +1049,7 @@ async def test_a_reply_to_a_quo_text_goes_out_from_the_line_the_agent_names(from
             "data": {
                 "object": {
                     "conversationId": "maintenance-thread-1",
-                    "phoneNumberId": "PNvHh9Fq2k",
+                    "phoneNumberId": "PNfakeCCC3",
                     "direction": "incoming",
                     "from": "+19085550199",
                 }
@@ -1129,12 +1129,12 @@ async def test_action_identity_and_payload_hash_are_canonical_and_stable():
     loader = ActionContextLoader(repo, policy())
     first = await loader.load(request())
     second = await loader.load(
-        request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"})
+        request(arguments={"to_address": "zara.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"})
     )
     assert first.action_id == second.action_id
     assert first.action_id.version == 5
     assert first.payload_hash == second.payload_hash
-    assert first.arguments == {"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"}
+    assert first.arguments == {"to_address": "zara.abc@convo.zillow.com", "text": "Friday at 10:30 works.\n— Nigel"}
     assert tuple(sorted(first.aliases)) == first.aliases
 
 
@@ -1161,9 +1161,9 @@ async def test_near_simultaneous_cross_channel_duplicate_is_canonicalized():
         envelope={
             "identity": {},
             "message": {
-                "prospect_name": "Kailani Deleon",
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "kailani.abc@convo.zillow.com",
+                "prospect_name": "Xena Fakeley",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "xena.abc@convo.zillow.com",
             },
             "routing_hints": {
                 "potential_cross_channel_duplicate": {
@@ -1189,13 +1189,13 @@ async def test_replay_refresh_certifies_older_zillow_scrape_rows():
         envelope={
             "identity": {},
             "message": {
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "amanda.abc@convo.zillow.com",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "zara.abc@convo.zillow.com",
             },
             "zillow_refresh": {
                 "status": "covered",
                 "covered_through": "2026-07-16T23:00:00Z",
-                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "covered_thread_identity": "Zara Samplerson|138 Samplewood St #144-A",
                 "evidence_sha256": "a" * 64,
                 "certified_older_message_ids": [197065, 197067],
             },
@@ -1214,13 +1214,13 @@ async def test_non_replay_event_cannot_certify_older_zillow_scrape_rows():
         envelope={
             "identity": {},
             "message": {
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "amanda.abc@convo.zillow.com",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "zara.abc@convo.zillow.com",
             },
             "zillow_refresh": {
                 "status": "covered",
                 "covered_through": "2026-07-16T23:00:00Z",
-                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "covered_thread_identity": "Zara Samplerson|138 Samplewood St #144-A",
                 "evidence_sha256": "a" * 64,
                 "certified_older_message_ids": [197065],
             },
@@ -1245,13 +1245,13 @@ async def test_replay_rejects_invalid_certified_zillow_chronology(certified_ids)
         envelope={
             "identity": {},
             "message": {
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "amanda.abc@convo.zillow.com",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "zara.abc@convo.zillow.com",
             },
             "zillow_refresh": {
                 "status": "covered",
                 "covered_through": "2026-07-16T23:00:00Z",
-                "covered_thread_identity": "Amanda Snyder|138 Bullman St #144-A",
+                "covered_thread_identity": "Zara Samplerson|138 Samplewood St #144-A",
                 "evidence_sha256": "a" * 64,
                 "certified_older_message_ids": certified_ids,
             },
@@ -1286,8 +1286,8 @@ async def test_unverified_cross_channel_duplicate_hint_is_ignored(
         envelope={
             "identity": {},
             "message": {
-                "property": "138 Bullman St #144-A",
-                "proxy_email": "kailani.abc@convo.zillow.com",
+                "property": "138 Samplewood St #144-A",
+                "proxy_email": "xena.abc@convo.zillow.com",
             },
             "routing_hints": {
                 "potential_cross_channel_duplicate": {
@@ -1322,9 +1322,9 @@ async def test_zoho_mail_wake_internal_cliq_post_derives_context():
         envelope={
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
             "message": {
-                "prospect_name": "Amanda Snyder",
-                "property": "138 Bullman St #144-A",
-                "direct_email": "AmandaSnyder@live.com",
+                "prospect_name": "Zara Samplerson",
+                "property": "138 Samplewood St #144-A",
+                "direct_email": "ZaraSamplerson@example.com",
             },
         },
     )
@@ -1360,37 +1360,37 @@ async def test_missing_aliases_no_longer_reject_customer_send():
     event = record(
         participant_key="unknown",
         participant_type="other",
-        envelope={"identity": {}, "message": {"property": "138 Bullman St #144-A"}},
+        envelope={"identity": {}, "message": {"property": "138 Samplewood St #144-A"}},
     )
 
     context = await ActionContextLoader(FakeRepository(event), policy()).load(request())
 
     assert context.prospect_id  # falls back, never raises
-    assert context.prospect_id == "prospect:amanda.abc@convo.zillow.com"
+    assert context.prospect_id == "prospect:zara.abc@convo.zillow.com"
 
 
 @pytest.mark.asyncio
 async def test_duplicate_provider_and_property_aliases_converge():
-    first_repo = FakeRepository(record(), canonical_subject="prospect:amanda")
+    first_repo = FakeRepository(record(), canonical_subject="prospect:zara")
     second_repo = FakeRepository(
         record(
             raw_payload={"provider": "hotpads", "thread_id": "zrm-thread-44"},
             envelope={
                 "identity": {},
                 "message": {
-                    "property": "144 Bullman Street",
-                    "proxy_email": "amanda.abc@convo.zillow.com",
-                    "direct_email": "AmandaSnyder@live.com",
+                    "property": "144 Samplewood Street",
+                    "proxy_email": "zara.abc@convo.zillow.com",
+                    "direct_email": "ZaraSamplerson@example.com",
                 },
             },
         ),
-        canonical_subject="prospect:amanda",
+        canonical_subject="prospect:zara",
     )
-    resolved = request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "hello",
+    resolved = request(arguments={"to_address": "zara.abc@convo.zillow.com", "text": "hello",
                                   "property_ref": {"building_id": 7, "unit_id": 12}})
     first = await ActionContextLoader(first_repo, policy()).load(resolved)
     second = await ActionContextLoader(second_repo, policy()).load(resolved)
-    assert first.prospect_id == second.prospect_id == "prospect:amanda"
+    assert first.prospect_id == second.prospect_id == "prospect:zara"
     assert first.property_id == second.property_id == "sor:building:7:unit:12"
     assert first.conversation_id == second.conversation_id
 
@@ -1412,7 +1412,7 @@ async def test_ambiguous_aliases_and_unresolvable_wakes_no_longer_block_execute(
         participant_key="unknown",
         envelope={
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
-            "message": {"property": "144 Bullman Street"},
+            "message": {"property": "144 Samplewood Street"},
         },
     )
     loader = ActionContextLoader(FakeRepository(unresolvable), policy())
@@ -1448,7 +1448,7 @@ async def test_system_sender_offers_no_suggestion_but_execute_still_honors_the_a
         envelope={
             "identity": {"factbook_entity_uuid": "aa1a1515-7929-4f17-a632-ec89c32f5895"},
             "message": {
-                "property": "138 Bullman St #144-A",
+                "property": "138 Samplewood St #144-A",
                 "direct_email": unsafe_address,
             },
         },
@@ -1488,14 +1488,14 @@ async def test_repository_uses_parameterized_queries_for_event_and_alias_reads()
         loaded = await repository.load_wake_event(12345)
         resolved = await repository.resolve_canonical_subject(
             ("email:a@example.com",),
-            "144 bullman street",
+            "144 samplewood street",
         )
 
     assert loaded == event
     assert resolved.canonical_subject == "prospect:canonical"
     assert calls[0][1] == [12345]
     assert "12345" not in calls[0][0]
-    assert calls[1][1] == [["email:a@example.com"], "144 bullman street"]
+    assert calls[1][1] == [["email:a@example.com"], "144 samplewood street"]
 
 
 @pytest.mark.asyncio
@@ -1600,7 +1600,7 @@ async def test_adversarial_zillow_rotating_proxy_send_goes_only_to_agent_supplie
             "identity": {},
             "message": {
                 "prospect_name": "New Prospect",
-                "property": "138 Bullman St #144-A",
+                "property": "138 Samplewood St #144-A",
                 "proxy_email": "rotation-88f3@convo.zillow.com",
             },
         },
@@ -1674,7 +1674,7 @@ async def test_adversarial_cliq_channel_post_and_chat_post_never_cross_contamina
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raw_target_id",
-    ["1424728044450751028", "CT_2243214485353125021_721156495"],
+    ["1000000000000000028", "CT_1000000000000000021_700000099"],
     ids=["prod_numeric_chat_id", "prod_ct_star_chat_id"],
 )
 async def test_cliq_channel_post_with_a_chat_shaped_id_is_routed_as_a_chat_target(raw_target_id):
@@ -1779,7 +1779,7 @@ async def test_cliq_wake_reply_targets_its_inbound_chat_without_property():
     inbound = record(
         event_source="zoho_cliq",
         message_source="zoho_cliq",
-        source_channel_id="1424728044450751028",
+        source_channel_id="1000000000000000028",
         channel_type="dm",
         subject=None,
         envelope={"identity": {}, "message": {}},
@@ -1790,13 +1790,13 @@ async def test_cliq_wake_reply_targets_its_inbound_chat_without_property():
         operation="cliq.chat.post",
         intent_kind="internal_reply",
         appointment_slot=None,
-        arguments={"channel_or_chat_id": "1424728044450751028", "text": "pong"},
+        arguments={"channel_or_chat_id": "1000000000000000028", "text": "pong"},
     )
 
     context = await ActionContextLoader(FakeRepository(inbound), policy()).load(outbound)
 
     assert context.target.kind == "cliq_chat"
-    assert context.target.target_id == "1424728044450751028"
+    assert context.target.target_id == "1000000000000000028"
     assert context.intent_kind == "internal_reply"
 
 
@@ -1805,15 +1805,15 @@ async def test_cliq_wake_reply_targets_its_inbound_chat_without_property():
     ("source", "target", "channel_type"),
     [
         ("zoho_cliq", "different-chat", "dm"),
-        ("zoho_mail", "1424728044450751028", "dm"),
-        ("zoho_cliq", "1424728044450751028", "channel"),
+        ("zoho_mail", "1000000000000000028", "dm"),
+        ("zoho_cliq", "1000000000000000028", "channel"),
     ],
 )
 async def test_cliq_wake_reply_rejects_wrong_chat_or_non_cliq_source(source, target, channel_type):
     inbound = record(
         event_source=source,
         message_source=source,
-        source_channel_id="1424728044450751028",
+        source_channel_id="1000000000000000028",
         channel_type=channel_type,
         subject=None,
         envelope={"identity": {}, "message": {}},
@@ -2166,7 +2166,7 @@ async def test_email_send_refuses_provider_without_configured_sender_account():
     unmapped = dataclasses.replace(policy(), email_account_by_provider={"zillow": "nigel-zoho"})
     loader = ActionContextLoader(FakeRepository(event), unmapped)
     with pytest.raises(ContextDerivationError, match="no outbound email account is configured for provider 'zoho_mail'"):
-        await loader.load(request(arguments={"to_address": "dan@pfg.io", "text": "hi"}))
+        await loader.load(request(arguments={"to_address": "staff-a@pfg.io", "text": "hi"}))
 
 
 @pytest.mark.asyncio
@@ -2178,10 +2178,10 @@ async def test_email_send_from_zoho_mail_wake_uses_mapped_account():
         policy(), email_account_by_provider={**policy().email_account_by_provider, "zoho_mail": "nigel-zoho"}
     )
     context = await ActionContextLoader(FakeRepository(event), mapped).load(
-        request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
+        request(arguments={"to_address": "staff-a@pfg.io", "text": "hi"})
     )
     assert context.provider_account == "nigel-zoho"
-    assert context.target.target_id == "dan@pfg.io"
+    assert context.target.target_id == "staff-a@pfg.io"
 
 
 @pytest.mark.asyncio
@@ -2195,7 +2195,7 @@ async def test_email_from_a_wake_without_a_mailbox_uses_the_default_sender():
         policy(), email_account_by_provider={"zillow": "nigel-zoho"}, email_default_account="nigel-zoho"
     )
     context = await ActionContextLoader(FakeRepository(event), defaulted).load(
-        request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
+        request(arguments={"to_address": "staff-a@pfg.io", "text": "hi"})
     )
     assert context.provider_account == "nigel-zoho"
 
@@ -2208,11 +2208,11 @@ async def test_omitted_optional_email_fields_leave_the_stored_arguments_unchange
     context = await ActionContextLoader(FakeRepository(record()), policy()).load(request())
     assert set(context.arguments) == {"to_address", "text"}
     with_subject = await ActionContextLoader(FakeRepository(record()), policy()).load(
-        request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel",
-                           "subject": "Your tour", "cc": ["dan@pfg.io"]})
+        request(arguments={"to_address": "zara.abc@convo.zillow.com", "text": "Friday at 10:30 works.\r\n— Nigel",
+                           "subject": "Your tour", "cc": ["staff-a@pfg.io"]})
     )
     assert with_subject.arguments["subject"] == "Your tour"
-    assert with_subject.arguments["cc"] == ["dan@pfg.io"]
+    assert with_subject.arguments["cc"] == ["staff-a@pfg.io"]
     assert with_subject.payload_hash != context.payload_hash
 
 
@@ -2223,11 +2223,11 @@ async def test_a_qualification_send_cannot_add_recipients():
     loader = ActionContextLoader(FakeRepository(SimpleNamespace(**values)), policy())
     with pytest.raises(ContextDerivationError, match="cannot add cc or attendees"):
         await loader.load(
-            request(arguments={"to_address": "amanda.abc@convo.zillow.com", "text": "hi", "cc": ["someone@example.com"]})
+            request(arguments={"to_address": "zara.abc@convo.zillow.com", "text": "hi", "cc": ["someone@example.com"]})
         )
 
 
-def _quo_request(to_phone="+12015756789", **arguments):
+def _quo_request(to_phone="+12015550189", **arguments):
     return request(
         operation="quo.sms.send", intent_kind="inquiry_reply", appointment_slot=None,
         arguments={"to_phone": to_phone, "text": "Ticket #1569672 created.", **arguments},
@@ -2241,7 +2241,7 @@ _NON_QUO_WAKES = {
     "tenantcloud": dict(raw_payload={"provider": "tenantcloud", "thread_id": "tc-lead-1"}, participant_key="+19085550199",
                         participant_type="phone", channel_type="sms",
                         envelope={"identity": {}, "message": {"property": "16 N Main St #16", "phone": "+1 908 555 0199"}}),
-    "zoho_cliq": dict(event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_2243226981154968407",
+    "zoho_cliq": dict(event_source="zoho_cliq", message_source="zoho_cliq", source_channel_id="CT_1000000000000000007",
                       channel_type="dm", participant_type="user", participant_key="dan", raw_payload={"provider": "cliq"},
                       envelope={"identity": {}, "message": {}}),
 }
@@ -2254,7 +2254,7 @@ async def test_a_text_from_a_wake_with_no_line_of_its_own_goes_out_from_the_name
     dpark) texts from the line the agent names -- there is no default."""
     event = record(**_NON_QUO_WAKES[wake])
     context = await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(from_phone=COLLECTIONS))
-    assert context.provider_account == "PNkmv4nD54"
+    assert context.provider_account == "PNfakeBBB2"
 
 
 @pytest.mark.asyncio
@@ -2266,24 +2266,24 @@ async def test_a_text_without_from_phone_is_refused_with_the_lines_it_can_send_f
     kind of wake, a Quo text included."""
     values = _NON_QUO_WAKES.get(wake) or dict(
         event_source="quo", message_source="quo", channel_type="phone_number", participant_type="phone_number",
-        participant_key="+12015756789",
-        raw_payload={"data": {"object": {"phoneNumberId": "PNvHh9Fq2k", "direction": "incoming", "from": "+12015756789"}}},
+        participant_key="+12015550189",
+        raw_payload={"data": {"object": {"phoneNumberId": "PNfakeCCC3", "direction": "incoming", "from": "+12015550189"}}},
     )
     repository = FakeRepository(record(**values))
     with pytest.raises(ContextDerivationError) as refused:
         await ActionContextLoader(repository, policy()).load(_quo_request())
     assert str(refused.value) == (
         "from_phone is missing. Nothing was sent: quo.sms.send must name the line to send from. Lines it can "
-        "send from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
+        "send from: +16105550175, +17575550130, +14845550120. Send again with one of them as from_phone."
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "from_phone", [LISTING, "+16109735105", "+13018875706", "(757) 997-2130", "<our line you send from, E.164>"]
+    "from_phone", [LISTING, "+16105550105", "+13015550106", "(757) 555-0130", "<our line you send from, E.164>"]
 )
 async def test_a_text_from_a_line_outside_the_map_is_refused_with_the_lines_it_can_send_from(from_phone):
-    """Listing is banned for agent sends; PFG-Dan and Laura's personal
+    """Listing is banned for agent sends; PFG-Dan and Rhea's personal
     number are not agent lines. None of them is in the map, so none can be
     named. A malformed line (a copied placeholder, a US-formatted number)
     gets the same list rather than a bare format error."""
@@ -2292,7 +2292,7 @@ async def test_a_text_from_a_line_outside_the_map_is_refused_with_the_lines_it_c
         await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(from_phone=from_phone))
     assert str(refused.value) == (
         f"from_phone {from_phone} is not a line the gateway can send from. Nothing was sent. Lines it can send "
-        "from: +16107095575, +17579972130, +14846260220. Send again with one of them as from_phone."
+        "from: +16105550175, +17575550130, +14845550120. Send again with one of them as from_phone."
     )
 
 
@@ -2303,7 +2303,7 @@ async def test_with_no_sending_lines_configured_every_text_is_refused_as_such():
     with pytest.raises(ContextDerivationError) as refused:
         await ActionContextLoader(FakeRepository(event), no_lines).load(_quo_request(from_phone=PFG_GENERAL))
     assert str(refused.value) == (
-        "from_phone +16107095575 is not a line the gateway can send from. Nothing was sent. No Quo sending "
+        "from_phone +16105550175 is not a line the gateway can send from. Nothing was sent. No Quo sending "
         "lines are configured, so the gateway cannot text: record needs_human."
     )
 
@@ -2320,19 +2320,19 @@ async def test_a_text_recorded_before_from_phone_keeps_its_recorded_line_when_re
     stored = _quo_request()
     assert "from_phone" not in stored.arguments.model_dump(exclude_none=True)
 
-    context = await loader.load(stored, recorded_account="PN8ujudrpa")
-    assert context.provider_account == "PN8ujudrpa"
+    context = await loader.load(stored, recorded_account="PNfakeAAA1")
+    assert context.provider_account == "PNfakeAAA1"
     assert set(context.arguments) == {"to_phone", "text"}
-    named = await loader.load(_quo_request(from_phone=COLLECTIONS), recorded_account="PN8ujudrpa")
-    assert named.provider_account == "PNkmv4nD54"
+    named = await loader.load(_quo_request(from_phone=COLLECTIONS), recorded_account="PNfakeAAA1")
+    assert named.provider_account == "PNfakeBBB2"
     with pytest.raises(ContextDerivationError, match="from_phone is missing"):
         await loader.load(stored)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("recorded_account", ["PNtjMqMO2h", ""], ids=["listing", "none"])
+@pytest.mark.parametrize("recorded_account", ["PNfakeDDD4", ""], ids=["listing", "none"])
 async def test_a_text_recorded_on_a_line_outside_the_map_is_never_re_derived_onto_it(recorded_account):
-    """250 stored texts were recorded on PFG Listing (PNtjMqMO2h) before the
+    """250 stored texts were recorded on PFG Listing (PNfakeDDD4) before the
     2026-09-11 ban, and two with no line at all (wake 27269). Re-deriving
     one (an override, a revise, a resume) must not reopen that line, and
     since no override can change it the refusal sends the agent to a new
@@ -2342,7 +2342,7 @@ async def test_a_text_recorded_on_a_line_outside_the_map_is_never_re_derived_ont
         await ActionContextLoader(FakeRepository(event), policy()).load(_quo_request(), recorded_account=recorded_account)
     assert str(refused.value) == (
         "this text was recorded on a line the gateway does not send from, and an override cannot change its "
-        "line. Nothing was sent. Lines it can send from: +16107095575, +17579972130, +14846260220. Execute it "
+        "line. Nothing was sent. Lines it can send from: +16105550175, +17575550130, +14845550120. Execute it "
         "as a new message with one of them as from_phone."
     )
 

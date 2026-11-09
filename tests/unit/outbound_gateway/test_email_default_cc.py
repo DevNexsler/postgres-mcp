@@ -26,7 +26,7 @@ from .test_context import record
 from .test_service import row as service_row
 
 MANAGEMENT = "management@pfg.io"
-PROSPECT = "amanda.abc@convo.zillow.com"
+PROSPECT = "zara.abc@convo.zillow.com"
 
 
 def _email(*, role="prospect_reply", intent="inquiry_reply", to=PROSPECT, **extra) -> ExecuteRequest:
@@ -60,14 +60,14 @@ def test_an_explicit_empty_cc_is_the_override_and_sends_none():
 
 @pytest.mark.parametrize(
     "cc",
-    [["dan@pfg.io"], ["Management@PFG.io"], ["tenant@example.com", "MANAGEMENT@pfg.io"]],
+    [["staff-a@pfg.io"], ["Management@PFG.io"], ["tenant@example.com", "MANAGEMENT@pfg.io"]],
 )
 def test_an_explicit_cc_is_kept_exactly_never_duplicated(cc):
     request = _email(cc=cc)
     assert with_default_cc(request, MANAGEMENT) is request
 
 
-@pytest.mark.parametrize("to", ["dan@pfg.io", "Management@PFG.IO"])
+@pytest.mark.parametrize("to", ["staff-a@pfg.io", "Management@PFG.IO"])
 def test_an_internal_only_recipient_gets_no_cc(to):
     request = _email(to=to)
     assert with_default_cc(request, MANAGEMENT) is request
@@ -127,7 +127,7 @@ def test_the_adapter_sends_a_stored_cc_exactly_and_the_source_copy_only_when_non
         return adapter.build_request(adapter_context(arguments=arguments), ACTION_UID).arguments.get("cc")
 
     assert sent_cc({"text": text, "cc": []}) is None
-    assert sent_cc({"text": text, "cc": ["dan@pfg.io"]}) == [{"address": "dan@pfg.io"}]
+    assert sent_cc({"text": text, "cc": ["staff-a@pfg.io"]}) == [{"address": "staff-a@pfg.io"}]
     # An action stored before the default existed keeps its per-source copy.
     assert sent_cc({"text": text}) == [{"address": MANAGEMENT}]
 

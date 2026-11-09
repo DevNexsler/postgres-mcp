@@ -94,10 +94,10 @@ def context() -> ActionContext:
         source_sent_at=NOW,
         conversation_id="conversation:zillow-1",
         conversation_watermark=700,
-        prospect_id="prospect:amanda",
-        aliases=("email:amanda@example.com",),
-        property_id="building:bullman-st",
-        property_label="138 Bullman St #144-A",
+        prospect_id="prospect:zara",
+        aliases=("email:zara@example.com",),
+        property_id="building:samplewood-st",
+        property_label="138 Samplewood St #144-A",
         target=DerivedTarget("email_thread", "lead@convo.zillow.com", True),
         provider_account="nigel-zoho",
         routing_policy_version="v1",
@@ -109,14 +109,14 @@ def context() -> ActionContext:
         showing_lifecycle_id="showing:7",
         calendar_event_uid=None,
         source_subject="Zillow inquiry",
-        prospect_name="Amanda Snyder",
+        prospect_name="Zara Samplerson",
     )
 
 
 def evidence(**overrides):
     values = dict(
         current_recipient_id="lead@convo.zillow.com",
-        current_property_id="building:bullman-st",
+        current_property_id="building:samplewood-st",
         current_appointment_slot=datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
         later_inbound_message_id=None,
         calendar_dependency=CalendarDependencyState.NOT_REQUIRED,
@@ -1831,7 +1831,7 @@ async def test_worker_executes_the_saved_record_when_live_context_has_drifted():
             # The real record shape: the saved context repeats the account and
             # routing (a replay of 310 real actions caught this collision).
             canonical_context={
-                "prospect_name": "Ytry Nationn", "source_subject": "Re: Your tour",
+                "prospect_name": "Nico Testerson", "source_subject": "Re: Your tour",
                 "provider_account": "nigel-zoho", "routing_policy_version": "appointment-v1",
                 "target": {"kind": "email_thread", "target_id": recorded_target},
                 "identity_version": "v1", "channel_id": 866870,
@@ -2625,7 +2625,7 @@ async def test_a_later_action_of_the_same_role_carries_its_own_identity():
     assert result.status is PublicStatus.SENT
     assert result.action_id == later
     assert store.calls[0] == ("create", ACTION_ID)
-    assert probe.calls[0] == ("newer_context", "prospect:amanda", later)
+    assert probe.calls[0] == ("newer_context", "prospect:zara", later)
     assert probe.calls[-1][-1] == later
 
 

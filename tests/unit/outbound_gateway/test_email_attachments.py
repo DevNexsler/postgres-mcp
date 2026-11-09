@@ -57,8 +57,8 @@ def test_an_email_may_carry_attachments():
 
 
 def test_an_email_without_attachments_stores_and_hashes_exactly_as_before():
-    assert request_arguments(EmailArguments(to_address="dan@pfg.io", text="hi")) == {
-        "to_address": "dan@pfg.io", "text": "hi",
+    assert request_arguments(EmailArguments(to_address="staff-a@pfg.io", text="hi")) == {
+        "to_address": "staff-a@pfg.io", "text": "hi",
     }
     # An empty list is the same request as no list.
     assert request_arguments(_email(attachments=[]).arguments) == request_arguments(_email().arguments)

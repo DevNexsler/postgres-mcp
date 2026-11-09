@@ -12,7 +12,7 @@ def _email(text="hi", **extra):
     return parse_outbound_request({
         "op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply",
         "operation": "email.send", "intent_kind": "inquiry_reply",
-        "arguments": {"to_address": "dan@pfg.io", "text": text, **extra},
+        "arguments": {"to_address": "staff-a@pfg.io", "text": text, **extra},
     })
 
 
@@ -30,22 +30,22 @@ def test_different_text_recipient_or_intent_is_a_different_request():
 def test_omitted_later_optional_fields_are_left_out_of_the_stored_form():
     """subject/cc were added after actions were stored; an email that omits
     them must store (and hash) exactly as before."""
-    assert request_arguments(EmailArguments(to_address="dan@pfg.io", text="hi")) == {
-        "to_address": "dan@pfg.io", "text": "hi",
+    assert request_arguments(EmailArguments(to_address="staff-a@pfg.io", text="hi")) == {
+        "to_address": "staff-a@pfg.io", "text": "hi",
     }
-    assert request_arguments(EmailArguments(to_address="dan@pfg.io", text="hi", subject="S")) == {
-        "to_address": "dan@pfg.io", "text": "hi", "subject": "S",
+    assert request_arguments(EmailArguments(to_address="staff-a@pfg.io", text="hi", subject="S")) == {
+        "to_address": "staff-a@pfg.io", "text": "hi", "subject": "S",
     }
 
 
 def test_a_text_without_from_phone_stores_exactly_as_before():
     """from_phone was added after texts were stored; a text that leaves it
     out must store (and hash) exactly as before."""
-    assert request_arguments(QuoSmsArguments(to_phone="+12015756789", text="hi")) == {
-        "to_phone": "+12015756789", "text": "hi",
+    assert request_arguments(QuoSmsArguments(to_phone="+12015550189", text="hi")) == {
+        "to_phone": "+12015550189", "text": "hi",
     }
-    assert request_arguments(QuoSmsArguments(to_phone="+12015756789", text="hi", from_phone="+17579972130")) == {
-        "to_phone": "+12015756789", "text": "hi", "from_phone": "+17579972130",
+    assert request_arguments(QuoSmsArguments(to_phone="+12015550189", text="hi", from_phone="+17575550130")) == {
+        "to_phone": "+12015550189", "text": "hi", "from_phone": "+17575550130",
     }
 
 

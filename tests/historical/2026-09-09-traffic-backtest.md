@@ -26,7 +26,7 @@ Original code disagrees with recipient-scoped expectations in 14 evaluable cases
 
 For 23 evaluable actions whose production ledger recorded `stale_context`, the original-code replay reproduces all 23 blocks. Fixed code preserves 17 and removes 6 unrelated-recipient blocks. The remaining 8 of the 14 corrected cases are historical counterfactuals: they show how this module behaves on older production data, not proof those sends were blocked by traffic control at the time.
 
-Jessica wake **26817**: original `stale_context`, fixed `pass`. Unrelated messages **694982** and **694983** no longer block her reply.
+Tess wake **26817**: original `stale_context`, fixed `pass`. Unrelated messages **694982** and **694983** no longer block her reply.
 
 | Wake | Action timestamp (UTC) | Newer unrelated message IDs | Recorded stale-context failure |
 | ---: | --- | --- | --- |
@@ -59,7 +59,7 @@ This uses retained database history, not archived WAL or complete point-in-time 
 
 ## Reproduce
 
-From `/home/danpark/projects/postgres-mcp-comm`:
+From `/home/operator/projects/postgres-mcp-comm`:
 
 ```sh
 .venv/bin/python tests/historical/backtest_gateway_traffic.py \

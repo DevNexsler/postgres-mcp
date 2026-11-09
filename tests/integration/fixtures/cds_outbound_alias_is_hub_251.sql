@@ -81,7 +81,7 @@ AS $$
         OR (kind IN ('email', '') AND value LIKE '%@%'
             AND cds_email_identity_class(value) IN ('agency', 'transport'))
         OR (kind IN ('phone', 'sms', '') AND (
-                value IN ('+19083397021', '+19085385092')
+                value IN ('+19085550121', '+19085550192')
                 OR EXISTS (
                     SELECT 1 FROM agency_identifiers AS agency
                     WHERE agency.kind = 'phone' AND agency.value = typed.value

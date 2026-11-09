@@ -25,9 +25,9 @@ from postgres_mcp.outbound_gateway.repository import OutboundGatewayRepository
 from postgres_mcp.sql import SqlDriver
 
 ACTION = UUID("10000000-0000-0000-0000-000000000001")
-SUBJECT = "subject:jessica"
-JESSICA = "+12025550101"
-GUNTHER = "+12025550102"
+SUBJECT = "subject:tess"
+TESS = "+12025550101"
+ULF = "+12025550102"
 LINE = "+12025550100"
 WATERMARK = datetime(2026, 9, 9, 23, 9, tzinfo=timezone.utc)
 
@@ -102,22 +102,22 @@ async def traffic(traffic_database):
         await conn.execute("INSERT INTO channels VALUES (18, %s), (19, %s)", (LINE, "+12025550199"))
         # Production seed (Comm-Data-Store migration 146): Nigel's own Cliq user.
         await conn.execute(
-            "INSERT INTO agency_identifiers VALUES ('cliq_user_id','918334727','nigel-zoho'),"
-            "('cliq_user_id','720844989','dan-zoho')"
+            "INSERT INTO agency_identifiers VALUES ('cliq_user_id','700000002','nigel-zoho'),"
+            "('cliq_user_id','700000001','dan-zoho')"
         )
         await conn.execute(
-            "INSERT INTO participants VALUES (918, '918334727', 'user', 'Nigel Pine'),"
-            "(720, '720844989', 'user', 'Dan Park')"
+            "INSERT INTO participants VALUES (918, '700000002', 'user', 'Nigel Placeholder'),"
+            "(720, '700000001', 'user', 'Dan Placeholder')"
         )
         await conn.execute(
             "INSERT INTO outbound_actions VALUES (%s,%s,'quo.sms.send','prepared',%s,'{}',%s,NULL,NULL)",
-            (ACTION, SUBJECT, WATERMARK, Jsonb({"recipient_phone": JESSICA})),
+            (ACTION, SUBJECT, WATERMARK, Jsonb({"recipient_phone": TESS})),
         )
         await conn.execute("UPDATE outbound_actions SET wakeup_event_id = 26817 WHERE action_id = %s", (ACTION,))
         yield conn, OutboundGatewayRepository(SqlDriver(conn=conn))
 
 
-async def add_message(conn, *, sender=GUNTHER, recipient=LINE, direction="inbound", channel=18, minute=13, message_id=694983, sent_minute=None):
+async def add_message(conn, *, sender=ULF, recipient=LINE, direction="inbound", channel=18, minute=13, message_id=694983, sent_minute=None):
     await conn.execute(
         "INSERT INTO raw_events VALUES (%s,%s)",
         (message_id, Jsonb({"data": {"object": {"from": sender, "to": recipient}}})),
@@ -141,7 +141,7 @@ SOURCE_AT = WATERMARK.replace(minute=5)
 
 
 def context(**overrides) -> ActionContext:
-    """Jessica's Quo reply on the shared leasing line (channel 18), wake 26817."""
+    """Tess's Quo reply on the shared leasing line (channel 18), wake 26817."""
     values = dict(
         action_id=ACTION,
         wakeup_event_id=26817,
@@ -149,7 +149,7 @@ def context(**overrides) -> ActionContext:
         operation=Operation.QUO_SMS_SEND,
         intent_kind=IntentKind.INQUIRY_REPLY,
         appointment_slot=None,
-        arguments={"text": "Friday works", "to_phone": JESSICA},
+        arguments={"text": "Friday works", "to_phone": TESS},
         source="quo",
         source_message_id=1,
         source_message_key="quo:AC-1",
@@ -160,17 +160,17 @@ def context(**overrides) -> ActionContext:
         aliases=(),
         property_id=None,
         property_label=None,
-        target=DerivedTarget("quo_conversation", JESSICA, True),
+        target=DerivedTarget("quo_conversation", TESS, True),
         provider_account="PN-leasing",
         routing_policy_version="v1",
         canonical_scope={},
         canonical_context={},
         payload_hash="a" * 64,
         lock_holder=f"outbound-gateway:{ACTION}",
-        thread_identity="CN-jessica",
+        thread_identity="CN-tess",
         showing_lifecycle_id="showing:26817",
         calendar_event_uid=None,
-        recipient_phone=JESSICA,
+        recipient_phone=TESS,
         channel_id=18,
     )
     values.update(overrides)
@@ -196,7 +196,7 @@ async def refs(repository, **overrides):
 
 
 @pytest.mark.asyncio
-async def test_gunther_activity_on_shared_line_is_not_jessicas_context(traffic):
+async def test_ulf_activity_on_shared_line_is_not_jessicas_context(traffic):
     conn, repository = traffic
     await add_message(conn)
     assert await refs(repository) == []
@@ -206,17 +206,17 @@ async def test_gunther_activity_on_shared_line_is_not_jessicas_context(traffic):
 @pytest.mark.parametrize(
     ("sender", "recipient", "direction", "listed", "label"),
     [
-        (GUNTHER, LINE, "inbound", False, None),
-        (LINE, GUNTHER, "outbound", False, None),
-        (LINE, [GUNTHER], "outbound", False, None),
-        (JESSICA, LINE, "inbound", True, "received"),
-        (LINE, JESSICA, "outbound", True, "sent by us"),
-        (LINE, [GUNTHER, JESSICA], "outbound", True, "sent by us"),
+        (ULF, LINE, "inbound", False, None),
+        (LINE, ULF, "outbound", False, None),
+        (LINE, [ULF], "outbound", False, None),
+        (TESS, LINE, "inbound", True, "received"),
+        (LINE, TESS, "outbound", True, "sent by us"),
+        (LINE, [ULF, TESS], "outbound", True, "sent by us"),
         ("+1 (202) 555-0101", LINE, "inbound", True, "received"),
         (LINE, "+1 (202) 555-0101", "outbound", True, "sent by us"),
-        (JESSICA, LINE, None, True, "received"),
-        (LINE, JESSICA, "inbound", True, "received"),  # mislabeled outbound: still hers
-        (GUNTHER, LINE, None, False, None),
+        (TESS, LINE, None, True, "received"),
+        (LINE, TESS, "inbound", True, "received"),  # mislabeled outbound: still hers
+        (ULF, LINE, None, False, None),
         (None, None, None, False, None),
     ],
 )
@@ -233,15 +233,15 @@ async def test_only_jessicas_endpoints_are_her_context(traffic, sender, recipien
 @pytest.mark.parametrize(("channel", "minute", "listed"), [(19, 13, True), (19, 4, False), (18, 8, False), (18, 9, False), (18, 10, True)])
 async def test_line_and_watermark_boundaries(traffic, channel, minute, listed):
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, channel=channel, minute=minute)
+    await add_message(conn, sender=TESS, channel=channel, minute=minute)
     assert bool(await refs(repository)) is listed
 
 
 @pytest.mark.asyncio
-async def test_a_newer_gunther_message_cannot_hide_jessicas(traffic):
+async def test_a_newer_ulf_message_cannot_hide_jessicas(traffic):
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
-    await add_message(conn, sender=GUNTHER, minute=13, message_id=13)
+    await add_message(conn, sender=TESS, minute=10, message_id=10)
+    await add_message(conn, sender=ULF, minute=13, message_id=13)
     assert await refs(repository, limit=1) == ["message:10"]
 
 
@@ -294,8 +294,8 @@ async def test_cliq_internal_reply_lists_our_own_non_alert_post_as_sent_by_us(tr
         (SUBJECT, "completed", False, False, True),
         (SUBJECT, "definitive_failed", False, False, False),
         (SUBJECT, "definitive_failed", True, False, True),
-        ("subject:gunther", "prepared", False, False, False),
-        ("subject:gunther", "completed", True, False, False),
+        ("subject:ulf", "prepared", False, False, False),
+        ("subject:ulf", "completed", True, False, False),
     ],
 )
 async def test_another_wakes_send_holds_while_in_flight_and_is_listed_once_dispatched(
@@ -338,24 +338,24 @@ async def test_this_wakes_own_sends_ingested_back_are_not_news(traffic):
         " wakeup_event_id, provider_message_id) VALUES (%s,%s,'quo.sms.send','completed',%s,'{}','{}',26817,'quo:AC-12')",
         (UUID(int=5), SUBJECT, WATERMARK.replace(minute=11)),
     )
-    await add_message(conn, sender=LINE, recipient=JESSICA, direction="outbound", minute=12, message_id=12)
+    await add_message(conn, sender=LINE, recipient=TESS, direction="outbound", minute=12, message_id=12)
     assert await refs(repository) == []
 
 
 @pytest.mark.asyncio
 async def test_every_item_is_listed_newest_first_with_its_sender(traffic):
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=10, message_id=10)
-    await add_message(conn, sender=GUNTHER, minute=11, message_id=11)
-    await add_message(conn, sender=LINE, recipient=JESSICA, direction="outbound", minute=12, message_id=12)
-    await conn.execute("INSERT INTO participants VALUES (7, 'phone:+12025550101', 'phone', 'Jessica')")
+    await add_message(conn, sender=TESS, minute=10, message_id=10)
+    await add_message(conn, sender=ULF, minute=11, message_id=11)
+    await add_message(conn, sender=LINE, recipient=TESS, direction="outbound", minute=12, message_id=12)
+    await conn.execute("INSERT INTO participants VALUES (7, 'phone:+12025550101', 'phone', 'Tess')")
     await conn.execute("UPDATE messages SET sender_participant_id = 7 WHERE id = 10")
 
     items = await newer(repository)
 
-    # Gunther shares the line but is not Jessica's context.
+    # Ulf shares the line but is not Tess's context.
     assert [(item.message_id, item.label) for item in items] == [(12, "sent by us"), (10, "received")]
-    assert items[1].sender == "Jessica"
+    assert items[1].sender == "Tess"
 
 
 @pytest.mark.asyncio
@@ -364,7 +364,7 @@ async def test_shown_refs_on_a_stale_row_waive_only_what_was_shown(traffic):
     one never shown still is -- INCLUDING one sent before the shown text and
     ingested after the question (a timestamp waiver would hide it)."""
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=11, message_id=11)
+    await add_message(conn, sender=TESS, minute=11, message_id=11)
     await conn.execute(
         "INSERT INTO outbound_actions (action_id, subject_key, operation, state, created_at, arguments, "
         "canonical_context, wakeup_event_id, stale_context_shown_refs) "
@@ -375,12 +375,12 @@ async def test_shown_refs_on_a_stale_row_waive_only_what_was_shown(traffic):
     # Re-asking lists everything again.
     assert await refs(repository, waive_shown=False) == ["message:11"]
     # Another subject's or another wake's shown set waives nothing here.
-    await conn.execute("UPDATE outbound_actions SET subject_key='subject:gunther' WHERE action_id=%s", (UUID(int=3),))
+    await conn.execute("UPDATE outbound_actions SET subject_key='subject:ulf' WHERE action_id=%s", (UUID(int=3),))
     assert await refs(repository) == ["message:11"]
     await conn.execute("UPDATE outbound_actions SET subject_key=%s WHERE action_id=%s", (SUBJECT, UUID(int=3)))
 
     # Sent at minute 10 -- before the shown text -- but ingested only now.
-    await add_message(conn, sender=JESSICA, minute=13, sent_minute=10, message_id=10)
+    await add_message(conn, sender=TESS, minute=13, sent_minute=10, message_id=10)
     assert await refs(repository) == ["message:10"]
 
 
@@ -422,7 +422,7 @@ async def test_a_human_pasting_a_cron_alert_is_not_exempt(traffic):
 # ----------------------------------------------------------------------------
 
 
-async def add_quo_elsewhere(conn, message_id, *, channel=19, minute=13, sent_minute=None, frm=JESSICA, line="PN-leasing", conversation="CN-jessica"):
+async def add_quo_elsewhere(conn, message_id, *, channel=19, minute=13, sent_minute=None, frm=TESS, line="PN-leasing", conversation="CN-tess"):
     payload = {"data": {"object": {"from": frm, "to": [LINE], "phoneNumberId": line, "conversationId": conversation}}}
     await conn.execute("INSERT INTO raw_events VALUES (%s,%s)", (message_id, Jsonb(payload)))
     await conn.execute(
@@ -436,13 +436,13 @@ async def add_quo_elsewhere(conn, message_id, *, channel=19, minute=13, sent_min
 @pytest.mark.asyncio
 async def test_her_text_on_any_channel_line_or_conversation_is_listed_and_gunthers_never(traffic):
     """Her phone is the destination: a text from it on another channel, Quo
-    line or conversation is news (2026-11-05); Gunther's is not, whatever
+    line or conversation is news (2026-11-05); Ulf's is not, whatever
     line he uses."""
     conn, repository = traffic
     await add_quo_elsewhere(conn, 30)
     await add_quo_elsewhere(conn, 31, line="PN-other")
     await add_quo_elsewhere(conn, 32, conversation="CN-other")
-    await add_quo_elsewhere(conn, 33, frm=GUNTHER)
+    await add_quo_elsewhere(conn, 33, frm=ULF)
     assert sorted(await refs(repository)) == ["message:30", "message:31", "message:32"]
 
 
@@ -470,10 +470,10 @@ async def test_a_zillow_relay_message_on_another_channel_is_listed(traffic):
 async def test_the_source_message_its_duplicates_and_certified_older_scrapes_are_not_news(traffic):
     conn, repository = traffic
     email = {"operation": Operation.EMAIL_SEND}  # the wake's channel is the conversation
-    await add_message(conn, sender=JESSICA, minute=10, message_id=1)  # the source message itself, re-ingested
-    await add_message(conn, sender=JESSICA, minute=11, message_id=50)
+    await add_message(conn, sender=TESS, minute=10, message_id=1)  # the source message itself, re-ingested
+    await add_message(conn, sender=TESS, minute=11, message_id=50)
     await conn.execute("UPDATE messages SET canonical_message_id = 1 WHERE id = 50")  # its canonical duplicate
-    await add_message(conn, sender=JESSICA, minute=12, message_id=51)  # a cross-channel duplicate
+    await add_message(conn, sender=TESS, minute=12, message_id=51)  # a cross-channel duplicate
     assert await refs(repository, **email, cross_channel_duplicate_message_ids=(51,)) == []
     await conn.execute("UPDATE messages SET source = 'zillow_rm_web_extract' WHERE id = 51")
     assert await refs(repository, **email, certified_older_message_ids=(51,)) == []
@@ -487,7 +487,7 @@ async def test_before_the_watermark_the_wake_channel_is_context_but_another_chan
     listed -- the old preflight refused it as newer_inbound); on another
     channel the context did not (listed, as the old preflight saw it)."""
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=7, message_id=60)
+    await add_message(conn, sender=TESS, minute=7, message_id=60)
     assert await refs(repository) == []
     await add_quo_elsewhere(conn, 61, minute=7)
     assert await refs(repository) == ["message:61"]
@@ -506,7 +506,7 @@ async def test_an_internal_notification_lists_what_was_received_not_its_chats_ot
         target=DerivedTarget("cliq_chat", "+12025550199", True),
         recipient_phone=None,
     )
-    await add_message(conn, sender=JESSICA, minute=10, message_id=70)
+    await add_message(conn, sender=TESS, minute=10, message_id=70)
     await conn.execute(
         "INSERT INTO messages (id,channel_id,created_at,sent_at,received_at,direction,body,source) "
         "VALUES (71,19,%s,%s,%s,'outbound','lead alert about someone else','zoho_cliq')",
@@ -518,8 +518,8 @@ async def test_an_internal_notification_lists_what_was_received_not_its_chats_ot
 @pytest.mark.asyncio
 async def test_as_of_replays_the_world_as_it_stood(traffic):
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=10, message_id=80)
-    await add_message(conn, sender=JESSICA, minute=14, message_id=81)
+    await add_message(conn, sender=TESS, minute=10, message_id=80)
+    await add_message(conn, sender=TESS, minute=14, message_id=81)
     items = await repository.newer_context(context(), limit=11, waive_shown=True, as_of=WATERMARK.replace(minute=12))
     assert [item.ref for item in items] == ["message:80"]
 
@@ -586,8 +586,8 @@ async def test_a_scrape_that_first_reached_cds_after_the_watermark_is_still_new(
 async def test_a_re_ingest_of_a_canonical_message_already_in_cds_is_not_new(traffic):
     conn, repository = traffic
     email = {"operation": Operation.EMAIL_SEND}
-    await add_message(conn, sender=JESSICA, minute=8, message_id=90)  # in context (before the watermark)
-    await add_message(conn, sender=JESSICA, minute=12, sent_minute=8, message_id=91)
+    await add_message(conn, sender=TESS, minute=8, message_id=90)  # in context (before the watermark)
+    await add_message(conn, sender=TESS, minute=12, sent_minute=8, message_id=91)
     await conn.execute("UPDATE messages SET canonical_message_id = 90, body = 'resent copy' WHERE id = 91")
     assert await refs(repository, **email) == []
     await conn.execute("UPDATE messages SET canonical_message_id = NULL WHERE id = 91")
@@ -597,10 +597,10 @@ async def test_a_re_ingest_of_a_canonical_message_already_in_cds_is_not_new(traf
 @pytest.mark.asyncio
 async def test_reaching_cds_is_received_at_not_the_send_time(traffic):
     """messages.created_at is a generated alias of sent_at in production. A
-    text Jessica sent before the watermark that reached CDS only after it was
+    text Tess sent before the watermark that reached CDS only after it was
     not in the agent's context (zoho_mail's median ingest lag is ~7 min)."""
     conn, repository = traffic
-    await add_message(conn, sender=JESSICA, minute=12, sent_minute=8, message_id=95)
+    await add_message(conn, sender=TESS, minute=12, sent_minute=8, message_id=95)
     assert await refs(repository) == ["message:95"]
     # Received before the watermark, it was context.
     await conn.execute("UPDATE messages SET received_at = %s WHERE id = 95", (WATERMARK.replace(minute=8),))
@@ -627,7 +627,7 @@ GENERAL_QA = dict(
     arguments={"text": "A plumber is booked for Monday.", "to_phone": TENANT},
     recipient_phone=TENANT,
     provider_account="PN-maintenance",
-    thread_identity="1424728044450751028",
+    thread_identity="1000000000000000028",
 )
 MAINTENANCE = dict(GENERAL_QA, source="quo", channel_id=MAINT_LINE_CHANNEL, prospect_id="subject:7ab2fbbe", thread_identity="CN-tenant")
 STAFF_ROLE = dict(
@@ -669,7 +669,7 @@ async def test_another_profiles_text_to_the_same_phone_is_news_whatever_its_subj
 @pytest.mark.asyncio
 async def test_another_profiles_send_to_someone_else_or_by_email_is_not_her_text(traffic):
     conn, repository = traffic
-    await add_other_profiles_send(conn, action_id=UUID(int=1), subject="subject:other", to=GUNTHER)
+    await add_other_profiles_send(conn, action_id=UUID(int=1), subject="subject:other", to=ULF)
     await add_other_profiles_send(conn, action_id=UUID(int=2), subject="subject:other", to=TENANT, operation="email.send")
     await add_other_profiles_send(conn, action_id=UUID(int=3), subject="subject:other", to=TENANT, minute=8)  # before the watermark
     await add_other_profiles_send(conn, action_id=UUID(int=4), subject="subject:other", to=TENANT, state="prepared")
@@ -684,7 +684,7 @@ async def test_a_cliq_woken_text_sees_her_newer_text_on_the_maintenance_line(tra
     conn, repository = traffic
     await add_quo_elsewhere(conn, 61, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", conversation="CN-tenant", minute=13)
     await add_quo_elsewhere(conn, 60, channel=MAINT_LINE_CHANNEL, frm=TENANT, line="PN-maintenance", minute=4)  # before the directive
-    await add_quo_elsewhere(conn, 62, channel=MAINT_LINE_CHANNEL, frm=GUNTHER, line="PN-maintenance", minute=13)
+    await add_quo_elsewhere(conn, 62, channel=MAINT_LINE_CHANNEL, frm=ULF, line="PN-maintenance", minute=13)
     items = await newer(repository, **GENERAL_QA)
     assert [(item.ref, item.label) for item in items] == [("message:61", "received")]
 
@@ -721,7 +721,7 @@ async def test_a_staff_role_text_is_checked_on_its_destination_only(traffic):
         "VALUES (70,%s,%s,%s,%s,'inbound','also check unit 2','zoho_cliq')",
         (CLIQ_CHANNEL, WATERMARK.replace(minute=11), WATERMARK.replace(minute=11), WATERMARK.replace(minute=11)),
     )
-    await add_other_profiles_send(conn, action_id=UUID(int=6), subject=f"internal:{TENANT}", to=GUNTHER)
+    await add_other_profiles_send(conn, action_id=UUID(int=6), subject=f"internal:{TENANT}", to=ULF)
     assert await refs(repository, **STAFF_ROLE) == []
     # The same wake's customer reply still matches its subject as before (a
     # text's own-channel match was always her phone's Quo messages only).

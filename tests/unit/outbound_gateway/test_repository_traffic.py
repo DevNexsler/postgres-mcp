@@ -47,7 +47,7 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
     assert params == [
         7,
         ctx.action_id,
-        "prospect:amanda",
+        "prospect:zara",
         44,
         ctx.source_sent_at,
         700,
@@ -93,7 +93,7 @@ async def test_newer_context_is_one_query_binding_the_action_its_recipient_and_t
 async def test_newer_context_maps_received_messages_and_our_sends_newest_first():
     rows = [
         Row({"message_id": 750826, "action_id": None, "created_at": datetime(2026, 9, 23, 19, 38, tzinfo=timezone.utc),
-             "direction": "inbound", "source": "zoho_cliq", "sender": "Dan Park", "preview": "skip the pong"}),
+             "direction": "inbound", "source": "zoho_cliq", "sender": "Dan Placeholder", "preview": "skip the pong"}),
         Row({"message_id": None, "action_id": OTHER_ACTION_ID, "created_at": datetime(2026, 9, 23, 19, 37, tzinfo=timezone.utc),
              "direction": "outbound", "source": "outbound_actions", "sender": "outbound gateway (cliq.chat.post)",
              "preview": "earlier reply"}),
@@ -104,5 +104,5 @@ async def test_newer_context_maps_received_messages_and_our_sends_newest_first()
         ("message:750826", "received"),
         (f"action:{OTHER_ACTION_ID}", "sent by us"),
     ]
-    assert items[0].sender == "Dan Park"
+    assert items[0].sender == "Dan Placeholder"
     assert calls[0][1][-6:] == [False, None, "email", "lead@convo.zillow.com", False, 2]

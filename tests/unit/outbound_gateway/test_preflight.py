@@ -44,8 +44,8 @@ def context(**overrides):
         "conversation_watermark": 700,
         "prospect_id": "prospect:a",
         "aliases": ("email:a@example.com",),
-        "property_id": "building:bullman",
-        "property_label": "138 Bullman St #144-A",
+        "property_id": "building:samplewood",
+        "property_label": "138 Samplewood St #144-A",
         "target": DerivedTarget("email_thread", "a@convo.zillow.com", True),
         "provider_account": "nigel-zoho",
         "routing_policy_version": "v1",
@@ -116,8 +116,8 @@ EARLIER_REPLY = RecentlyAnswered(
     wakeup_event_id=27994,
     intent="inquiry_reply",
     sent_at=NOW - timedelta(hours=27),
-    recipient="amc51816@gmail.com",
-    text_excerpt="Hi Amy",
+    recipient="wren-prospect@example.com",
+    text_excerpt="Hi Wren",
     reply_status="answered",
 )
 
@@ -152,8 +152,8 @@ def test_no_reply_a_requested_send_or_a_new_question_is_ready(answered):
 
 
 def test_a_handed_off_staff_directive_to_a_just_answered_tenant_is_ready():
-    """2026-11-05: maintenance-supervisor answered Christina Santiago on the
-    Maintenance line; Joycelyn's DM "inform tenant it has to be done Monday"
+    """2026-11-05: maintenance-supervisor answered Quinn Testerson on the
+    Maintenance line; Sage's DM "inform tenant it has to be done Monday"
     is handed to maintenance-supervisor as a CDS wake_handoff notice (CDS
     migration 286). That send is staff-requested, so the earlier reply does not
     refuse it; the same reply against her own repeated text still does."""
@@ -207,11 +207,11 @@ def bf41be6_loader_evidence(ctx):
 TARGETS = (
     DerivedTarget("email_thread", "a@convo.zillow.com", True),
     DerivedTarget("quo_conversation", "+15705550143", True),
-    DerivedTarget("cliq_chat", "1424728044450751028", True),
+    DerivedTarget("cliq_chat", "1000000000000000028", True),
     DerivedTarget("tenantcloud_thread", "6001", True),
     DerivedTarget("calendar", "nigel", True),
 )
-PROPERTIES = (None, "building:bullman", "building:other")
+PROPERTIES = (None, "building:samplewood", "building:other")
 SLOTS = (None, datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc), datetime(2026, 7, 18, 9, 0, tzinfo=timezone.utc))
 
 

@@ -5,11 +5,11 @@ functions (migration 269, vendored verbatim in
 fixtures/cds_contact_identity_269.sql), and the trigger-key matcher from
 migration 270 (fixtures/cds_prospect_replies_match_trigger_keys_270.sql).
 
-- Amy McDermott, 2026-10-07/09: TenantCloud lead 2512395. Wake 27994 emailed
+- Wren Fakerton, 2026-10-07/09: TenantCloud lead 9000011. Wake 27994 emailed
   her the viewing windows (action 95d784bf) for message 854668; 27 hours later
   message 856923 repeated the same text and wake 28084 emailed her again
   (action b7a380d1). Found.
-- Aimee Tapia, 2026-09-28: one tour request on two lanes. Wake 27332 (Zillow)
+- Bree Testaro, 2026-09-28: one tour request on two lanes. Wake 27332 (Zillow)
   emailed the relay at 20:09 (action 4fae7656); wake 27331 (TenantCloud, its
   trigger 816806 sent at 18:38, before that reply) emailed it again at 20:13
   (action 96f92ed3). Found.
@@ -83,18 +83,18 @@ TRIGGER_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cds_prospect_r
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cds_contact_identity_269.sql"
 UTC = timezone.utc
 
-AMY = "amc51816@gmail.com"
-AMY_FIRST_REPLY = UUID("95d784bf-0a66-59d1-9fb9-1e7d325d484a")
-AMY_REPEAT_REPLY = UUID("b7a380d1-3563-5577-8849-7f4240efb174")
-AMY_TEXT = "I am interested in this rental and would like to schedule a viewing. Please let me know when this would be possible."
-AIMEE_RELAY = "2p76acgkd4bm2i4j2pznecx07b1@convo.zillow.com"
-AIMEE_EMAIL = "aimee.tapia@example.com"
-AIMEE_PHONE = "+15705550143"
-AIMEE_ZILLOW_REPLY = UUID("4fae7656-5e0f-581f-af14-f50c842998c6")
-AIMEE_TC_REPLY = UUID("96f92ed3-033c-5484-8417-b89aa8fbbfb0")
-AIMEE_EXTRACT = (
-    f"prospect: Aimee Tapia | property: 138 Bullman St #144-A | phone: (570) 555-0143 | proxy_email: {AIMEE_RELAY} "
-    f"| direct_email: {AIMEE_EMAIL} | direction: prospect | message: I would like to schedule a tour."
+WREN = "wren-prospect@example.com"
+WREN_FIRST_REPLY = UUID("95d784bf-0a66-59d1-9fb9-1e7d325d484a")
+WREN_REPEAT_REPLY = UUID("b7a380d1-3563-5577-8849-7f4240efb174")
+WREN_TEXT = "I am interested in this rental and would like to schedule a viewing. Please let me know when this would be possible."
+BREE_RELAY = "fakefakefakefakefakefake001@convo.zillow.com"
+BREE_EMAIL = "bree.testaro@example.com"
+BREE_PHONE = "+15705550143"
+BREE_ZILLOW_REPLY = UUID("4fae7656-5e0f-581f-af14-f50c842998c6")
+BREE_TC_REPLY = UUID("96f92ed3-033c-5484-8417-b89aa8fbbfb0")
+BREE_EXTRACT = (
+    f"prospect: Bree Testaro | property: 138 Samplewood St #144-A | phone: (570) 555-0143 | proxy_email: {BREE_RELAY} "
+    f"| direct_email: {BREE_EMAIL} | direction: prospect | message: I would like to schedule a tour."
 )
 
 
@@ -281,23 +281,23 @@ async def action(
     )
 
 
-async def amy(conn) -> None:
-    """Amy: the same text twice on one TenantCloud lead, 27 h apart."""
-    payload = {"email": AMY, "message_data": {"auth_name": "Amy McDermott"}}
-    await message(conn, 854668, "tenantcloud_api", at("2026-10-07 21:40:22"), 1900001, AMY_TEXT, payload=payload)
-    await message(conn, 856923, "tenantcloud_api", at("2026-10-09 00:24:40"), 1900001, AMY_TEXT + "  ", payload=payload)
+async def wren(conn) -> None:
+    """Wren: the same text twice on one TenantCloud lead, 27 h apart."""
+    payload = {"email": WREN, "message_data": {"auth_name": "Wren Fakerton"}}
+    await message(conn, 854668, "tenantcloud_api", at("2026-10-07 21:40:22"), 1900001, WREN_TEXT, payload=payload)
+    await message(conn, 856923, "tenantcloud_api", at("2026-10-09 00:24:40"), 1900001, WREN_TEXT + "  ", payload=payload)
     await wake(conn, 27994, 854668)
     await wake(conn, 28084, 856923)
-    await action(conn, AMY_FIRST_REPLY, 27994, AMY, at("2026-10-07 21:48:07"), text="Hi Amy,\n\nThanks for reaching out about #7")
-    await action(conn, AMY_REPEAT_REPLY, 28084, AMY, at("2026-10-09 01:06:44"), text="Hi Amy, again")
+    await action(conn, WREN_FIRST_REPLY, 27994, WREN, at("2026-10-07 21:48:07"), text="Hi Wren,\n\nThanks for reaching out about #7")
+    await action(conn, WREN_REPEAT_REPLY, 28084, WREN, at("2026-10-09 01:06:44"), text="Hi Wren, again")
 
 
-AMY_AS_OF = at("2026-10-09 01:06:44")
+WREN_AS_OF = at("2026-10-09 01:06:44")
 
 
 # --- Courtney: staff accepted 50 ms after a new customer question -------------
 
-COURTNEY_RELAY = "courtney@convo.zillow.com"
+COURTNEY_RELAY = "prospect-c@convo.zillow.com"
 QUESTION_TIME = at("2026-10-23 15:42:26.000")
 INCIDENT_TIME = at("2026-10-23 15:45:35.357")
 DEPOSIT_QUESTION = "what would the deposit be to move in"
@@ -483,13 +483,13 @@ async def test_staff_exclusion_does_not_exempt_same_sender_repeated_body(conn, s
 
 @pytest.mark.asyncio
 async def test_amys_repeated_inquiry_finds_the_reply_she_already_got(conn, store) -> None:
-    await amy(conn)
+    await wren(conn)
 
-    [found] = await store.recently_answered(AMY_REPEAT_REPLY, as_of=AMY_AS_OF)
+    [found] = await store.recently_answered(WREN_REPEAT_REPLY, as_of=WREN_AS_OF)
 
-    assert found["action_id"] == AMY_FIRST_REPLY
-    assert (found["wakeup_event_id"], found["intent"], found["recipient"]) == (27994, "inquiry_reply", AMY)
-    assert found["reply_text"].startswith("Hi Amy,")
+    assert found["action_id"] == WREN_FIRST_REPLY
+    assert (found["wakeup_event_id"], found["intent"], found["recipient"]) == (27994, "inquiry_reply", WREN)
+    assert found["reply_text"].startswith("Hi Wren,")
     assert found["reply_status"] == "answered"
     assert found["sent_at"] == at("2026-10-07 21:48:10")
     # A repeat of her own earlier words, after our reply: still asked.
@@ -498,40 +498,40 @@ async def test_amys_repeated_inquiry_finds_the_reply_she_already_got(conn, store
 
 @pytest.mark.asyncio
 async def test_the_second_lane_finds_the_first_lanes_reply(conn, store) -> None:
-    await message(conn, 817301, "zillow_rm_web_extract", at("2026-09-28 18:38:00"), 1838192, AIMEE_EXTRACT)
+    await message(conn, 817301, "zillow_rm_web_extract", at("2026-09-28 18:38:00"), 1838192, BREE_EXTRACT)
     await message(conn, 816806, "tenantcloud_api", at("2026-09-28 18:38:44"), 1837476, "I would like to schedule a tour.")
     await wake(conn, 27332, 817301)
     await wake(conn, 27331, 816806)
-    await action(conn, AIMEE_ZILLOW_REPLY, 27332, AIMEE_RELAY, at("2026-09-28 20:09:24"), intent="showing_offer", text="slots")
+    await action(conn, BREE_ZILLOW_REPLY, 27332, BREE_RELAY, at("2026-09-28 20:09:24"), intent="showing_offer", text="slots")
     # The first reply, before the second lane's exists, finds nothing.
-    assert await store.recently_answered(AIMEE_ZILLOW_REPLY, as_of=at("2026-09-28 20:09:24")) == []
-    await action(conn, AIMEE_TC_REPLY, 27331, AIMEE_RELAY.upper(), at("2026-09-28 20:13:16"), text="units")
+    assert await store.recently_answered(BREE_ZILLOW_REPLY, as_of=at("2026-09-28 20:09:24")) == []
+    await action(conn, BREE_TC_REPLY, 27331, BREE_RELAY.upper(), at("2026-09-28 20:13:16"), text="units")
 
-    [found] = await store.recently_answered(AIMEE_TC_REPLY, as_of=at("2026-09-28 20:13:16"))
+    [found] = await store.recently_answered(BREE_TC_REPLY, as_of=at("2026-09-28 20:13:16"))
 
-    assert (found["action_id"], found["intent"]) == (AIMEE_ZILLOW_REPLY, "showing_offer")
+    assert (found["action_id"], found["intent"]) == (BREE_ZILLOW_REPLY, "showing_offer")
 
 
 @pytest.mark.asyncio
 async def test_a_new_question_after_our_reply_is_marked_new(conn, store) -> None:
-    await amy(conn)
-    await message(conn, 860001, "tenantcloud_api", at("2026-10-09 12:00:00"), 1900001, "Is parking included?", payload={"email": AMY})
+    await wren(conn)
+    await message(conn, 860001, "tenantcloud_api", at("2026-10-09 12:00:00"), 1900001, "Is parking included?", payload={"email": WREN})
     await wake(conn, 28200, 860001)
-    await action(conn, uid(1), 28200, AMY, at("2026-10-09 12:05:00"), state="received", completion_kind=None, detail_code="received")
+    await action(conn, uid(1), 28200, WREN, at("2026-10-09 12:05:00"), state="received", completion_kind=None, detail_code="received")
 
     rows = await store.recently_answered(uid(1), as_of=at("2026-10-09 12:05:00"))
 
-    assert [row["action_id"] for row in rows] == [AMY_REPEAT_REPLY, AMY_FIRST_REPLY]
+    assert [row["action_id"] for row in rows] == [WREN_REPEAT_REPLY, WREN_FIRST_REPLY]
     assert all(row["trigger_is_new_question"] for row in rows)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["zoho_cliq", "hermes_schedule", "comms_review_task", "wake_handoff"])
 async def test_a_staff_directive_or_a_schedule_carries_its_trigger_source(conn, store, source) -> None:
-    await amy(conn)
-    await message(conn, 860002, source, at("2026-10-09 01:20:00"), 407, "send Amy the application link")
+    await wren(conn)
+    await message(conn, 860002, source, at("2026-10-09 01:20:00"), 407, "send Wren the application link")
     await wake(conn, 28210, 860002)
-    await action(conn, uid(2), 28210, AMY, at("2026-10-09 01:21:00"), state="received", completion_kind=None, detail_code="received")
+    await action(conn, uid(2), 28210, WREN, at("2026-10-09 01:21:00"), state="received", completion_kind=None, detail_code="received")
 
     rows = await store.recently_answered(uid(2), as_of=at("2026-10-09 01:21:00"))
 
@@ -540,46 +540,46 @@ async def test_a_staff_directive_or_a_schedule_carries_its_trigger_source(conn, 
 
 @pytest.mark.asyncio
 async def test_only_other_wakes_sent_or_in_flight_customer_replies_inside_the_window_are_listed(conn, store) -> None:
-    await amy(conn)
-    as_of = AMY_AS_OF
+    await wren(conn)
+    as_of = WREN_AS_OF
     await action(conn, uid(11), 27000, "someone@else.com", at("2026-10-08 10:00:00"))
-    await action(conn, uid(12), 26000, AMY, as_of - timedelta(hours=72, minutes=1))
-    await action(conn, uid(13), 27990, AMY, at("2026-10-08 09:00:00"), state="rejected", completion_kind=None, detail_code="wake_terminal")
-    await action(conn, uid(14), 27991, AMY, at("2026-10-08 09:30:00"), detail_code="already_handled", completion_kind="duplicate")
-    await action(conn, uid(15), 27992, AMY, at("2026-10-08 10:00:00"), role="internal_notification", intent="manual_review_alert")
-    await action(conn, uid(16), 28084, AMY, at("2026-10-08 11:00:00"))  # this wake's own earlier reply
-    await action(conn, uid(17), 27993, AMY, at("2026-10-08 12:00:00"), intent="showing_confirmation")
-    await action(conn, uid(18), 27996, AMY, at("2026-10-08 13:00:00"))
+    await action(conn, uid(12), 26000, WREN, as_of - timedelta(hours=72, minutes=1))
+    await action(conn, uid(13), 27990, WREN, at("2026-10-08 09:00:00"), state="rejected", completion_kind=None, detail_code="wake_terminal")
+    await action(conn, uid(14), 27991, WREN, at("2026-10-08 09:30:00"), detail_code="already_handled", completion_kind="duplicate")
+    await action(conn, uid(15), 27992, WREN, at("2026-10-08 10:00:00"), role="internal_notification", intent="manual_review_alert")
+    await action(conn, uid(16), 28084, WREN, at("2026-10-08 11:00:00"))  # this wake's own earlier reply
+    await action(conn, uid(17), 27993, WREN, at("2026-10-08 12:00:00"), intent="showing_confirmation")
+    await action(conn, uid(18), 27996, WREN, at("2026-10-08 13:00:00"))
     await conn.execute("INSERT INTO outbound_action_quarantines VALUES (%s)", (uid(18),))
 
-    assert [row["action_id"] for row in await store.recently_answered(AMY_REPEAT_REPLY, as_of=as_of)] == [AMY_FIRST_REPLY]
+    assert [row["action_id"] for row in await store.recently_answered(WREN_REPEAT_REPLY, as_of=as_of)] == [WREN_FIRST_REPLY]
 
 
 @pytest.mark.asyncio
 async def test_a_reply_in_flight_is_listed_as_in_flight(conn, store) -> None:
-    await amy(conn)
-    await action(conn, uid(20), 28001, AMY, at("2026-10-09 01:06:40"), state="prepared", completion_kind=None, detail_code="prepared")
+    await wren(conn)
+    await action(conn, uid(20), 28001, WREN, at("2026-10-09 01:06:40"), state="prepared", completion_kind=None, detail_code="prepared")
 
-    rows = await store.recently_answered(AMY_REPEAT_REPLY, as_of=AMY_AS_OF)
+    rows = await store.recently_answered(WREN_REPEAT_REPLY, as_of=WREN_AS_OF)
 
-    assert [(row["action_id"], row["reply_status"]) for row in rows] == [(uid(20), "in_flight"), (AMY_FIRST_REPLY, "answered")]
+    assert [(row["action_id"], row["reply_status"]) for row in rows] == [(uid(20), "in_flight"), (WREN_FIRST_REPLY, "answered")]
 
 
 @pytest.mark.asyncio
 async def test_unknown_action_finds_nothing(store) -> None:
-    assert await store.recently_answered(uid(99), as_of=AMY_AS_OF) == []
+    assert await store.recently_answered(uid(99), as_of=WREN_AS_OF) == []
 
 
 # --- one person, three addresses ---------------------------------------------
 
 
-async def aimee_lanes(conn) -> None:
+async def bree_lanes(conn) -> None:
     """Wake 30001: Zillow extract (proxy, direct email, phone). Wake 30002:
     TenantCloud lead whose payload carries her email and phone."""
-    await message(conn, 900001, "zillow_rm_web_extract", at("2026-10-18 10:00:00"), 5001, AIMEE_EXTRACT)
+    await message(conn, 900001, "zillow_rm_web_extract", at("2026-10-18 10:00:00"), 5001, BREE_EXTRACT)
     await message(
         conn, 900002, "tenantcloud_api", at("2026-10-18 10:00:05"), 5002, "I would like to schedule a tour.",
-        payload={"email": AIMEE_EMAIL, "phone": AIMEE_PHONE},
+        payload={"email": BREE_EMAIL, "phone": BREE_PHONE},
     )  # fmt: skip
     await wake(conn, 30001, 900001)
     await wake(conn, 30002, 900002)
@@ -590,13 +590,13 @@ AS_OF = at("2026-10-18 11:00:00")
 
 @pytest.mark.asyncio
 async def test_the_contact_keys_are_the_trigger_messages_and_the_recipients(conn, store) -> None:
-    await aimee_lanes(conn)
+    await bree_lanes(conn)
     await action(conn, uid(31), 30001, "+1 (570) 555-0143", at("2026-10-18 10:01:00"), state="received", completion_kind=None)
 
     keys = await store.contact_keys(uid(31))
 
-    hashed = "email_sha256:" + sha256(AIMEE_EMAIL.encode()).hexdigest()
-    assert {f"email:{AIMEE_EMAIL}", f"email:{AIMEE_RELAY}", "phone:5705550143", hashed} <= set(keys)
+    hashed = "email_sha256:" + sha256(BREE_EMAIL.encode()).hexdigest()
+    assert {f"email:{BREE_EMAIL}", f"email:{BREE_RELAY}", "phone:5705550143", hashed} <= set(keys)
     assert keys == sorted(keys)
 
 
@@ -604,15 +604,15 @@ async def test_the_contact_keys_are_the_trigger_messages_and_the_recipients(conn
 @pytest.mark.parametrize(
     ("earlier_wake", "earlier_to", "later_wake", "later_to"),
     [
-        (30001, AIMEE_PHONE, 30002, AIMEE_EMAIL),  # SMS, then email
-        (30001, AIMEE_RELAY, 30001 + 10, AIMEE_EMAIL),  # Zillow proxy, then email
-        (30002, AIMEE_EMAIL, 30001, AIMEE_PHONE),  # email, then SMS
-        (30002, AIMEE_EMAIL, 30001, AIMEE_RELAY),  # email, then Zillow proxy
-        (30002, "(570) 555-0143", 30001, AIMEE_RELAY),  # phone (any format), then proxy
+        (30001, BREE_PHONE, 30002, BREE_EMAIL),  # SMS, then email
+        (30001, BREE_RELAY, 30001 + 10, BREE_EMAIL),  # Zillow proxy, then email
+        (30002, BREE_EMAIL, 30001, BREE_PHONE),  # email, then SMS
+        (30002, BREE_EMAIL, 30001, BREE_RELAY),  # email, then Zillow proxy
+        (30002, "(570) 555-0143", 30001, BREE_RELAY),  # phone (any format), then proxy
     ],
 )
 async def test_a_reply_to_any_of_her_addresses_counts_against_another(conn, store, earlier_wake, earlier_to, later_wake, later_to) -> None:
-    await aimee_lanes(conn)
+    await bree_lanes(conn)
     await wake(conn, 30011, 900001)  # a second Zillow-lane wake on the same extract
     await action(conn, uid(41), earlier_wake, earlier_to, at("2026-10-18 10:01:00"))
     await action(conn, uid(42), later_wake, later_to, at("2026-10-18 10:30:00"), state="received", completion_kind=None)
@@ -624,7 +624,7 @@ async def test_a_reply_to_any_of_her_addresses_counts_against_another(conn, stor
 
 @pytest.mark.asyncio
 async def test_someone_else_on_the_same_lane_does_not_count(conn, store) -> None:
-    await aimee_lanes(conn)
+    await bree_lanes(conn)
     await action(conn, uid(51), 30001, "+19085550199", at("2026-10-18 10:01:00"))
     await message(conn, 900003, "quo", at("2026-10-18 10:10:00"), 5003, "hi", identifier="+19085550123")
     await wake(conn, 30003, 900003)
@@ -679,7 +679,7 @@ def service_on(store: PostgresActionStore, *, lock_ms: int = 5000) -> OutboundAc
     )
 
 
-def zillow_lane_sms(text: str = "Hi Aimee, we show weekdays 7:00-3:30.") -> Any:
+def zillow_lane_sms(text: str = "Hi Bree, we show weekdays 7:00-3:30.") -> Any:
     return parse_outbound_request(
         {
             "op": "execute",
@@ -687,12 +687,12 @@ def zillow_lane_sms(text: str = "Hi Aimee, we show weekdays 7:00-3:30.") -> Any:
             "action_role": "prospect_reply",
             "operation": "quo.sms.send",
             "intent_kind": "inquiry_reply",
-            "arguments": {"text": text, "to_phone": AIMEE_PHONE},
+            "arguments": {"text": text, "to_phone": BREE_PHONE},
         }
     )
 
 
-def tenantcloud_lane_email(text: str = "Hi Aimee, how about Tuesday at 10?") -> Any:
+def tenantcloud_lane_email(text: str = "Hi Bree, how about Tuesday at 10?") -> Any:
     return parse_outbound_request(
         {
             "op": "execute",
@@ -701,14 +701,14 @@ def tenantcloud_lane_email(text: str = "Hi Aimee, how about Tuesday at 10?") -> 
             "operation": "email.send",
             "intent_kind": "showing_offer",
             "appointment_slot": "2026-10-20T14:00:00Z",
-            "arguments": {"text": text, "to_address": AIMEE_EMAIL, "cc": []},
+            "arguments": {"text": text, "to_address": BREE_EMAIL, "cc": []},
         }
     )
 
 
 @pytest_asyncio.fixture
 async def pooled(conn, database):
-    await aimee_lanes(conn)
+    await bree_lanes(conn)
     pool = DbConnPool(database)
     await pool.pool_connect()
     try:
@@ -761,7 +761,7 @@ async def test_the_second_lane_later_is_refused_naming_the_first(conn, pooled) -
 
     assert first.status is PublicStatus.PENDING
     assert (second.status, second.detail_code) == (PublicStatus.REJECTED, RECENTLY_ANSWERED_DETAIL)
-    assert second.recently_answered[0].recipient == AIMEE_PHONE
+    assert second.recently_answered[0].recipient == BREE_PHONE
 
 
 @pytest.mark.asyncio
@@ -785,7 +785,7 @@ async def test_a_contact_lock_held_past_the_wait_refuses_retryably_and_records_n
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing", ["prospect_replies_to_keys(text[], timestamptz, boolean, timestamptz)", "message_contact_keys(bigint)"])
 async def test_without_comm_data_stores_functions_the_reply_still_goes_out(conn, pooled, missing) -> None:
-    await action(conn, uid(61), 30009, AIMEE_PHONE, datetime.now(UTC) - timedelta(minutes=5))
+    await action(conn, uid(61), 30009, BREE_PHONE, datetime.now(UTC) - timedelta(minutes=5))
     await conn.execute(f"DROP FUNCTION {missing} CASCADE")
 
     result = await service_on(pooled).enqueue(zillow_lane_sms())

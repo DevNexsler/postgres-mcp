@@ -90,10 +90,10 @@ def context(operation=Operation.EMAIL_SEND, **overrides):
         source_sent_at=NOW,
         conversation_id="conversation:zillow-1",
         conversation_watermark=700,
-        prospect_id="prospect:amanda",
-        aliases=("email:amanda@example.com",),
-        property_id="building:bullman-st",
-        property_label="138 Bullman St #144-A",
+        prospect_id="prospect:zara",
+        aliases=("email:zara@example.com",),
+        property_id="building:samplewood-st",
+        property_label="138 Samplewood St #144-A",
         target=target,
         provider_account="nigel-zoho"
         if operation is Operation.EMAIL_SEND
@@ -108,8 +108,8 @@ def context(operation=Operation.EMAIL_SEND, **overrides):
         thread_identity="zrm-thread-1",
         showing_lifecycle_id="showing:7",
         calendar_event_uid="existing-event" if operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE} else None,
-        source_subject="Zillow inquiry for 138 Bullman St #144-A",
-        prospect_name="Amanda Snyder",
+        source_subject="Zillow inquiry for 138 Samplewood St #144-A",
+        prospect_name="Zara Samplerson",
         recipient_phone="+19085550199" if operation is Operation.QUO_SMS_SEND else None,
         calendar_event_url="https://calendar.local/events/existing-event.ics"
         if operation in {Operation.CALENDAR_UPDATE, Operation.CALENDAR_DELETE}
@@ -212,7 +212,7 @@ def test_effect_call_tool_error_result_with_no_transport_kind_is_definitive_non_
 
 def test_provider_permanent_upstream_error_is_definitive_non_acceptance():
     """wake 27327 (2026-09-28 20:14:53Z): a cliq.chat.post to chat
-    1608777531604898891 whose Agent Email job finished status=failed,
+    1000000000000000091 whose Agent Email job finished status=failed,
     category=provider_permanent_upstream_error -- the provider itself said
     the rejection is permanent. CDS confirms it was never delivered (a
     sibling DM sent at the same second WAS delivered), yet this classified
@@ -357,7 +357,7 @@ async def test_email_adapter_derives_recipient_and_returns_structured_receipt():
         "account_id": "nigel-zoho",
         "to": [{"address": "lead@convo.zillow.com"}],
         "cc": [{"address": "management@pfg.io"}],
-        "subject": "Re: Zillow inquiry for 138 Bullman St #144-A",
+        "subject": "Re: Zillow inquiry for 138 Samplewood St #144-A",
         "text": "Friday at 10:30 works. — Nigel",
         "outbound_action_uid": str(ACTION_UID),
     }
@@ -783,7 +783,7 @@ async def test_calendar_adapter_uses_deterministic_uid_and_exact_revision(operat
     assert request.arguments["calendar"] == "nigel"
     if operation is Operation.CALENDAR_CREATE:
         assert request.arguments["uid"] == str(ACTION_UID)
-        assert request.arguments["location"] == "138 Bullman St #144-A"
+        assert request.arguments["location"] == "138 Samplewood St #144-A"
         assert request.arguments["end"] == "2026-07-17T15:00:00Z"
     else:
         assert request.arguments["event_url"].endswith("existing-event.ics")
@@ -849,14 +849,14 @@ async def test_calendar_adapter_accepts_structured_event_object_from_async_job_r
     event = {
         "id": "created-event",
         "uid": "7ea7586e-64d1-4c7b-9c1a-2b6a6f9d6a11",
-        "summary": "Tour — Amanda Snyder",
+        "summary": "Tour — Zara Samplerson",
         "start": "2026-07-17T14:30:00Z",
         "end": "2026-07-17T15:00:00Z",
         "all_day": False,
         "recurring": False,
         "calendar": "nigel",
         "description": "Tour",
-        "location": "138 Bullman St #144-A",
+        "location": "138 Samplewood St #144-A",
         "event_url": "https://calendar.local/events/created-event.ics",
         "etag": "",
         "sequence": 0,
@@ -1828,7 +1828,7 @@ class TruncatingTenantCloudThread:
             return None
         return FakeMutationObservation(
             target_reference=f"thread:{thread_id}",
-            provider_object_id="11742638",
+            provider_object_id="90000010",
             canonical_observed_state={"thread_id": str(thread_id), "body": body},
         )
 
@@ -1889,19 +1889,19 @@ def test_email_adapter_uses_the_agents_subject_and_sends_its_cc_exactly():
         context(arguments=MappingProxyType({
             "text": "Ticket #1569606 is open.",
             "subject": "Maintenance ticket #1569606",
-            "cc": ["dan@pfg.io", "MANAGEMENT@pfg.io"],
+            "cc": ["staff-a@pfg.io", "MANAGEMENT@pfg.io"],
         })),
         ACTION_UID,
     )
     assert request.arguments["subject"] == "Maintenance ticket #1569606"
     # The agent's cc replaces the per-source copy rather than adding to it.
-    assert request.arguments["cc"] == [{"address": "dan@pfg.io"}, {"address": "MANAGEMENT@pfg.io"}]
+    assert request.arguments["cc"] == [{"address": "staff-a@pfg.io"}, {"address": "MANAGEMENT@pfg.io"}]
 
 
 def test_email_adapter_without_a_subject_still_replies_on_the_wakes_thread():
     adapter = EmailAdapter(sender_domains={"nigel-zoho": "pfg.io"})
     request = adapter.build_request(context(), ACTION_UID)
-    assert request.arguments["subject"] == "Re: Zillow inquiry for 138 Bullman St #144-A"
+    assert request.arguments["subject"] == "Re: Zillow inquiry for 138 Samplewood St #144-A"
     assert "cc" not in request.arguments
 
 
@@ -1914,25 +1914,25 @@ def test_calendar_adapter_builds_a_maintenance_visit_from_the_agents_details(ope
     request = adapter.build_request(
         context(operation, arguments=MappingProxyType({
             "description": "Replace bathroom faucet cartridge",
-            "title": "Repair — 163 Washington St Unit 1",
+            "title": "Repair — 163 Placeholder St Unit 1",
             "duration_minutes": 120,
-            "location": "163 Washington St Unit 1",
-            "attendees": ["gunther@pfg.io", "rafael@pfg.io"],
+            "location": "163 Placeholder St Unit 1",
+            "attendees": ["staff-c@pfg.io", "staff-b@pfg.io"],
         })),
         ACTION_UID,
     )
     assert request.tool == tool
-    assert request.arguments["summary"] == "Repair — 163 Washington St Unit 1"
+    assert request.arguments["summary"] == "Repair — 163 Placeholder St Unit 1"
     assert request.arguments["end"] == "2026-07-17T16:30:00Z"
-    assert request.arguments["location"] == "163 Washington St Unit 1"
-    assert request.arguments["attendees"] == [{"email": "gunther@pfg.io"}, {"email": "rafael@pfg.io"}]
+    assert request.arguments["location"] == "163 Placeholder St Unit 1"
+    assert request.arguments["attendees"] == [{"email": "staff-c@pfg.io"}, {"email": "staff-b@pfg.io"}]
 
 
 def test_calendar_adapter_defaults_still_make_a_tour():
     request = CalendarAdapter(account_by_calendar={"nigel": "nigel-zoho"}).build_request(
         context(Operation.CALENDAR_CREATE), ACTION_UID
     )
-    assert request.arguments["summary"] == "Tour — Amanda Snyder"
+    assert request.arguments["summary"] == "Tour — Zara Samplerson"
     assert request.arguments["end"] == "2026-07-17T15:00:00Z"
     assert "attendees" not in request.arguments
 
@@ -2166,7 +2166,7 @@ async def test_quo_missing_dispatch_timestamp_cannot_adopt_an_older_send():
 
 
 @pytest.mark.parametrize("operation", [Operation.CLIQ_CHANNEL_POST, Operation.CLIQ_CHAT_POST])
-@pytest.mark.parametrize("text", ["{@100000001} please check", "{@200000002} {@300000003}", "@Laura laura@example.invalid"])
+@pytest.mark.parametrize("text", ["{@100000001} please check", "{@200000002} {@300000003}", "@Rhea rhea@example.invalid"])
 def test_cliq_preserves_agent_authored_mentions_without_name_rewriting(operation, text):
     original = context(operation, arguments=MappingProxyType({"text": text}))
     request = CliqAdapter(operation).build_request(original, ACTION_UID)

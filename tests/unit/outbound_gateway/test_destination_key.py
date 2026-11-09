@@ -43,7 +43,7 @@ TENANT = "+12025550142"
         (Operation.QUO_SMS_SEND, "555", None),
         (Operation.EMAIL_SEND, " Tenant@Example.COM ", "email:tenant@example.com"),
         (Operation.EMAIL_SEND, "not-an-address", None),
-        (Operation.CLIQ_CHAT_POST, "1424728044450751028", None),
+        (Operation.CLIQ_CHAT_POST, "1000000000000000028", None),
         (Operation.CLIQ_CHANNEL_POST, "tenantmanagementchat", None),
         (Operation.TENANTCLOUD_MESSAGE_SEND, "123", None),
         (Operation.QUO_SMS_SEND, "", None),

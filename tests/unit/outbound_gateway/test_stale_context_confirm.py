@@ -52,9 +52,9 @@ from postgres_mcp.outbound_gateway.service import OutboundActionRecord
 from postgres_mcp.outbound_gateway.service import OutboundActionService
 
 WAKE = 27164
-CHAT = "1424728044450751028"
+CHAT = "1000000000000000028"
 # A staff review channel: not the conversation that woke the wake.
-REVIEW_CHAT = "CT_2243179624167910134_721156495"
+REVIEW_CHAT = "CT_1000000000000000034_700000099"
 SUBJECT = f"internal:{CHAT}"
 # Real timeline, wake 27164 (UTC).
 WATERMARK = datetime(2026, 9, 23, 19, 36, 29, 938418, tzinfo=timezone.utc)
@@ -68,7 +68,7 @@ CRON_ALERT = NewerActivity(
     preview="wait, is that cron alert about the gateway you are testing?",
     message_id=750824,
     action_id=None,
-    sender="Dan Park",
+    sender="Dan Placeholder",
 )
 DAN_FOLLOW_UP = NewerActivity(
     direction="inbound",
@@ -77,7 +77,7 @@ DAN_FOLLOW_UP = NewerActivity(
     preview="never mind, skip the pong",
     message_id=750826,
     action_id=None,
-    sender="Dan Park",
+    sender="Dan Placeholder",
 )
 
 
@@ -645,11 +645,11 @@ async def test_internal_notification_never_asks_the_stale_context_question():
 @pytest.mark.asyncio
 async def test_internal_notification_back_into_the_waking_cliq_channel_asks_the_stale_context_question():
     """Wake 30443, 2026-11-02: Dan asked a question in #Tenant Management
-    Chat, Laura answered it in the same channel at 11:04, and Nigel's reply
+    Chat, Rhea answered it in the same channel at 11:04, and Nigel's reply
     posts -- an org-channel reply can only be an internal_notification
     cliq.channel.post -- went out at 11:19, 11:22 and 11:35 without anyone
     asking whether the thread had moved on; the last one called the reason
-    Laura had already given "still unknown". A post into the conversation
+    Rhea had already given "still unknown". A post into the conversation
     that woke the wake is a reply in that conversation, whatever its role."""
     service, store, _probe, adapter = harness(DAN_FOLLOW_UP)
     reply = parse_outbound_request(
@@ -805,7 +805,7 @@ async def test_newer_activity_after_the_refusal_raises_another_question_on_the_s
     assert result.status is PublicStatus.NEEDS_CONFIRMATION
     assert result.action_id == SUCCESSOR
     assert [item.id for item in result.new_context] == ["message:750826"]
-    assert result.new_context[0].sender == "Dan Park"
+    assert result.new_context[0].sender == "Dan Placeholder"
     assert f'"action_id": "{SUCCESSOR}"' in result.question
     assert adapter.sent == []
     assert store.rows[SUCCESSOR].state is ActionState.STALE
@@ -1022,7 +1022,7 @@ def quo_reply_request(text: str = "Yes, Friday at 10 still works.") -> ExecuteRe
     return parsed
 
 
-QUO_TEXT = replace(CRON_ALERT, source="quo", preview="Is Friday still open?", sender="Jessica")
+QUO_TEXT = replace(CRON_ALERT, source="quo", preview="Is Friday still open?", sender="Tess")
 
 
 @pytest.mark.asyncio
@@ -1240,7 +1240,7 @@ async def test_wire_shape_of_needs_confirmation_and_of_an_ordinary_result():
             "id": "message:750824",
             "source": "zoho_cliq",
             "direction": "received",
-            "sender": "Dan Park",
+            "sender": "Dan Placeholder",
             "occurred_at": CRON_ALERT_AT.isoformat().replace("+00:00", "Z"),
             "preview": "wait, is that cron alert about the gateway you are testing?",
         }

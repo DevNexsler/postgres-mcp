@@ -102,18 +102,18 @@ def test_quo_sending_lines_are_config_keyed_on_the_number_from_phone_names(monke
     assert _quo_sending_lines() == {}
     monkeypatch.setenv(
         "OUTBOUND_QUO_SENDING_LINES_JSON",
-        '{" +16107095575 ": "PN8ujudrpa", "+17579972130": " PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}',
+        '{" +16105550175 ": "PNfakeAAA1", "+17575550130": " PNfakeBBB2", "+14845550120": "PNfakeCCC3"}',
     )
-    assert _quo_sending_lines() == {"+16107095575": "PN8ujudrpa", "+17579972130": "PNkmv4nD54", "+14846260220": "PNvHh9Fq2k"}
+    assert _quo_sending_lines() == {"+16105550175": "PNfakeAAA1", "+17575550130": "PNfakeBBB2", "+14845550120": "PNfakeCCC3"}
 
 
 @pytest.mark.parametrize(
     ("raw", "words"),
     [
         ("{not json", "Expecting property name"),
-        ('["+16107095575"]', "must be a JSON string-to-string object"),
-        ('{"6107095575": "PN8ujudrpa"}', "keys must be E.164 phone numbers"),
-        ('{"+16107095575": "  "}', "values must be Quo phone_number_ids"),
+        ('["+16105550175"]', "must be a JSON string-to-string object"),
+        ('{"6105550175": "PNfakeAAA1"}', "keys must be E.164 phone numbers"),
+        ('{"+16105550175": "  "}', "values must be Quo phone_number_ids"),
     ],
 )
 def test_malformed_quo_sending_lines_stop_the_gateway_at_start(monkeypatch, raw, words):
@@ -541,7 +541,7 @@ def test_focused_server_tool_description_names_the_override_only_as_op_confirm_a
 @pytest.mark.asyncio
 async def test_suggest_returns_ids_the_wake_implies():
     service = AsyncMock()
-    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
+    service.suggest_targets.return_value = {"lead_id": "9000005", "thread_id": "9000007"}
     policy = FeaturePolicy(writes_enabled=True, kill_switch=False)
 
     result = await handle_outbound_action(
@@ -551,7 +551,7 @@ async def test_suggest_returns_ids_the_wake_implies():
     )
 
     assert result["wakeup_event_id"] == 1
-    assert result["suggestions"] == {"lead_id": "2405115", "thread_id": "2002331"}
+    assert result["suggestions"] == {"lead_id": "9000005", "thread_id": "9000007"}
     service.suggest_targets.assert_awaited_once_with(1)
 
 
@@ -574,7 +574,7 @@ async def test_suggest_returns_empty_for_a_wake_with_no_hints():
 async def test_suggest_never_writes_and_ignores_the_kill_switch():
     """Advisory reads stay available even when writes are disabled."""
     service = AsyncMock()
-    service.suggest_targets.return_value = {"lead_id": "2405115", "thread_id": "2002331"}
+    service.suggest_targets.return_value = {"lead_id": "9000005", "thread_id": "9000007"}
     policy = FeaturePolicy(writes_enabled=False, kill_switch=True)
 
     result = await handle_outbound_action(
@@ -779,7 +779,7 @@ def test_reject_tenantcloud_origin_overrides_is_a_noop_without_any_override_env(
     ],
 )
 def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_path, monkeypatch, bad_url):
-    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
+    real_scripts = Path("/home/operator/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 
@@ -788,7 +788,7 @@ def test_tenantcloud_fails_closed_for_non_loopback_or_malformed_runner_url(tmp_p
     monkeypatch.setenv("TENANTCLOUD_RUNNER_CONTROL_URL", bad_url)
     monkeypatch.setenv("TENANTCLOUD_RUNNER_BEARER_FILE", str(bearer_file))
     monkeypatch.setenv("TENANTCLOUD_MODULE_DIR", str(real_scripts))
-    monkeypatch.setenv("WEB_USAGE_WORKSPACE", "/home/danpark/workspace")
+    monkeypatch.setenv("WEB_USAGE_WORKSPACE", "/home/operator/workspace")
 
     with pytest.raises(ValueError):
         _tenantcloud_adapters(frozenset(TENANTCLOUD_OPERATIONS))
@@ -802,9 +802,9 @@ def test_tenantcloud_import_resolves_under_container_shaped_web_usage_mount(tmp_
     The real tenantcloud_auth.py module must resolve its module-level
     `from web_usage_runner_control import build_runner_curl_command` in that
     shape -- not merely when the developer's full host workspace happens to
-    already sit at /home/danpark/workspace. Reproduces the container
+    already sit at /home/operator/workspace. Reproduces the container
     ModuleNotFoundError crash-loop reported in review."""
-    real_scripts = Path("/home/danpark/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
+    real_scripts = Path("/home/operator/projects/Comm-Data-Store/.worktrees/tenantcloud-gateway-writes/scripts")
     if not (real_scripts / "tenantcloud_auth.py").is_file():
         pytest.skip("real CDS scripts checkout unavailable in this environment")
 

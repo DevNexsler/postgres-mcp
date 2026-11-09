@@ -281,17 +281,17 @@ def test_tenantcloud_arguments_carry_agent_supplied_targets():
         "op": "execute", "wakeup_event_id": 1, "action_role": "prospect_reply",
         "operation": "tenantcloud.message.send", "intent_kind": "inquiry_reply",
         "appointment_slot": None,
-        "arguments": {"thread_id": 2002331, "text": "Thanks"},
+        "arguments": {"thread_id": 9000007, "text": "Thanks"},
     })
-    assert msg.arguments.thread_id == 2002331
+    assert msg.arguments.thread_id == 9000007
 
     lead = parse_outbound_request({
         "op": "execute", "wakeup_event_id": 1, "action_role": "provider_mutation",
         "operation": "tenantcloud.lead.status.update", "intent_kind": "tenantcloud_lead_status",
         "appointment_slot": None,
-        "arguments": {"lead_id": 2405115, "status": "working"},
+        "arguments": {"lead_id": 9000005, "status": "working"},
     })
-    assert lead.arguments.lead_id == 2405115
+    assert lead.arguments.lead_id == 9000005
 
 
 @pytest.mark.parametrize("bad", [0, -1, "12", 1.5, None, True])
@@ -485,12 +485,12 @@ def test_quo_from_phone_is_only_stripped_so_context_can_answer_with_the_lines():
         )
 
     assert quo().arguments.from_phone is None
-    assert quo(from_phone=" +17579972130 ").arguments.from_phone == "+17579972130"
-    assert quo(from_phone=" (757) 997-2130 ").arguments.from_phone == "(757) 997-2130"
+    assert quo(from_phone=" +17575550130 ").arguments.from_phone == "+17575550130"
+    assert quo(from_phone=" (757) 555-0130 ").arguments.from_phone == "(757) 555-0130"
     assert quo(from_phone="   ").arguments.from_phone is None
 
 
-@pytest.mark.parametrize("bad", [5, True, ["+17579972130"]])
+@pytest.mark.parametrize("bad", [5, True, ["+17575550130"]])
 def test_quo_from_phone_rejects_non_string_values(bad):
     with pytest.raises(ValidationError, match="from_phone must be a string"):
         QuoSmsArguments.model_validate({"to_phone": "+19085550100", "text": "Thanks", "from_phone": bad})
@@ -841,17 +841,17 @@ def test_a_stored_over_long_message_still_rebuilds_so_it_can_settle():
 
 
 SAMPLE_ARGUMENTS = {
-    Operation.EMAIL_SEND: {"to_address": "dan@pfg.io", "text": "hi"},
-    Operation.QUO_SMS_SEND: {"to_phone": "+12015756789", "text": "hi", "from_phone": "+16107095575"},
+    Operation.EMAIL_SEND: {"to_address": "staff-a@pfg.io", "text": "hi"},
+    Operation.QUO_SMS_SEND: {"to_phone": "+12015550189", "text": "hi", "from_phone": "+16105550175"},
     Operation.CLIQ_CHANNEL_POST: {"channel_or_chat_id": "tenant-leads", "text": "hi"},
     Operation.CLIQ_CHAT_POST: {"channel_or_chat_id": "CT_1", "text": "hi"},
     Operation.CALENDAR_CREATE: {"calendar_id": "nigel"},
     Operation.CALENDAR_UPDATE: {"calendar_id": "nigel"},
     Operation.CALENDAR_DELETE: {"calendar_id": "nigel"},
     Operation.TENANTCLOUD_MESSAGE_SEND: {"thread_id": 1270770, "text": "hi"},
-    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"lead_id": 1803629, "status": "working"},
+    Operation.TENANTCLOUD_LEAD_STATUS_UPDATE: {"lead_id": 9000006, "status": "working"},
     Operation.TENANTCLOUD_MAINTENANCE_CREATE: {
-        "property_id": 621905, "unit_id": 1035381, "category_id": 13, "title": "Faucet",
+        "property_id": 900008, "unit_id": 9000009, "category_id": 13, "title": "Faucet",
         "priority": "normal", "initiated_at": "2026-09-25", "text": "Dripping", "entry_allowed": False,
     },
     Operation.TENANTCLOUD_MAINTENANCE_STATUS_UPDATE: {"request_id": 1569606, "status": 3},

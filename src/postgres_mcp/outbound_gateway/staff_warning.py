@@ -14,7 +14,7 @@ creates the row with CDS's ``create_outbound_delivery_escalation()``
 (migration 279). That wake has usually ended by the time a send gives up --
 and a TenantCloud wake's claim has closed -- so an ordinary row there is
 refused (``wake_terminal``, or ``guard_tenantcloud_outbound_action_ownership``:
-10/27, the escalations for Mary Haas's and Charles Serpone's dropped replies
+10/27, the escalations for two tenants' dropped replies
 both died this way). CDS lets this row through because it names a failed
 action CDS can check, one escalation per failed action; an agent has no way to
 create one.

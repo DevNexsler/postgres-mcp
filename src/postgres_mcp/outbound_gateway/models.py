@@ -1126,8 +1126,8 @@ class RecentlyAnswered(StrictModel):
     contact keys), or is sending right now, inside Comm-Data-Store's
     contact_recently_answered_window(): what the agent must read before it
     sends another. 2026-09-28
-    (wakes 27331/27332, one tour request on two lanes) and 2026-10-09 (Amy
-    McDermott's repeated TenantCloud inquiry, wake 28084): a second wake
+    (wakes 27331/27332, one tour request on two lanes) and 2026-10-09 (a
+    prospect's repeated TenantCloud inquiry, wake 28084): a second wake
     answered a prospect who already had an answer, in different words, so
     byte-identical idempotency never saw it."""
 

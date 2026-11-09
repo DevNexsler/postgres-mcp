@@ -3,7 +3,7 @@
 72 hours is refused once, naming that reply; the agent sends nothing or
 overrides with a reason. Never a silent drop.
 
-2026-10-09, wake 28084: Amy McDermott re-sent her TenantCloud inquiry 27 hours
+2026-10-09, wake 28084: Wren Fakerton re-sent her TenantCloud inquiry 27 hours
 after wake 27994 had emailed her the viewing windows (action 95d784bf). The
 new wake did not see that reply's text and emailed her again in different
 words; byte-identical idempotency could not tell. 2026-09-28, wakes
@@ -51,9 +51,9 @@ WAKE = stale_tests.WAKE
 REFUSED = stale_tests.action_id_for(WAKE, "prospect_reply", 0)
 SUCCESSOR = stale_tests.action_id_for(WAKE, "prospect_reply", 1)
 EARLIER = UUID("95d784bf-0a66-59d1-9fb9-1e7d325d484a")
-RECIPIENT = "amc51816@gmail.com"
+RECIPIENT = "wren-prospect@example.com"
 EARLIER_TEXT = (
-    "Hi Amy,\n\nThanks for reaching out about 480-484 S Main St #7 (Carriage Apartments) in Phillipsburg, NJ. "
+    "Hi Wren,\n\nThanks for reaching out about 480-484 S Fictional St #7 (Sample Apartments) in Phillipsburg, NJ. "
     "I'd be glad to set up a viewing. We show units Monday-Friday 7:00 AM-3:30 PM."
 )
 PRIOR = {
@@ -67,7 +67,7 @@ PRIOR = {
     "trigger_source": "tenantcloud_api",
     "trigger_is_new_question": False,
 }
-REPLY = "Hi Amy, thanks for reaching out about Unit 7! We show weekdays 7:00 AM-3:30 PM."
+REPLY = "Hi Wren, thanks for reaching out about Unit 7! We show weekdays 7:00 AM-3:30 PM."
 REASON = "She asked a new question about parking that the earlier reply did not cover."
 POLICY = FeaturePolicy(writes_enabled=True, kill_switch=False, enabled_operations=frozenset(Operation))
 
@@ -123,7 +123,7 @@ def execute(text: str = REPLY, *, intent: str = "inquiry_reply", role: str = "pr
         "action_role": role,
         "operation": "quo.sms.send",
         "intent_kind": intent,
-        "arguments": {"text": text, "to_phone": "+18622665285"},
+        "arguments": {"text": text, "to_phone": "+18625550185"},
     }
 
 
@@ -139,7 +139,7 @@ def confirm(action_id: UUID, decision: str, reason: str | None = None) -> dict[s
 
 
 @pytest.mark.asyncio
-async def test_amy_repeat_is_refused_naming_the_earlier_reply_and_offering_the_override() -> None:
+async def test_wren_repeat_is_refused_naming_the_earlier_reply_and_offering_the_override() -> None:
     store = AnsweredLedger([PRIOR])
     service, adapter = harness(store)
 
@@ -150,7 +150,7 @@ async def test_amy_repeat_is_refused_naming_the_earlier_reply_and_offering_the_o
     assert result["detail_code"] == RECENTLY_ANSWERED_DETAIL
     assert result["detail"].startswith(
         f"Not sent: RECENTLY ANSWERED: {RECIPIENT} already got a reply 27h ago (action {EARLIER}, wake 27994, inquiry_reply): "
-        '"Hi Amy, Thanks for reaching out about 480-484 S Main St #7'
+        '"Hi Wren, Thanks for reaching out about 480-484 S Fictional St #7'
     )
     assert "send nothing (op confirm, decision no)" in result["detail"]
     assert result["detail"].endswith(OVERRIDE_RULE)
@@ -266,7 +266,7 @@ async def test_a_stale_context_successor_is_not_asked_again() -> None:
     """The agent already answered a stale_context question with yes: its
     successor carries that answer, so recently_answered does not ask."""
     store = AnsweredLedger([PRIOR])
-    newer = stale_tests.replace(stale_tests.CRON_ALERT, source="quo", preview="Is Unit 7 still open?", sender="Amy")
+    newer = stale_tests.replace(stale_tests.CRON_ALERT, source="quo", preview="Is Unit 7 still open?", sender="Wren")
     probe = stale_tests.LedgerProbe(store, newer)
     adapter = stale_tests.CliqAdapter()
     service = OutboundActionService(
@@ -366,9 +366,9 @@ async def test_a_reply_still_in_flight_is_named_as_being_sent_now() -> None:
 # contract -- one holder per contact key, the check and the prepare inside.
 # ----------------------------------------------------------------------------
 
-AMY_KEYS = frozenset({"email:amc51816@gmail.com", "phone:8622665285", "phone:9085550101"})
+WREN_KEYS = frozenset({"email:wren-prospect@example.com", "phone:8625550185", "phone:9085550101"})
 LANE_A, LANE_B = 28300, 28301
-PHONE_A, PHONE_B = "+18622665285", "+19085550101"
+PHONE_A, PHONE_B = "+18625550185", "+19085550101"
 _IN_FLIGHT_STATES = {ActionState.PREPARED, ActionState.DISPATCHING, ActionState.PROVIDER_ACCEPTED, ActionState.UNKNOWN}
 
 
@@ -395,7 +395,7 @@ class SerializedLedger(AnsweredLedger):
 
     def keys(self, action_id: UUID) -> list[str]:
         row = self.rows[action_id]
-        return sorted(AMY_KEYS | {phone_key(str(row.recipient_scope["target_id"]))})
+        return sorted(WREN_KEYS | {phone_key(str(row.recipient_scope["target_id"]))})
 
     @asynccontextmanager
     async def contact_serialized(self, action_id: UUID, *, lock_timeout_ms: int) -> AsyncIterator[SerializedLedger]:  # type: ignore[override]
@@ -460,8 +460,8 @@ def lane(wake: int, phone: str, text: str) -> dict[str, Any]:
 async def both_lanes(store: SerializedLedger) -> tuple[list[dict[str, Any]], list[str]]:
     service, adapter = harness(store)
     results = await asyncio.gather(
-        call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30.")),
-        call(service, lane(LANE_B, PHONE_B, "Hi Amy, how about Tuesday at 10?")),
+        call(service, lane(LANE_A, PHONE_A, "Hi Wren, we show weekdays 7-3:30.")),
+        call(service, lane(LANE_B, PHONE_B, "Hi Wren, how about Tuesday at 10?")),
     )
     return list(results), adapter.sent
 
@@ -494,7 +494,7 @@ async def test_negative_control_without_the_lock_both_lanes_send() -> None:
 async def test_a_lock_held_too_long_refuses_retryably_and_records_nothing() -> None:
     store = SerializedLedger(lock_timeout=0.01)
     service, adapter = harness(store)
-    blocker = store.locks.setdefault("email:amc51816@gmail.com", asyncio.Lock())
+    blocker = store.locks.setdefault("email:wren-prospect@example.com", asyncio.Lock())
     await blocker.acquire()
 
     busy = await call(service, lane(LANE_A, PHONE_A, REPLY))
@@ -518,10 +518,10 @@ async def test_a_lock_held_too_long_refuses_retryably_and_records_nothing() -> N
 async def test_after_a_lock_timeout_the_retry_sees_the_reply_that_held_it() -> None:
     store = SerializedLedger(lock_timeout=0.01)
     service, adapter = harness(store)
-    sent = await call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30."))
+    sent = await call(service, lane(LANE_A, PHONE_A, "Hi Wren, we show weekdays 7-3:30."))
     assert sent["status"] == PublicStatus.SENT.value
 
-    retried = await call(service, lane(LANE_B, PHONE_B, "Hi Amy, how about Tuesday at 10?"))
+    retried = await call(service, lane(LANE_B, PHONE_B, "Hi Wren, how about Tuesday at 10?"))
 
     assert (retried["status"], retried["detail_code"]) == (PublicStatus.REJECTED.value, RECENTLY_ANSWERED_DETAIL)
     assert retried["recently_answered"][0]["reply_status"] == "answered"
@@ -536,7 +536,7 @@ async def test_the_background_prepare_leaves_a_busy_row_for_its_next_advance() -
     service, _adapter = harness(store)
     context = await stale_tests.FakeLoader().load(parse_outbound_request(lane(LANE_A, PHONE_A, REPLY)))
     await store.create_or_load(context)
-    blocker = store.locks.setdefault("email:amc51816@gmail.com", asyncio.Lock())
+    blocker = store.locks.setdefault("email:wren-prospect@example.com", asyncio.Lock())
     await blocker.acquire()
 
     result = await service.prepare(context.action_id)
@@ -551,8 +551,8 @@ async def test_the_background_prepare_leaves_a_busy_row_for_its_next_advance() -
 async def test_an_override_still_takes_the_lock_so_a_concurrent_reply_sees_it() -> None:
     store = SerializedLedger()
     service, adapter = harness(store)
-    await call(service, lane(LANE_A, PHONE_A, "Hi Amy, we show weekdays 7-3:30."))
-    refused = await call(service, lane(LANE_B, PHONE_B, "Hi Amy, parking is included."))
+    await call(service, lane(LANE_A, PHONE_A, "Hi Wren, we show weekdays 7-3:30."))
+    refused = await call(service, lane(LANE_B, PHONE_B, "Hi Wren, parking is included."))
     assert refused["detail_code"] == RECENTLY_ANSWERED_DETAIL
 
     overridden = await call(service, {**refused["override"], "reason": REASON})

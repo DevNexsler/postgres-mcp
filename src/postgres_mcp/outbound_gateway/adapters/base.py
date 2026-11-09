@@ -201,8 +201,8 @@ def initial_observation(result: McpCallResult, *, effect_call: bool = False) -> 
             # below adds the "provider_" prefix) already says the upstream
             # provider's rejection is permanent -- this is authoritative
             # evidence, not a transport hiccup. Without this, a
-            # permanently-refused send (wake 27327, a cliq.chat.post to chat
-            # 1608777531604898891, 2026-09-28 20:14:53Z -- CDS confirms
+            # permanently-refused send (wake 27327, a cliq.chat.post to a chat,
+            # 2026-09-28 20:14:53Z -- CDS confirms
             # non-delivery, a sibling DM at the same second delivered fine)
             # reconciled 5 times and parked in manual_review with no reason
             # surfaced, exactly like provider_rejected_request above did

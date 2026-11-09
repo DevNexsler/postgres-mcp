@@ -2,8 +2,8 @@
 """The 10/26 TenantCloud outage, replayed through the real delivery path.
 
 TenantCloud's API hung or answered 503/500 from 12:23 PM to 12:10 AM ET.
-Two tenant replies queued during it -- Mary Haas's (action 152dd448, created
-17:25 ET) and Charles Serpone's (d2031a21, created 22:32 ET) -- were never
+Two tenant replies queued during it -- Pia Testerson's (action 152dd448, created
+17:25 ET) and Otto Testerson's (d2031a21, created 22:32 ET) -- were never
 sent: the coordinator waited while auth was down, and the first check after
 auth came back found them more than an hour old and closed them
 `retry_budget_exhausted` without a single dispatch. Their one-hour budget

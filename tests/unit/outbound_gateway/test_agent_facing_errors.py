@@ -117,7 +117,7 @@ async def test_an_unconfigured_email_source_says_nothing_was_sent_and_what_to_do
     unmapped = dataclasses.replace(policy(), email_account_by_provider={"zillow": "nigel-zoho"})
     with pytest.raises(ContextDerivationError) as raised:
         await ActionContextLoader(FakeRepository(event), unmapped).load(
-            request(arguments={"to_address": "dan@pfg.io", "text": "hi"})
+            request(arguments={"to_address": "staff-a@pfg.io", "text": "hi"})
         )
     text = str(raised.value)
     assert text.startswith("no outbound email account is configured for provider 'zoho_mail'")
@@ -140,7 +140,7 @@ async def test_an_invalid_request_says_nothing_was_sent_and_where_the_shapes_are
     result = await handle_outbound_action(
         AsyncMock(), FeaturePolicy(writes_enabled=True, kill_switch=False),
         {"op": "execute", "wakeup_event_id": 7, "action_role": "prospect_reply", "operation": "email.send",
-         "intent_kind": "inquiry_reply", "arguments": {"to": "dan@pfg.io", "text": "hi"}},
+         "intent_kind": "inquiry_reply", "arguments": {"to": "staff-a@pfg.io", "text": "hi"}},
     )
     assert (result["status"], result["detail_code"]) == ("rejected", "invalid_request")
     text = result["detail"]
@@ -192,7 +192,7 @@ async def _unknown_action_refusal() -> Exception:
 
 EXECUTE = {
     "op": "execute", "wakeup_event_id": 27250, "action_role": "prospect_reply", "operation": "email.send",
-    "intent_kind": "inquiry_reply", "arguments": {"to_address": "dan@pfg.io", "text": "hi"},
+    "intent_kind": "inquiry_reply", "arguments": {"to_address": "staff-a@pfg.io", "text": "hi"},
 }
 CONFIRM = {"op": "confirm", "wakeup_event_id": 27250, "action_id": str(ACTION_ID), "decision": "yes"}
 STATUS = {"op": "status", "action_id": str(ACTION_ID)}

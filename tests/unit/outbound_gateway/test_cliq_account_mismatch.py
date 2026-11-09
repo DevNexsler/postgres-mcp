@@ -23,7 +23,7 @@ from .test_service import evidence
 from .test_service import row
 
 REFUSAL = (
-    "Cliq message was NOT sent to chat CT_1424657680898345423_721156495: "
+    "Cliq message was NOT sent to chat CT_1000000000000000023_700000099: "
     "local history has this chat only under dan-zoho, and the Cliq write identity "
     'for upstream "nigel_cliq" (account nigel-zoho) does not participate. '
     "A conversation id from another account is not a post target. The provider was not called."
@@ -89,7 +89,7 @@ async def test_execute_and_later_status_keep_recovery_guidance():
             "request_id": "job-28166",
         }
     )
-    chat_id = "CT_1424657680898345423_721156495"
+    chat_id = "CT_1000000000000000023_700000099"
     ctx = context(Operation.CLIQ_CHANNEL_POST, target=DerivedTarget("cliq_chat", chat_id, True))
     store = FakeStore(row(operation=ctx.operation, action_role=ctx.action_role))
     loader = AsyncMock()

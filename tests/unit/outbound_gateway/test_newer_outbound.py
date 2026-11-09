@@ -53,14 +53,14 @@ from .test_stale_context_confirm import action_id_for
 from .test_stale_context_confirm import confirm
 
 WAKE = 27279
-DM = "1424728044450751028"
-PROSPECT = "ytryboujee@gmail.com"
+DM = "1000000000000000028"
+PROSPECT = "nico-prospect@example.com"
 # Real timeline, wake 27279 (UTC).
 SOURCE_AT = datetime(2026, 9, 26, 13, 1, 6, 353000, tzinfo=timezone.utc)  # message 806237, Dan
 CRON_POST_AT = datetime(2026, 9, 26, 13, 5, 50, 439000, tzinfo=timezone.utc)  # message 806236, Nigel
 WATERMARK = datetime(2026, 9, 26, 13, 5, 55, 544802, tzinfo=timezone.utc)  # webui_accepted_at
 EXECUTED_AT = datetime(2026, 9, 26, 13, 11, 2, 842599, tzinfo=timezone.utc)
-EMAIL_TEXT = "Hi Alberto, here is the application link: https://pinefield.tenantcloud.com/listings/204968"
+EMAIL_TEXT = "Hi Vito, here is the application link: https://example-co.tenantcloud.com/listings/204968"
 
 FIRST = action_id_for(WAKE, "prospect_reply", 0)
 SUCCESSOR = action_id_for(WAKE, "prospect_reply", 1)
@@ -71,10 +71,10 @@ EARLIER_EMAIL = NewerActivity(
     direction="outbound",
     source="zoho_mail",
     occurred_at=SOURCE_AT + timedelta(minutes=2),
-    preview="Hi Alberto, the application link is https://pinefield.tenantcloud.com/listings/204968",
+    preview="Hi Vito, the application link is https://example-co.tenantcloud.com/listings/204968",
     message_id=806300,
     action_id=None,
-    sender="Nigel Pine",
+    sender="Nigel Placeholder",
 )
 
 
@@ -89,7 +89,7 @@ def email_request(text: str = EMAIL_TEXT, to_address: str = PROSPECT) -> Execute
             "arguments": {
                 "to_address": to_address,
                 "text": text,
-                "subject": "Application link — 480-484 S Main St, Unit 7",
+                "subject": "Application link — 480-484 S Fictional St, Unit 7",
                 "cc": ["management@pfg.io"],
             },
         }
@@ -241,7 +241,7 @@ async def test_a_newer_outbound_to_the_target_is_a_question_listing_it_as_sent_b
     assert result.new_context is not None and len(result.new_context) == 1
     item = result.new_context[0]
     assert (item.id, item.source, item.direction) == ("message:806300", "zoho_mail", "sent by us")
-    assert item.sender == "Nigel Pine"
+    assert item.sender == "Nigel Placeholder"
     assert item.occurred_at == EARLIER_EMAIL.occurred_at
     assert "application link" in item.preview
     assert result.detail and "sent by us" in result.detail
@@ -325,7 +325,7 @@ async def test_newer_inbound_and_our_newer_send_are_one_question():
         EARLIER_EMAIL,
         direction="inbound",
         message_id=806310,
-        sender="Alberto",
+        sender="Vito",
         occurred_at=EARLIER_EMAIL.occurred_at + timedelta(minutes=1),
         preview="got it, thanks",
     )

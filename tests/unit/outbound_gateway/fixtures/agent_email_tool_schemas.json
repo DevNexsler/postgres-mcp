@@ -75,7 +75,7 @@
         "type": "string",
         "maxLength": 256,
         "pattern": "^(?:[0-9]{15,}|CT_[A-Za-z0-9_/%-]*[0-9][A-Za-z0-9_/%-]*)$",
-        "description": "Zoho existing DM/group chat ID. Do not pass a channel unique name or a user id (ZUID). Expected a numeric Cliq chat id of at least 15 digits (e.g. 1424728044450751028) or a CT_<chat>_<user> conversation id (e.g. CT_2198174035284346737_721156495)."
+        "description": "Zoho existing DM/group chat ID. Do not pass a channel unique name or a user id (ZUID). Expected a numeric Cliq chat id of at least 15 digits (e.g. 1000000000000000028) or a CT_<chat>_<user> conversation id (e.g. CT_1000000000000000037_700000099)."
       },
       "post_in_parent": {
         "type": "boolean",

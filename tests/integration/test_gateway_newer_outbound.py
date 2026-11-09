@@ -64,21 +64,21 @@ def _ledger_module():
 ledger = _ledger_module()
 
 WAKE = 27279
-DM = "1424728044450751028"
-PROSPECT = "ytryboujee@gmail.com"
+DM = "1000000000000000028"
+PROSPECT = "nico-prospect@example.com"
 SOURCE_AT = datetime(2026, 9, 26, 13, 1, 6, 353000, tzinfo=timezone.utc)
 CRON_POST_AT = datetime(2026, 9, 26, 13, 5, 50, 439000, tzinfo=timezone.utc)
 WAKE_CREATED_AT = datetime(2026, 9, 26, 13, 5, 55, 380524, tzinfo=timezone.utc)
 WAKE_ACCEPTED_AT = datetime(2026, 9, 26, 13, 5, 55, 544802, tzinfo=timezone.utc)
-EMAIL_TEXT = "Hi Alberto, here is the application link: https://pinefield.tenantcloud.com/listings/204968"
+EMAIL_TEXT = "Hi Vito, here is the application link: https://example-co.tenantcloud.com/listings/204968"
 FIRST = ledger.action_id_for(WAKE, "prospect_reply", 0)
 SUCCESSOR = ledger.action_id_for(WAKE, "prospect_reply", 1)
 
 QUO_WAKE = 27300
-QUO_LINE = "PNtjMqMO2h"
-QUO_LINE_PHONE = "+17623726083"
-QUO_PROSPECT = "+15168594333"
-QUO_OTHER = "+14843530553"
+QUO_LINE = "PNfakeDDD4"
+QUO_LINE_PHONE = "+17625550183"
+QUO_PROSPECT = "+15165550133"
+QUO_OTHER = "+14845550153"
 QUO_SOURCE_AT = datetime(2026, 8, 27, 18, 20, 16, tzinfo=timezone.utc)
 
 POLICY = RoutingPolicy(
@@ -167,10 +167,12 @@ SCHEMA = """
 async def seed_wake_27279(conn) -> None:
     """Wake 27279's rows as production stored them (payload keys trimmed to
     the ones any gateway query reads)."""
-    await conn.execute("INSERT INTO channels VALUES (417, %s, 'dm', 'Dan Park')", (DM,))
-    await conn.execute("INSERT INTO participants VALUES (407, 'user', '720844989', 'Dan Park'), (997, 'user', '918334727', 'Nigel Pine')")
-    await conn.execute("INSERT INTO agency_identifiers VALUES ('cliq_user_id', '918334727', 'nigel-zoho')")
-    people = [{"id": "918334727", "name": "Nigel Pine"}, {"id": "720844989", "name": "Dan Park"}]
+    await conn.execute("INSERT INTO channels VALUES (417, %s, 'dm', 'Dan Placeholder')", (DM,))
+    await conn.execute(
+        "INSERT INTO participants VALUES (407, 'user', '700000001', 'Dan Placeholder'), (997, 'user', '700000002', 'Nigel Placeholder')"
+    )
+    await conn.execute("INSERT INTO agency_identifiers VALUES ('cliq_user_id', '700000002', 'nigel-zoho')")
+    people = [{"id": "700000002", "name": "Nigel Placeholder"}, {"id": "700000001", "name": "Dan Placeholder"}]
     source_payload = {
         "direction": "inbound",
         "conversation_id": DM,
@@ -205,7 +207,7 @@ async def seed_wake_27279(conn) -> None:
             "proxy_email": None,
             "direct_email": None,
             "prospect_name": None,
-            "sender": {"display_name": "Dan Park", "participant_key": "720844989", "participant_type": "user"},
+            "sender": {"display_name": "Dan Placeholder", "participant_key": "700000001", "participant_type": "user"},
         },
         "identity": {"factbook_entity_uuid": None, "link_type": "source_participant"},
         "routing_hints": {},
@@ -221,7 +223,7 @@ async def add_sent_email(conn, message_id: int, *, to: str, at: datetime, source
     """A zoho_mail Sent-folder message from Nigel's mailbox, participants as
     the collector stores them."""
     await conn.execute("INSERT INTO channels VALUES (900, 'nigel@pfg.io:Sent', 'email', 'Sent') ON CONFLICT DO NOTHING")
-    await conn.execute("INSERT INTO participants VALUES (998, 'email', 'nigel@pfg.io', 'Nigel Pine') ON CONFLICT DO NOTHING")
+    await conn.execute("INSERT INTO participants VALUES (998, 'email', 'nigel@pfg.io', 'Nigel Placeholder') ON CONFLICT DO NOTHING")
     payload = {
         "source_folder": "Sent",
         "participants": [
@@ -337,11 +339,11 @@ def build(conn):
 
 
 IDENTITY_WAKE = 27500
-IDENTITY_DM = "1424728044450751029"
+IDENTITY_DM = "1000000000000000029"
 IDENTITY_SOURCE_AT = datetime(2026, 9, 28, 20, 2, 55, tzinfo=timezone.utc)
 IDENTITY_WATERMARK = datetime(2026, 9, 28, 20, 3, 45, tzinfo=timezone.utc)
 IDENTITY_PROSPECT = "identity-prospect@example.com"
-# Wake 27332's resolved identity (Aimee Tapia), reused verbatim from prod.
+# Wake 27332's resolved identity (Bree Testaro), reused verbatim from prod.
 ENTITY_UUID = "4b2d6a38-aa45-4010-9e36-6056d0ce0fd8"
 OTHER_ENTITY_UUID = "11111111-1111-1111-1111-111111111111"
 
@@ -349,18 +351,18 @@ OTHER_ENTITY_UUID = "11111111-1111-1111-1111-111111111111"
 async def seed_identity_wake(conn) -> None:
     """A wake CDS resolved to a person -- the same DM-sourced shape as wake
     27279, on its own channel, carrying an `identity.factbook_entity_uuid`."""
-    await conn.execute("INSERT INTO channels VALUES (418, %s, 'dm', 'Dan Park (identity)')", (IDENTITY_DM,))
-    await conn.execute("INSERT INTO participants VALUES (1407, 'user', '720844989', 'Dan Park') ON CONFLICT DO NOTHING")
+    await conn.execute("INSERT INTO channels VALUES (418, %s, 'dm', 'Dan Placeholder (identity)')", (IDENTITY_DM,))
+    await conn.execute("INSERT INTO participants VALUES (1407, 'user', '700000001', 'Dan Placeholder') ON CONFLICT DO NOTHING")
     payload = {
         "direction": "inbound",
         "conversation_id": IDENTITY_DM,
-        "participants": [{"id": "720844989", "name": "Dan Park"}],
+        "participants": [{"id": "700000001", "name": "Dan Placeholder"}],
         "provider_ids": {"cliq": IDENTITY_DM, "message": "identity-source-msg", "conversation": IDENTITY_DM},
     }
     await conn.execute("INSERT INTO raw_events VALUES (900100, %s)", (Jsonb(payload),))
     await conn.execute(
         "INSERT INTO messages VALUES (900100, NULL, 'zoho_cliq', 'identity-source-msg', %s, %s, %s, NULL, "
-        "'reply to Aimee', 'nigel-zoho', 418, 1407, NULL, 900100, 'inbound')",
+        "'reply to Bree', 'nigel-zoho', 418, 1407, NULL, 900100, 'inbound')",
         (IDENTITY_SOURCE_AT, IDENTITY_SOURCE_AT, IDENTITY_SOURCE_AT),
     )
     envelope = {
@@ -371,7 +373,7 @@ async def seed_identity_wake(conn) -> None:
             "proxy_email": None,
             "direct_email": None,
             "prospect_name": None,
-            "sender": {"display_name": "Dan Park", "participant_key": "720844989", "participant_type": "user"},
+            "sender": {"display_name": "Dan Placeholder", "participant_key": "700000001", "participant_type": "user"},
         },
         "identity": {"factbook_entity_uuid": ENTITY_UUID, "link_type": "phone"},
         "routing_hints": {},
@@ -412,7 +414,7 @@ async def insert_ledger_send(
     )
 
 
-def identity_email_request(text: str = "Following up on Aimee's application.", to_address: str = IDENTITY_PROSPECT) -> ExecuteRequest:
+def identity_email_request(text: str = "Following up on Bree's application.", to_address: str = IDENTITY_PROSPECT) -> ExecuteRequest:
     parsed = parse_outbound_request(
         {
             "op": "execute",
@@ -450,7 +452,7 @@ def email_request(text: str = EMAIL_TEXT) -> ExecuteRequest:
             "arguments": {
                 "to_address": PROSPECT,
                 "text": text,
-                "subject": "Application link — 480-484 S Main St, Unit 7 (1BR, 3rd Floor)",
+                "subject": "Application link — 480-484 S Fictional St, Unit 7 (1BR, 3rd Floor)",
                 "cc": ["management@pfg.io"],
             },
         }
@@ -508,7 +510,7 @@ async def test_an_earlier_email_to_the_same_prospect_is_shown_and_the_agent_answ
         to=PROSPECT,
         at=SOURCE_AT + timedelta(minutes=2),
         source_message_id="<manual-1@pfg.io>",
-        body="Hi Alberto, the application link is https://pinefield.tenantcloud.com/listings/204968",
+        body="Hi Vito, the application link is https://example-co.tenantcloud.com/listings/204968",
     )
     # Another prospect's email in the same Sent folder is not this target's.
     await add_sent_email(
@@ -525,7 +527,7 @@ async def test_an_earlier_email_to_the_same_prospect_is_shown_and_the_agent_answ
         service, store, adapter = build(conn)
         asked = await service.execute(email_request())
         assert asked.status is PublicStatus.NEEDS_CONFIRMATION, asked
-        assert [(item.id, item.direction, item.sender) for item in asked.new_context] == [("message:806300", "sent by us", "Nigel Pine")]
+        assert [(item.id, item.direction, item.sender) for item in asked.new_context] == [("message:806300", "sent by us", "Nigel Placeholder")]
         revised = None
         if decision == "revise":
             revised = email_request("Following up: did the application link come through?").arguments.model_dump(mode="json", exclude_none=True)
@@ -683,7 +685,7 @@ async def test_a_different_person_is_not_asked(conn):
     result = await service.execute(identity_email_request())
 
     assert result.status is PublicStatus.SENT, result
-    assert adapter.sent == ["Following up on Aimee's application."]
+    assert adapter.sent == ["Following up on Bree's application."]
 
 
 @pytest.mark.asyncio
@@ -696,7 +698,7 @@ async def test_an_earlier_send_before_the_context_time_is_not_asked(conn):
     result = await service.execute(identity_email_request())
 
     assert result.status is PublicStatus.SENT, result
-    assert adapter.sent == ["Following up on Aimee's application."]
+    assert adapter.sent == ["Following up on Bree's application."]
 
 
 @pytest.mark.asyncio
@@ -709,7 +711,7 @@ async def test_a_definitively_failed_send_does_not_count(conn):
     result = await service.execute(identity_email_request())
 
     assert result.status is PublicStatus.SENT, result
-    assert adapter.sent == ["Following up on Aimee's application."]
+    assert adapter.sent == ["Following up on Bree's application."]
 
 
 # One Hermes turn answering three wakes (CDS steering), as production stored
@@ -727,7 +729,7 @@ TURN_WAKES = {
         "2026-10-01 02:43:31.494932+00",
         "2026-10-01 02:43:31.531572+00",
         "2026-10-01 02:43:31.791453+00",
-        "{@918334727} this is quick test message.   2+4",
+        "{@700000002} this is quick test message.   2+4",
     ),
     27458: (
         839377,
@@ -736,7 +738,7 @@ TURN_WAKES = {
         "2026-10-01 02:44:01.507186+00",
         "2026-10-01 02:44:01.526953+00",
         "2026-10-01 02:44:01.807227+00",
-        "{@918334727}  also tell me a short story",
+        "{@700000002}  also tell me a short story",
     ),
     27459: (
         839378,
@@ -745,7 +747,7 @@ TURN_WAKES = {
         "2026-10-01 02:44:01.527349+00",
         "2026-10-01 02:44:01.736748+00",
         "2026-10-01 02:44:02.057595+00",
-        "{@918334727}  and 9+4",
+        "{@700000002}  and 9+4",
     ),
 }
 SIX = UUID("eb73af99-c747-5fcd-8a9a-5e91207dcab6")
@@ -781,7 +783,7 @@ def _turn_payload(provider_message_id: str) -> dict[str, Any]:
     return {
         "direction": "inbound",
         "conversation_id": DM,
-        "participants": [{"id": "918334727", "name": "Nigel Pine"}, {"id": "720844989", "name": "Dan Park"}],
+        "participants": [{"id": "700000002", "name": "Nigel Placeholder"}, {"id": "700000001", "name": "Dan Placeholder"}],
         "provider_ids": {"cliq": DM, "message": provider_message_id, "conversation": DM},
     }
 
@@ -804,7 +806,7 @@ async def seed_steered_turn(conn, *, story_stream: str = TURN_STREAM) -> None:
                 "proxy_email": None,
                 "direct_email": None,
                 "prospect_name": None,
-                "sender": {"display_name": "Dan Park", "participant_key": "720844989", "participant_type": "user"},
+                "sender": {"display_name": "Dan Placeholder", "participant_key": "700000001", "participant_type": "user"},
             },
             "identity": {"factbook_entity_uuid": None, "link_type": "source_participant"},
             "routing_hints": {},
@@ -885,7 +887,7 @@ async def test_a_new_message_from_dan_in_the_same_turn_is_still_asked(conn):
     await conn.execute("INSERT INTO raw_events VALUES (839400, %s)", (Jsonb(_turn_payload("never-mind")),))
     await conn.execute(
         "INSERT INTO messages VALUES (839400, NULL, 'zoho_cliq', 'never-mind', %s, %s, %s, NULL, "
-        "'{@918334727} never mind the math', 'dan-zoho', 417, 407, NULL, 839400, 'outbound', %s)",
+        "'{@700000002} never mind the math', 'dan-zoho', 417, 407, NULL, 839400, 'outbound', %s)",
         (at, at, at, at),
     )
     await conn.execute(

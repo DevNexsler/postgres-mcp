@@ -15,7 +15,7 @@ def test_admin_requires_operator_and_authoritative_evidence():
             "resolve",
             "00000000-0000-0000-0000-000000000001",
             "--operator",
-            "danpark",
+            "operator",
             "--evidence-kind",
             "authoritative_acceptance",
             "--evidence-reference",
@@ -28,7 +28,7 @@ def test_admin_requires_operator_and_authoritative_evidence():
             "verified in provider history",
         ]
     )
-    assert args.operator == "danpark"
+    assert args.operator == "operator"
     assert args.resolution == "completed"
 
 
@@ -39,7 +39,7 @@ def test_admin_remediation_accepts_no_recipient_or_provider_override():
             "remediate",
             "00000000-0000-0000-0000-000000000001",
             "--operator",
-            "danpark",
+            "operator",
             "--reason",
             "provider proved first action failed",
         ]
@@ -64,7 +64,7 @@ async def test_admin_resolution_query_survives_literal_empty_json_object():
             "resolve",
             "00000000-0000-0000-0000-000000000001",
             "--operator",
-            "danpark",
+            "operator",
             "--evidence-kind",
             "authoritative_acceptance",
             "--evidence-reference",

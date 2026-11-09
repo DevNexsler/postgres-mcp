@@ -7,7 +7,7 @@
 -- later wake's message does not carry, shares no recipient key with the later
 -- wake, so the outbound gateway's `recently_answered` check (postgres-mcp #84,
 -- 33d77aa, under a per-contact-key advisory lock) and wake context missed it.
--- 2026-09-28 Aimee Tapia: wake 27332 (Zillow extract) answered her proxy; the
+-- 2026-09-28 Bree Testaro: wake 27332 (Zillow extract) answered her proxy; the
 -- TenantCloud lead wake 27331 carries only her email hash, which the proxy
 -- recipient never normalizes to, but which the extract message 817301 that
 -- triggered the first reply does carry.

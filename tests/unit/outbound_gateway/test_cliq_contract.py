@@ -50,8 +50,8 @@ NOW = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
 
 # Real target ids from outbound_actions where operation='cliq.channel.post',
 # queried read-only on prod 2026-09-28 (see the ticket this branch fixes).
-PROD_NUMERIC_CHAT_ID = "1424728044450751028"  # 19 digits -- a Cliq DM, not a channel
-PROD_CT_STAR_CHAT_ID = "CT_2243214485353125021_721156495"
+PROD_NUMERIC_CHAT_ID = "1000000000000000028"  # 19 digits -- a Cliq DM, not a channel
+PROD_CT_STAR_CHAT_ID = "CT_1000000000000000021_700000099"
 PROD_UNIQUE_NAMES = ("maintenance", "tenantleads", "nigeldebugging")
 
 
